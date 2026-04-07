@@ -133,7 +133,7 @@ async function searchFoods(query, page = 1, pageSize = 20) {
     const response = await fetch(url.toString(), {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'LibreLog/1.0'
+        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
       }
     });
 
@@ -189,7 +189,7 @@ async function lookupFdcId(fdcId) {
     const response = await fetch(url.toString(), {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'LibreLog/1.0'
+        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
       }
     });
 

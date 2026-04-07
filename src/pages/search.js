@@ -41,6 +41,9 @@ export function renderSearchPage(container, queryString) {
   let searchQuery = '';
   let searchResults = [];
   let searchTimeout;
+  let searchSources = { local: true, usda: true, off: true };
+  let offPage = 1;
+  let usdaPage = 1;
 
   // Scanner state
   let cameraStarted = false;
@@ -141,6 +144,11 @@ export function renderSearchPage(container, queryString) {
         <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
         <input type="text" class="search-input" id="food-search-input" placeholder="Search foods..." autocomplete="off" aria-label="Search for foods" role="searchbox" value="${escapeHTML(searchQuery)}">
       </div>
+      <div class="search-source-filters" role="group" aria-label="Filter by source">
+        <button class="source-filter-chip ${searchSources.local ? 'active' : ''}" data-source="local">Local</button>
+        <button class="source-filter-chip ${searchSources.usda ? 'active' : ''}" data-source="usda">USDA</button>
+        <button class="source-filter-chip ${searchSources.off ? 'active' : ''}" data-source="off">OFF</button>
+      </div>
       <div id="search-results-area">
         ${recentFoods.length > 0 ? `<section class="search-section"><h3 class="section-title">Recent Foods</h3><div class="food-results">${recentFoods.map(f => renderFoodResult(f)).join('')}</div></section>` : ''}
         ${frequentFoods.length > 0 ? `<section class="search-section"><h3 class="section-title">Frequent Foods</h3><div class="food-results">${frequentFoods.map(f => renderFoodResult(f)).join('')}</div></section>` : ''}
@@ -154,10 +162,29 @@ export function renderSearchPage(container, queryString) {
     bindFoodResultEvents([...recentFoods, ...frequentFoods]);
     document.getElementById('add-custom-food-btn')?.addEventListener('click', openCustomFoodForm);
 
+    // Source filter chips
+    document.querySelectorAll('.source-filter-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const source = chip.dataset.source;
+        searchSources[source] = !searchSources[source];
+        // Ensure at least one source stays active
+        if (!searchSources.local && !searchSources.usda && !searchSources.off) {
+          searchSources[source] = true;
+          return;
+        }
+        chip.classList.toggle('active', searchSources[source]);
+        offPage = 1;
+        usdaPage = 1;
+        if (searchQuery) performTextSearch();
+      });
+    });
+
     searchInput.addEventListener('input', (e) => {
       searchQuery = e.target.value.trim();
       clearTimeout(searchTimeout);
       if (!searchQuery) { renderSearchMode(el); return; }
+      offPage = 1;
+      usdaPage = 1;
       // Auto-detect barcode
       if (/^\d{8,13}$/.test(searchQuery)) {
         performBarcodeLookup(searchQuery); return;
@@ -166,20 +193,40 @@ export function renderSearchPage(container, queryString) {
     });
   }
 
-  async function performTextSearch() {
+  async function performTextSearch(loadMore = false) {
     const area = document.getElementById('search-results-area');
     if (!area) return;
-    area.innerHTML = '<div class="search-loading">Searching...</div>';
+    if (!loadMore) {
+      area.innerHTML = '<div class="search-loading">Searching...</div>';
+    }
     try {
-      searchResults = await searchFoods(searchQuery, { localOnly: false, limit: 20 });
+      const newResults = await searchFoods(searchQuery, {
+        localOnly: false,
+        limit: 50,
+        sources: searchSources,
+        offPage,
+        usdaPage
+      });
+      if (loadMore) {
+        searchResults = [...searchResults, ...newResults];
+      } else {
+        searchResults = newResults;
+      }
       if (!searchResults?.length) {
         area.innerHTML = `<div class="search-empty"><p>No foods found for "${escapeHTML(searchQuery)}"</p></div><div class="search-actions"><button class="btn btn-outline" id="add-custom-food-btn">Add Custom Food</button></div>`;
         document.getElementById('add-custom-food-btn')?.addEventListener('click', openCustomFoodForm);
         return;
       }
-      area.innerHTML = `<section class="search-section"><h3 class="section-title">Results</h3><div class="food-results">${searchResults.map(f => renderFoodResult(f)).join('')}</div></section><div class="search-actions"><button class="btn btn-outline" id="add-custom-food-btn">Add Custom Food</button></div>`;
+      const hasRemoteSources = searchSources.usda || searchSources.off;
+      const loadMoreBtn = hasRemoteSources ? '<button class="btn btn-outline" id="load-more-btn">Load More</button>' : '';
+      area.innerHTML = `<section class="search-section"><h3 class="section-title">Results</h3><div class="food-results">${searchResults.map(f => renderFoodResult(f)).join('')}</div></section><div class="search-actions">${loadMoreBtn}<button class="btn btn-outline" id="add-custom-food-btn">Add Custom Food</button></div>`;
       bindFoodResultEvents(searchResults);
       document.getElementById('add-custom-food-btn')?.addEventListener('click', openCustomFoodForm);
+      document.getElementById('load-more-btn')?.addEventListener('click', () => {
+        if (searchSources.off) offPage++;
+        if (searchSources.usda) usdaPage++;
+        performTextSearch(true);
+      });
     } catch (err) {
       console.error('Search error:', err);
       area.innerHTML = '<div class="search-error"><p>Search failed. Please try again.</p></div>';
@@ -537,7 +584,9 @@ function renderFoodResult(food) {
   const macroSummary = `${Math.round(protein)}P ${Math.round(carbs)}C ${Math.round(fat)}F`;
   const servingLabel = food.servingSize ? `${food.servingSize.quantity}${food.servingSize.unit}` : '100g';
   const sourceType = food.source?.type || '';
-  const sourceBadge = sourceType ? `<span class="source-badge ${sourceType}">${sourceType.toUpperCase()}</span>` : '';
+  const sourceClass = sourceType === 'openFoodFacts' ? 'off' : sourceType;
+  const sourceLabel = sourceType === 'openFoodFacts' ? 'OFF' : sourceType.toUpperCase();
+  const sourceBadge = sourceType ? `<span class="source-badge ${sourceClass}">${sourceLabel}</span>` : '';
   return `
     <div class="food-result-item" data-food-id="${food.id}" role="button" tabindex="0" aria-label="${escapeHTML(food.name)}, ${Math.round(kcal)} calories per ${servingLabel}">
       <div class="food-result-info">

@@ -95,13 +95,19 @@ function calculateRelevance(food, query) {
  * @param {boolean} [options.localOnly=false] - Only search local database
  * @param {number} [options.limit=50] - Maximum results to return
  * @param {number} [options.apiPageSize=20] - Page size for API search
+ * @param {Object} [options.sources] - Which sources to include { local, usda, off }
+ * @param {number} [options.offPage=1] - OFF page number for pagination
+ * @param {number} [options.usdaPage=1] - USDA page number for pagination
  * @returns {Promise<Array>} Combined results sorted by relevance
  */
 async function searchFoods(query, options = {}) {
   const {
     localOnly = false,
     limit = 50,
-    apiPageSize = 20
+    apiPageSize = 20,
+    sources = { local: true, usda: true, off: true },
+    offPage = 1,
+    usdaPage = 1
   } = options;
 
   if (!query || query.trim().length === 0) {
@@ -115,21 +121,22 @@ async function searchFoods(query, options = {}) {
 
   try {
     // Search local database first
-    const localFoods = await getAll(LOCAL_STORE_NAME);
+    if (sources.local) {
+      const localFoods = await getAll(LOCAL_STORE_NAME);
 
-    if (localFoods && localFoods.length > 0) {
-      const queryLower = queryTrim.toLowerCase();
+      if (localFoods && localFoods.length > 0) {
+        const queryLower = queryTrim.toLowerCase();
 
-      for (const food of localFoods) {
-        if (!food.isDeleted && food.name) {
-          if (food.name.toLowerCase().includes(queryLower)) {
-            // Add relevance score for sorting
-            food._relevance = calculateRelevance(food.name, queryTrim);
-            results.push(food);
+        for (const food of localFoods) {
+          if (!food.isDeleted && food.name) {
+            if (food.name.toLowerCase().includes(queryLower)) {
+              food._relevance = calculateRelevance(food.name, queryTrim);
+              results.push(food);
 
-            seenNames.add(food.name.toLowerCase());
-            if (food.barcode?.ean13) {
-              seenBarcodes.add(food.barcode.ean13);
+              seenNames.add(food.name.toLowerCase());
+              if (food.barcode?.ean13) {
+                seenBarcodes.add(food.barcode.ean13);
+              }
             }
           }
         }
@@ -148,89 +155,87 @@ async function searchFoods(query, options = {}) {
     }
 
     // Search Open Food Facts API
-    const cacheKey = `search_${queryTrim}`;
-    let apiResults = await getCached('openfoodfacts', cacheKey);
+    if (sources.off) {
+      const cacheKey = `search_${queryTrim}_p${offPage}`;
+      let apiResults = await getCached('openfoodfacts', cacheKey);
 
-    if (!apiResults) {
-      apiResults = await openfoodfacts.searchFoods(
-        queryTrim,
-        1,
-        apiPageSize
-      );
-
-      if (apiResults && apiResults.length > 0) {
-        // Cache for 24 hours
-        await setCache('openfoodfacts', cacheKey, apiResults, 86400);
-      }
-    }
-
-    // Add API results that aren't duplicates
-    // Ensure all API results have IDs (handles stale cache without id field)
-    if (apiResults && apiResults.length > 0) {
-      for (const apiFood of apiResults) {
-        if (!apiFood.id) {
-          apiFood.id = `off-${apiFood.barcode?.ean13 || Math.random().toString(36).slice(2, 11)}`;
-        }
-        const nameLower = apiFood.name?.toLowerCase();
-        const barcode = apiFood.barcode?.ean13;
-
-        // Skip if we already have this by name or barcode
-        if (seenNames.has(nameLower) || (barcode && seenBarcodes.has(barcode))) {
-          continue;
-        }
-
-        // Skip if too similar to existing local food
-        const isDuplicate = results.some(existing =>
-          areSimilarNames(existing.name, apiFood.name)
+      if (!apiResults) {
+        apiResults = await openfoodfacts.searchFoods(
+          queryTrim,
+          offPage,
+          apiPageSize
         );
 
-        if (isDuplicate) {
-          continue;
+        if (apiResults && apiResults.length > 0) {
+          await setCache('openfoodfacts', cacheKey, apiResults, 86400);
         }
+      }
 
-        apiFood._relevance = calculateRelevance(apiFood.name, queryTrim);
-        results.push(apiFood);
+      if (apiResults && apiResults.length > 0) {
+        for (const apiFood of apiResults) {
+          if (!apiFood.id) {
+            apiFood.id = `off-${apiFood.barcode?.ean13 || Math.random().toString(36).slice(2, 11)}`;
+          }
+          const nameLower = apiFood.name?.toLowerCase();
+          const barcode = apiFood.barcode?.ean13;
 
-        if (nameLower) {
-          seenNames.add(nameLower);
-        }
-        if (barcode) {
-          seenBarcodes.add(barcode);
+          if (seenNames.has(nameLower) || (barcode && seenBarcodes.has(barcode))) {
+            continue;
+          }
+
+          const isDuplicate = results.some(existing =>
+            areSimilarNames(existing.name, apiFood.name)
+          );
+
+          if (isDuplicate) {
+            continue;
+          }
+
+          apiFood._relevance = calculateRelevance(apiFood.name, queryTrim);
+          results.push(apiFood);
+
+          if (nameLower) {
+            seenNames.add(nameLower);
+          }
+          if (barcode) {
+            seenBarcodes.add(barcode);
+          }
         }
       }
     }
 
     // Search USDA FoodData Central (if API key configured)
-    try {
-      const usda = await getUsda();
-      if (usda) {
-        const usdaCacheKey = `usda_search_${queryTrim}`;
-        let usdaResults = await getCached('usda', usdaCacheKey);
+    if (sources.usda) {
+      try {
+        const usda = await getUsda();
+        if (usda) {
+          const usdaCacheKey = `usda_search_${queryTrim}_p${usdaPage}`;
+          let usdaResults = await getCached('usda', usdaCacheKey);
 
-        if (!usdaResults) {
-          usdaResults = await usda.searchFoods(queryTrim, 1, 10);
+          if (!usdaResults) {
+            usdaResults = await usda.searchFoods(queryTrim, usdaPage, apiPageSize);
+            if (usdaResults && usdaResults.length > 0) {
+              await setCache('usda', usdaCacheKey, usdaResults, 30 * 86400);
+            }
+          }
+
           if (usdaResults && usdaResults.length > 0) {
-            await setCache('usda', usdaCacheKey, usdaResults, 30 * 86400); // 30 days
+            for (const usdaFood of usdaResults) {
+              if (!usdaFood.id) continue;
+              const nameLower = usdaFood.name?.toLowerCase();
+              const isDuplicate = seenNames.has(nameLower) ||
+                results.some(existing => areSimilarNames(existing.name, usdaFood.name));
+              if (isDuplicate) continue;
+
+              usdaFood._relevance = calculateRelevance(usdaFood.name, queryTrim);
+              results.push(usdaFood);
+              if (nameLower) seenNames.add(nameLower);
+            }
           }
         }
-
-        if (usdaResults && usdaResults.length > 0) {
-          for (const usdaFood of usdaResults) {
-            if (!usdaFood.id) continue;
-            const nameLower = usdaFood.name?.toLowerCase();
-            const isDuplicate = seenNames.has(nameLower) ||
-              results.some(existing => areSimilarNames(existing.name, usdaFood.name));
-            if (isDuplicate) continue;
-
-            usdaFood._relevance = calculateRelevance(usdaFood.name, queryTrim);
-            results.push(usdaFood);
-            if (nameLower) seenNames.add(nameLower);
-          }
-        }
+      } catch (err) {
+        console.warn('USDA search failed:', err);
       }
-    } catch (err) {
-      // USDA search is optional — don't block on failure
-      console.warn('USDA search failed:', err);
     }
 
     // Sort by relevance and return limited results

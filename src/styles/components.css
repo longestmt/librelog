@@ -1530,6 +1530,38 @@ textarea.input {
     box-shadow: 0 0 0 3px rgba(212, 204, 180, .12);
 }
 
+/* ---------- Source Filter Chips ---------- */
+.search-source-filters {
+    display: flex;
+    gap: var(--sp-2);
+    margin-bottom: var(--sp-3);
+}
+
+.source-filter-chip {
+    padding: var(--sp-1) var(--sp-3);
+    border-radius: var(--radius-full);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-semibold);
+    font-family: var(--font-sans);
+    letter-spacing: 0.02em;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all var(--duration-fast) var(--ease-out);
+}
+
+.source-filter-chip.active {
+    background: var(--bg-elevated);
+    border-color: var(--accent);
+    color: var(--text-primary);
+}
+
+.source-filter-chip:hover:not(.active) {
+    border-color: var(--text-muted);
+    color: var(--text-secondary);
+}
+
 .meal-type-badge {
     padding: var(--sp-2) var(--sp-4);
     background: var(--bg-elevated);
