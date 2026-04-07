@@ -1530,11 +1530,52 @@ textarea.input {
     box-shadow: 0 0 0 3px rgba(212, 204, 180, .12);
 }
 
-/* ---------- Source Filter Chips ---------- */
+/* ---------- Search Input Row ---------- */
+.search-input-row {
+    display: flex;
+    gap: var(--sp-2);
+    align-items: center;
+}
+
+.search-input-row .search-input-wrapper {
+    flex: 1;
+}
+
+/* ---------- Filter Button & Chips ---------- */
+.search-filter-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 42px;
+    height: 42px;
+    flex-shrink: 0;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all var(--duration-fast) var(--ease-out);
+}
+
+.search-filter-btn:hover {
+    border-color: var(--accent);
+    color: var(--text-primary);
+}
+
+.search-filter-btn.has-filter {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
 .search-source-filters {
     display: flex;
     gap: var(--sp-2);
     margin-bottom: var(--sp-3);
+    padding-top: var(--sp-2);
+}
+
+.search-source-filters.hidden {
+    display: none;
 }
 
 .source-filter-chip {

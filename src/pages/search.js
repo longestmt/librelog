@@ -140,11 +140,16 @@ export function renderSearchPage(container, queryString) {
     const frequentFoods = await getFavoriteFoods();
 
     el.innerHTML = `
-      <div class="search-input-wrapper">
-        <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-        <input type="text" class="search-input" id="food-search-input" placeholder="Search foods..." autocomplete="off" aria-label="Search for foods" role="searchbox" value="${escapeHTML(searchQuery)}">
+      <div class="search-input-row">
+        <div class="search-input-wrapper">
+          <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <input type="text" class="search-input" id="food-search-input" placeholder="Search foods..." autocomplete="off" aria-label="Search for foods" role="searchbox" value="${escapeHTML(searchQuery)}">
+        </div>
+        <button class="search-filter-btn ${(!searchSources.local || !searchSources.usda || !searchSources.off) ? 'has-filter' : ''}" id="filter-toggle-btn" aria-label="Filter sources" aria-expanded="false">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+        </button>
       </div>
-      <div class="search-source-filters" role="group" aria-label="Filter by source">
+      <div class="search-source-filters hidden" id="source-filters" role="group" aria-label="Filter by source">
         <button class="source-filter-chip ${searchSources.local ? 'active' : ''}" data-source="local">Local</button>
         <button class="source-filter-chip ${searchSources.usda ? 'active' : ''}" data-source="usda">USDA</button>
         <button class="source-filter-chip ${searchSources.off ? 'active' : ''}" data-source="off">OFF</button>
@@ -162,17 +167,25 @@ export function renderSearchPage(container, queryString) {
     bindFoodResultEvents([...recentFoods, ...frequentFoods]);
     document.getElementById('add-custom-food-btn')?.addEventListener('click', openCustomFoodForm);
 
+    // Filter toggle
+    const filterBtn = document.getElementById('filter-toggle-btn');
+    const filterPanel = document.getElementById('source-filters');
+    filterBtn?.addEventListener('click', () => {
+      const open = filterPanel.classList.toggle('hidden');
+      filterBtn.setAttribute('aria-expanded', !open);
+    });
+
     // Source filter chips
     document.querySelectorAll('.source-filter-chip').forEach(chip => {
       chip.addEventListener('click', () => {
         const source = chip.dataset.source;
         searchSources[source] = !searchSources[source];
-        // Ensure at least one source stays active
         if (!searchSources.local && !searchSources.usda && !searchSources.off) {
           searchSources[source] = true;
           return;
         }
         chip.classList.toggle('active', searchSources[source]);
+        filterBtn.classList.toggle('has-filter', !searchSources.local || !searchSources.usda || !searchSources.off);
         offPage = 1;
         usdaPage = 1;
         if (searchQuery) performTextSearch();
