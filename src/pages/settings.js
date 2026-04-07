@@ -1,4 +1,4 @@
-import { getSetting, setSetting } from '../data/db.js';
+import { getSetting, setSetting, clearAllData } from '../data/db.js';
 import { getGoals, setGoals } from '../engine/goal-tracking.js';
 import { exportData, importData, importMyFitnessPalCSV } from '../data/io.js';
 import { pushToWebDav, pullFromWebDav } from '../data/webdav.js';
@@ -400,7 +400,7 @@ export function renderSettingsPage(container, queryString) {
     document.getElementById('cancel-btn').addEventListener('click', closeModal);
     document.getElementById('confirm-btn').addEventListener('click', async () => {
       try {
-        indexedDB.deleteDatabase('librelog');
+        await clearAllData();
         closeModal();
         showToast('All data cleared');
         setTimeout(() => {

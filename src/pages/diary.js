@@ -70,22 +70,6 @@ export function renderDiaryPage(container, queryString) {
           </button>
         </div>
 
-        <!-- Quick Actions -->
-        <div class="diary-actions">
-          <button class="btn btn-ghost btn-small" id="copy-day-btn" aria-label="Copy meals from another day">
-            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            Copy Day
-          </button>
-          <button class="btn btn-ghost btn-small" id="save-template-btn" aria-label="Save today as meal template">
-            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
-            Save Template
-          </button>
-          <button class="btn btn-ghost btn-small" id="load-template-btn" aria-label="Load a saved meal template">
-            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-            Load Template
-          </button>
-        </div>
-
         <!-- Nutrition Ring and Macros -->
         <div class="nutrition-summary" role="region" aria-label="Nutrition summary">
           <div class="nutrition-ring-container">
@@ -186,6 +170,22 @@ export function renderDiaryPage(container, queryString) {
             rows="2"
             aria-label="Daily notes for ${formatDate(currentDate)}"
           >${escapeHTML(dailyNote)}</textarea>
+        </div>
+
+        <!-- Quick Actions -->
+        <div class="diary-actions">
+          <button class="btn btn-ghost btn-small" id="copy-day-btn" aria-label="Copy meals from another day">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            Copy Day
+          </button>
+          <button class="btn btn-ghost btn-small" id="save-template-btn" aria-label="Save today as meal template">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
+            Save Template
+          </button>
+          <button class="btn btn-ghost btn-small" id="load-template-btn" aria-label="Load a saved meal template">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            Load Template
+          </button>
         </div>
 
         <!-- FAB Button -->

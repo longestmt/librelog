@@ -30,25 +30,26 @@ function normalizeProduct(product) {
       },
       nutrients: {
         energy: {
-          kcal: nutriments['energy-kcal_100g'] || nutriments['energy_100g'] ?
-            (nutriments['energy-kcal_100g'] || Math.round((nutriments['energy_100g'] || 0) / 4.184)) : 0
+          kcal: (nutriments['energy-kcal_100g'] ?? null) !== null
+            ? nutriments['energy-kcal_100g']
+            : Math.round((nutriments['energy_100g'] ?? 0) / 4.184)
         },
         macros: {
           protein: {
-            g: nutriments.proteins_100g || 0
+            g: nutriments.proteins_100g ?? 0
           },
           carbs: {
-            g: nutriments.carbohydrates_100g || 0
+            g: nutriments.carbohydrates_100g ?? 0
           },
           fat: {
-            g: nutriments.fat_100g || 0
+            g: nutriments.fat_100g ?? 0
           }
         },
         fiber: {
-          g: nutriments.fiber_100g || 0
+          g: nutriments.fiber_100g ?? 0
         },
         sodium: {
-          mg: nutriments.sodium_100g ? nutriments.sodium_100g * 10 : 0
+          mg: nutriments.sodium_100g != null ? nutriments.sodium_100g * 10 : 0
         }
       },
       barcode: {

@@ -38,7 +38,7 @@ function getNutrientValue(foodNutrients, nutrientId) {
     return 0;
   }
 
-  return nutrient.value || nutrient.amount || 0;
+  return nutrient.value ?? nutrient.amount ?? 0;
 }
 
 /**
