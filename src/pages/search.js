@@ -57,12 +57,13 @@ export function renderSearchPage(container, queryString) {
   let recorder = null;
   let isRecording = false;
   let amplitudeInterval = null;
+  let aiProvider = null;
 
   async function render() {
     // Determine which modes to show based on AI config
     const ai = await loadAI();
     const aiConfigured = ai ? await ai.isAIConfigured() : false;
-    let aiProvider = null;
+    aiProvider = null;
     if (aiConfigured && ai) { const cfg = await ai.getAIConfig(); aiProvider = cfg.provider; }
 
     const visibleModes = MODES.filter(m => {
