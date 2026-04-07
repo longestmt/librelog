@@ -33,7 +33,6 @@ async function renderRecipeList(container) {
     <div class="recipes-page" role="main" aria-label="Recipes">
       <div class="page-header">
         <h1 class="page-title">Recipes</h1>
-        <button class="btn btn-primary" id="new-recipe-btn" aria-label="Create new recipe">New Recipe</button>
       </div>
 
       ${recipes.length === 0 ? `
@@ -68,6 +67,10 @@ async function renderRecipeList(container) {
           }).join('')}
         </div>
       `}
+
+      <button class="fab" id="new-recipe-btn" aria-label="Create new recipe">
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm5 11h-4v4h-2v-4H7v-2h4V7h2v4h4v2z"/></svg>
+      </button>
     </div>
   `;
 
@@ -339,7 +342,7 @@ async function renderRecipeDetail(container, recipeId) {
         <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
         <input type="text" class="search-input" id="ingredient-search-input" placeholder="Search foods..." autocomplete="off" aria-label="Search for a food to add as ingredient" role="searchbox">
       </div>
-      <div id="ingredient-search-results" class="search-content">
+      <div id="ingredient-search-results" class="ingredient-search-results">
         <div class="search-empty"><p>Type to search for foods</p></div>
       </div>
     `;

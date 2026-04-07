@@ -14,6 +14,7 @@ For each food mentioned, provide:
 - protein: grams
 - carbs: grams
 - fat: grams
+- confidence: your confidence in the identification and portion estimate (0.0-1.0)
 
 Handle natural language quantities:
 - "a handful of almonds" → ~30g
@@ -246,7 +247,7 @@ export function normalizeParsedFoods(foods) {
       fiber: { g: 0 },
       sodium: { mg: 0 },
     },
-    source: { type: 'ai-voice' },
-    _aiMeta: { confidence: 0.7 },
+    source: { type: 'ai-voice', confidence: food.confidence ?? 0.7 },
+    _aiMeta: { confidence: food.confidence ?? 0.7 },
   }));
 }

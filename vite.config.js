@@ -1,15 +1,20 @@
 import { defineConfig } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
+import basicSsl from '@vitejs/plugin-basic-ssl';
 
 export default defineConfig({
     base: '/',
     root: '.',
     publicDir: 'public',
+    server: {
+        host: '0.0.0.0',
+    },
     build: {
         outDir: 'dist',
         emptyOutDir: true,
     },
     plugins: [
+        basicSsl(),
         VitePWA({
             registerType: 'autoUpdate',
             includeAssets: ['favicon.svg', 'icon-192.png', 'icon-512.png'],

@@ -26,11 +26,13 @@ let Quagga = null;
 let aiClientMod = null;
 let imageProcessorMod = null;
 let voiceParserMod = null;
+let clarificationMod = null;
 
 async function loadQuagga() { if (Quagga) return Quagga; try { const m = await import('@ericblade/quagga2'); Quagga = m.default || m; return Quagga; } catch { return null; } }
 async function loadAI() { if (aiClientMod) return aiClientMod; try { aiClientMod = await import('../integrations/aiClient.js'); return aiClientMod; } catch { return null; } }
 async function loadImageProcessor() { if (imageProcessorMod) return imageProcessorMod; try { imageProcessorMod = await import('../integrations/imageProcessor.js'); return imageProcessorMod; } catch { return null; } }
 async function loadVoiceParser() { if (voiceParserMod) return voiceParserMod; try { voiceParserMod = await import('../integrations/voiceParser.js'); return voiceParserMod; } catch { return null; } }
+async function loadClarification() { if (clarificationMod) return clarificationMod; try { clarificationMod = await import('../integrations/clarificationEngine.js'); return clarificationMod; } catch { return null; } }
 
 export function renderSearchPage(container, queryString) {
   const params = new URLSearchParams(queryString);
@@ -51,6 +53,7 @@ export function renderSearchPage(container, queryString) {
   // AI state
   let aiProcessing = false;
   let aiResults = null;
+  let clarificationData = null;
   let recorder = null;
   let isRecording = false;
   let amplitudeInterval = null;
@@ -73,19 +76,17 @@ export function renderSearchPage(container, queryString) {
 
     container.innerHTML = `
       <div class="search-page" role="main" aria-label="Add food">
-        <!-- Header: meal type toggle -->
+        <!-- Header: mode tabs + meal type badge in one row -->
         <div class="search-top-bar">
+          <div class="search-mode-tabs" role="tablist" aria-label="Add food method">
+            ${visibleModes.map(m => `
+              <button class="search-mode-tab ${mode === m.key ? 'active' : ''}" data-mode="${m.key}" role="tab" aria-selected="${mode === m.key}" aria-label="${m.label}">
+                ${m.icon}
+                <span>${m.label}</span>
+              </button>
+            `).join('')}
+          </div>
           <button class="meal-type-badge" id="meal-type-toggle" aria-label="Logging to ${mealType}. Tap to change.">${mealType}</button>
-        </div>
-
-        <!-- Mode tabs -->
-        <div class="search-mode-tabs" role="tablist" aria-label="Add food method">
-          ${visibleModes.map(m => `
-            <button class="search-mode-tab ${mode === m.key ? 'active' : ''}" data-mode="${m.key}" role="tab" aria-selected="${mode === m.key}" aria-label="${m.label}">
-              ${m.icon}
-              <span>${m.label}</span>
-            </button>
-          `).join('')}
         </div>
 
         <!-- Mode content -->
@@ -345,6 +346,7 @@ export function renderSearchPage(container, queryString) {
   // ===== PHOTO MODE =====
   function renderPhotoMode(el) {
     if (aiProcessing) { el.innerHTML = renderAIProcessing('photo'); return; }
+    if (clarificationData?.questions?.length) { el.innerHTML = renderClarificationUI(); wireClarificationEvents(); return; }
     if (aiResults) { el.innerHTML = renderAIResults(); wireAIResultEvents(); return; }
 
     el.innerHTML = `
@@ -379,6 +381,7 @@ export function renderSearchPage(container, queryString) {
       const proc = await loadImageProcessor();
       const result = await proc.analyzeImage(dataUrl);
       aiResults = result.success ? result : { foods: [], error: result.error };
+      if (aiResults?.foods?.length) await checkClarification();
     } catch (err) { aiResults = { foods: [], error: 'Analysis failed' }; }
     aiProcessing = false;
     renderModeContent();
@@ -387,6 +390,7 @@ export function renderSearchPage(container, queryString) {
   // ===== VOICE MODE =====
   function renderVoiceMode(el) {
     if (aiProcessing) { el.innerHTML = renderAIProcessing('voice'); return; }
+    if (clarificationData?.questions?.length) { el.innerHTML = renderClarificationUI(); wireClarificationEvents(); return; }
     if (aiResults) { el.innerHTML = renderAIResults(); wireAIResultEvents(); return; }
 
     el.innerHTML = `
@@ -437,6 +441,7 @@ export function renderSearchPage(container, queryString) {
       const transcription = await vp.transcribeAudio(blob, liveTranscript);
       if (!transcription.text) { aiResults = { foods: [], error: transcription.error || 'Could not transcribe' }; }
       else { const parsed = await vp.parseTranscription(transcription.text); aiResults = parsed.success ? parsed : { foods: [], error: parsed.error }; }
+      if (aiResults?.foods?.length) await checkClarification();
     } catch { aiResults = { foods: [], error: 'Voice processing failed' }; }
     aiProcessing = false;
     renderModeContent();
@@ -452,6 +457,7 @@ export function renderSearchPage(container, queryString) {
   // ===== TEXT AI MODE =====
   function renderTextMode(el) {
     if (aiProcessing) { el.innerHTML = renderAIProcessing('text'); return; }
+    if (clarificationData?.questions?.length) { el.innerHTML = renderClarificationUI(); wireClarificationEvents(); return; }
     if (aiResults) { el.innerHTML = renderAIResults(); wireAIResultEvents(); return; }
 
     el.innerHTML = `
@@ -481,9 +487,89 @@ export function renderSearchPage(container, queryString) {
       const vp = await loadVoiceParser();
       const parsed = await vp.parseTranscription(text);
       aiResults = parsed.success ? parsed : { foods: [], error: parsed.error };
+      if (aiResults?.foods?.length) await checkClarification();
     } catch { aiResults = { foods: [], error: 'AI analysis failed' }; }
     aiProcessing = false;
     renderModeContent();
+  }
+
+  // ===== CLARIFICATION =====
+  async function checkClarification() {
+    const engine = await loadClarification();
+    if (!engine || !engine.needsClarification(aiResults.foods)) {
+      clarificationData = null;
+      return;
+    }
+    try {
+      clarificationData = await engine.generateClarifications(aiResults.foods);
+      if (!clarificationData?.questions?.length) clarificationData = null;
+    } catch {
+      clarificationData = null;
+    }
+  }
+
+  function renderClarificationUI() {
+    const questions = clarificationData.questions;
+    return `
+      <div class="clarify-container">
+        <p class="clarify-header">A few quick questions to improve accuracy:</p>
+        ${questions.map((q, qi) => {
+          const food = aiResults.foods[q.foodIndex];
+          const foodName = food ? escapeHTML(food.name) : 'Unknown';
+          return `
+            <div class="clarify-card" data-question-index="${qi}">
+              <div class="clarify-question">${escapeHTML(q.question)}</div>
+              <div class="clarify-food-context">${foodName}</div>
+              <div class="clarify-options">
+                ${q.options.map((opt, oi) => `
+                  <button class="clarify-option ${oi === 0 ? 'selected' : ''}" data-question="${qi}" data-option="${oi}">${escapeHTML(opt.label)}</button>
+                `).join('')}
+              </div>
+            </div>
+          `;
+        }).join('')}
+        <div class="clarify-actions">
+          <button class="btn btn-secondary" id="clarify-skip-btn">Skip</button>
+          <button class="btn btn-primary" id="clarify-done-btn">Done</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function wireClarificationEvents() {
+    // Option selection
+    document.querySelectorAll('.clarify-option').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const qi = btn.dataset.question;
+        document.querySelectorAll(`.clarify-option[data-question="${qi}"]`).forEach(b => b.classList.remove('selected'));
+        btn.classList.add('selected');
+      });
+    });
+
+    // Skip — go to results with original data
+    document.getElementById('clarify-skip-btn')?.addEventListener('click', () => {
+      clarificationData = null;
+      renderModeContent();
+    });
+
+    // Done — apply refinements and show results
+    document.getElementById('clarify-done-btn')?.addEventListener('click', async () => {
+      const engine = await loadClarification();
+      if (!engine) { clarificationData = null; renderModeContent(); return; }
+
+      for (const q of clarificationData.questions) {
+        const selectedBtn = document.querySelector(`.clarify-option[data-question="${clarificationData.questions.indexOf(q)}"].selected`);
+        if (!selectedBtn) continue;
+        const optIdx = parseInt(selectedBtn.dataset.option);
+        const option = q.options[optIdx];
+        if (option) {
+          aiResults.foods = engine.applyRefinement(aiResults.foods, q.foodIndex, option);
+        }
+      }
+
+      clarificationData = null;
+      renderModeContent();
+    });
   }
 
   // ===== SHARED AI RESULTS =====
