@@ -5,3 +5,5 @@ dist/
 .env
 .env.*
 PRD.md
+README-SPECIFICATION.md
+TECHNICAL-SPEC-INDEX.md
