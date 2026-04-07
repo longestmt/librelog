@@ -12,7 +12,9 @@ For each food item, provide:
 
 Return a JSON object with a "foods" array. Be specific about portion sizes.
 If you cannot identify a food, include it with a low confidence score and your best guess.
-Estimate portions conservatively — it's better to underestimate than overestimate.`;
+Estimate portions conservatively — it's better to underestimate than overestimate.
+
+Critical: estimate the ACTUAL portion visible, not per-100g defaults. If you see a whole plate of pasta, estimate the full plate weight (~300g), not 100g. If you see a tin of sardines, use the real tin weight (~125g). Calculate calories and macros for the total visible portion.`;
 
 /**
  * Analyze a food photo and return identified foods with nutrition estimates.

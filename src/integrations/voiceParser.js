@@ -25,6 +25,15 @@ Handle natural language quantities:
 
 Important: quantity and unit must be logically consistent. If using a container unit (bowl, tin, cup, glass), quantity should be the count of containers (e.g., 1 bowl, 2 cups). If using weight/volume units (g, ml, oz), quantity should be the amount in that unit (e.g., 250 g). Never combine a weight number with a container unit.
 
+Critical: calculate calories and macros for the TOTAL portion described, not per 100g. When a user mentions a packaged container (tin, can, bottle, bar, bag, packet, box), use realistic product weights:
+- a tin/can of sardines → ~125g total, ~310 kcal
+- a can of tuna → ~160g drained, ~200 kcal
+- a protein bar → ~60g, ~220 kcal
+- a bag/packet of chips → ~28g (single serve), ~140 kcal
+- a can of soda → ~355ml, ~140 kcal
+- a bottle of beer → ~355ml, ~150 kcal
+Do NOT default to 100g. Use the actual expected weight of the container or serving the user described.
+
 Return a JSON object with a "foods" array. If uncertain about portions, use standard serving sizes.`;
 
 /**
