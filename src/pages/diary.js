@@ -371,10 +371,10 @@ function renderMealSection(mealType, mealsOfType, foodsMap) {
               const name = food?.name || item.foodId || 'Unknown food';
               const unit = item.unit || food?.servingSize?.unit || 'g';
               return `
-                <div class="food-item" data-meal-id="${meal.id}" data-food-index="${foodIdx}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${item.quantity}${unit}, ${Math.round(kcal)} calories. Click to edit.">
+                <div class="food-item" data-meal-id="${meal.id}" data-food-index="${foodIdx}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${item.quantity} ${unit}, ${Math.round(kcal)} calories. Click to edit.">
                   <div class="food-info">
                     <div class="food-name">${escapeHTML(name)}</div>
-                    <div class="food-portion">${item.quantity}${unit}</div>
+                    <div class="food-portion">${item.quantity} ${unit}</div>
                   </div>
                   <div class="food-calories">${Math.round(kcal)} kcal</div>
                 </div>

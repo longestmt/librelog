@@ -16,9 +16,7 @@ const MEAL_TYPES = ['Breakfast', 'Lunch', 'Dinner', 'Snacks'];
 const MODES = [
   { key: 'search', label: 'Search', icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>' },
   { key: 'scan', label: 'Scan', icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" x2="17" y1="12" y2="12"/></svg>' },
-  { key: 'photo', label: 'Photo', icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>' },
-  { key: 'voice', label: 'Voice', icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>' },
-  { key: 'text', label: 'AI Text', icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' },
+  { key: 'ai', label: 'AI', icon: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>' },
 ];
 
 // Lazy-loaded modules
@@ -54,6 +52,8 @@ export function renderSearchPage(container, queryString) {
   let aiProcessing = false;
   let aiResults = null;
   let clarificationData = null;
+  let aiAttachedPhoto = null;
+  let aiTextValue = '';
   let recorder = null;
   let isRecording = false;
   let amplitudeInterval = null;
@@ -66,8 +66,7 @@ export function renderSearchPage(container, queryString) {
     if (aiConfigured && ai) { const cfg = await ai.getAIConfig(); aiProvider = cfg.provider; }
 
     const visibleModes = MODES.filter(m => {
-      if (m.key === 'photo' || m.key === 'text') return aiConfigured;
-      if (m.key === 'voice') return aiConfigured && aiProvider === 'openai';
+      if (m.key === 'ai') return aiConfigured;
       return true;
     });
 
@@ -111,6 +110,9 @@ export function renderSearchPage(container, queryString) {
         mode = btn.dataset.mode;
         aiResults = null;
         aiProcessing = false;
+        clarificationData = null;
+        aiAttachedPhoto = null;
+        aiTextValue = '';
         renderModeContent();
         document.querySelectorAll('.search-mode-tab').forEach(b => {
           b.classList.toggle('active', b.dataset.mode === mode);
@@ -129,9 +131,7 @@ export function renderSearchPage(container, queryString) {
     switch (mode) {
       case 'search': await renderSearchMode(el); break;
       case 'scan': renderScanMode(el); break;
-      case 'photo': renderPhotoMode(el); break;
-      case 'voice': renderVoiceMode(el); break;
-      case 'text': renderTextMode(el); break;
+      case 'ai': renderAIMode(el); break;
     }
   }
 
@@ -343,107 +343,147 @@ export function renderSearchPage(container, queryString) {
     } catch { resultDiv.innerHTML = '<div class="search-error"><p>Lookup failed</p></div>'; }
   }
 
-  // ===== PHOTO MODE =====
-  function renderPhotoMode(el) {
-    if (aiProcessing) { el.innerHTML = renderAIProcessing('photo'); return; }
+  // ===== UNIFIED AI MODE =====
+  function renderAIMode(el) {
+    if (aiProcessing) { el.innerHTML = renderAIProcessing(aiAttachedPhoto ? 'photo' : 'description'); return; }
     if (clarificationData?.questions?.length) { el.innerHTML = renderClarificationUI(); wireClarificationEvents(); return; }
     if (aiResults) { el.innerHTML = renderAIResults(); wireAIResultEvents(); return; }
 
-    el.innerHTML = `
-      <div class="ai-photo-input">
-        <div class="ai-photo-area">
-          <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-          <p>Take a photo of your meal</p>
-          <p class="text-muted">AI will identify foods and estimate portions</p>
-        </div>
-        <div class="ai-photo-buttons">
-          <button class="btn btn-primary" id="photo-capture-btn">Take Photo</button>
-          <button class="btn btn-secondary" id="photo-gallery-btn">Gallery</button>
-        </div>
-        <input type="file" id="photo-file-input" accept="image/*" capture="environment" style="display:none">
-        <input type="file" id="gallery-file-input" accept="image/*" style="display:none">
-        <div class="ai-disclaimer"><p>AI estimates are not exact. Review before confirming.</p></div>
-      </div>
-    `;
-    document.getElementById('photo-capture-btn')?.addEventListener('click', () => document.getElementById('photo-file-input')?.click());
-    document.getElementById('photo-gallery-btn')?.addEventListener('click', () => document.getElementById('gallery-file-input')?.click());
-    document.getElementById('photo-file-input')?.addEventListener('change', e => { if (e.target.files?.[0]) processPhoto(e.target.files[0]); });
-    document.getElementById('gallery-file-input')?.addEventListener('change', e => { if (e.target.files?.[0]) processPhoto(e.target.files[0]); });
-  }
-
-  async function processPhoto(file) {
-    const ai = await loadAI();
-    if (!ai || !(await ai.isAIConfigured())) { showToast('Set up an AI provider in Settings first'); return; }
-    aiProcessing = true; aiResults = null;
-    renderModeContent();
-    try {
-      const dataUrl = await fileToDataUrl(file);
-      const proc = await loadImageProcessor();
-      const result = await proc.analyzeImage(dataUrl);
-      aiResults = result.success ? result : { foods: [], error: result.error };
-      if (aiResults?.foods?.length) await checkClarification();
-    } catch (err) { aiResults = { foods: [], error: 'Analysis failed' }; }
-    aiProcessing = false;
-    renderModeContent();
-  }
-
-  // ===== VOICE MODE =====
-  function renderVoiceMode(el) {
-    if (aiProcessing) { el.innerHTML = renderAIProcessing('voice'); return; }
-    if (clarificationData?.questions?.length) { el.innerHTML = renderClarificationUI(); wireClarificationEvents(); return; }
-    if (aiResults) { el.innerHTML = renderAIResults(); wireAIResultEvents(); return; }
+    const showVoice = aiProvider === 'openai';
 
     el.innerHTML = `
-      <div class="ai-voice-input">
-        <div class="ai-voice-area">
-          <button class="ai-voice-btn ${isRecording ? 'recording' : ''}" id="voice-record-btn" aria-label="${isRecording ? 'Stop recording' : 'Start recording'}">
-            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="${isRecording ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
-              ${isRecording ? '<rect x="6" y="6" width="12" height="12" rx="2"/>' : '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/>'}
-            </svg>
+      <div class="ai-unified-input">
+        ${aiAttachedPhoto ? `
+          <div class="ai-attached-photo">
+            <img src="${aiAttachedPhoto}" alt="Attached meal photo">
+            <button class="ai-photo-remove" id="ai-remove-photo" aria-label="Remove photo">&#10005;</button>
+          </div>
+        ` : ''}
+        <textarea class="ai-text-area" id="ai-text-input" rows="3" placeholder="Describe what you ate, attach a photo, or both..." aria-label="Describe your meal">${escapeHTML(aiTextValue)}</textarea>
+        <div class="ai-input-actions">
+          <button class="btn btn-secondary btn-small" id="ai-photo-btn" aria-label="Attach photo">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            Photo
           </button>
-          <div class="ai-voice-waveform" id="voice-waveform">${isRecording ? '<div class="waveform-bars">' + Array(12).fill('<div class="waveform-bar"></div>').join('') + '</div>' : ''}</div>
-          <p class="ai-voice-hint">${isRecording ? 'Listening... tap to stop' : 'Tap to start recording'}</p>
-          <p class="ai-voice-example">"I had two eggs, toast with butter, and a coffee"</p>
+          ${showVoice ? `
+            <button class="btn btn-secondary btn-small ${isRecording ? 'recording' : ''}" id="ai-voice-btn" aria-label="${isRecording ? 'Stop recording' : 'Record voice'}">
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="${isRecording ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+                ${isRecording ? '<rect x="6" y="6" width="12" height="12" rx="2"/>' : '<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/>'}
+              </svg>
+              ${isRecording ? 'Stop' : 'Voice'}
+            </button>
+          ` : ''}
+          <button class="btn btn-primary btn-small" id="ai-submit-btn">Analyze</button>
         </div>
+        ${isRecording ? `<div class="ai-recording-indicator"><div class="waveform-bars" id="voice-waveform">${Array(12).fill('<div class="waveform-bar"></div>').join('')}</div><p class="ai-voice-hint">Listening... tap Stop when done</p></div>` : ''}
+        <input type="file" id="ai-photo-capture" accept="image/*" capture="environment" style="display:none">
+        <input type="file" id="ai-photo-gallery" accept="image/*" style="display:none">
         <div class="ai-disclaimer"><p>AI estimates are not exact. Review before confirming.</p></div>
       </div>
     `;
-    document.getElementById('voice-record-btn')?.addEventListener('click', () => isRecording ? stopVoiceAndProcess() : startVoiceRecording());
-  }
 
-  async function startVoiceRecording() {
-    const ai = await loadAI();
-    if (!ai || !(await ai.isAIConfigured())) { showToast('Set up an AI provider in Settings first'); return; }
-    try {
-      const vp = await loadVoiceParser();
-      recorder = await vp.startRecording();
-      isRecording = true;
+    // Photo attachment
+    document.getElementById('ai-photo-btn')?.addEventListener('click', () => {
+      // On mobile, offer camera; on desktop, just gallery
+      if (/Mobi|Android/i.test(navigator.userAgent)) {
+        document.getElementById('ai-photo-capture')?.click();
+      } else {
+        document.getElementById('ai-photo-gallery')?.click();
+      }
+    });
+    document.getElementById('ai-photo-capture')?.addEventListener('change', e => handlePhotoAttach(e));
+    document.getElementById('ai-photo-gallery')?.addEventListener('change', e => handlePhotoAttach(e));
+    document.getElementById('ai-remove-photo')?.addEventListener('click', () => {
+      aiAttachedPhoto = null;
       renderModeContent();
+    });
+
+    // Voice recording
+    document.getElementById('ai-voice-btn')?.addEventListener('click', () => {
+      isRecording ? stopVoiceTranscription() : startVoiceTranscription();
+    });
+
+    // Submit
+    document.getElementById('ai-submit-btn')?.addEventListener('click', processAIInput);
+    document.getElementById('ai-text-input')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) processAIInput();
+    });
+
+    // Persist textarea value on input
+    document.getElementById('ai-text-input')?.addEventListener('input', (e) => {
+      aiTextValue = e.target.value;
+    });
+
+    // Waveform animation
+    if (isRecording) {
       amplitudeInterval = setInterval(() => {
         if (!recorder) return;
         const amp = recorder.getAmplitude();
         document.querySelectorAll('.waveform-bar').forEach(bar => { bar.style.height = `${Math.max(4, amp * 100 * (0.5 + Math.random() * 0.5))}%`; });
       }, 100);
+    }
+  }
+
+  async function handlePhotoAttach(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    aiAttachedPhoto = await fileToDataUrl(file);
+    renderModeContent();
+  }
+
+  async function startVoiceTranscription() {
+    try {
+      const vp = await loadVoiceParser();
+      recorder = await vp.startRecording();
+      isRecording = true;
+      renderModeContent();
     } catch { showToast('Could not access microphone'); isRecording = false; }
   }
 
-  async function stopVoiceAndProcess() {
+  async function stopVoiceTranscription() {
     if (amplitudeInterval) clearInterval(amplitudeInterval);
     amplitudeInterval = null;
     isRecording = false;
     if (!recorder) return;
-    aiProcessing = true;
-    renderModeContent();
     try {
       const vp = await loadVoiceParser();
       const { blob, liveTranscript } = await recorder.stop();
       recorder = null;
       const transcription = await vp.transcribeAudio(blob, liveTranscript);
-      if (!transcription.text) { aiResults = { foods: [], error: transcription.error || 'Could not transcribe' }; }
-      else { const parsed = await vp.parseTranscription(transcription.text); aiResults = parsed.success ? parsed : { foods: [], error: parsed.error }; }
+      if (transcription.text) {
+        aiTextValue = aiTextValue ? `${aiTextValue} ${transcription.text}` : transcription.text;
+      } else {
+        showToast(transcription.error || 'Could not transcribe');
+      }
+    } catch { showToast('Voice transcription failed'); }
+    renderModeContent();
+  }
+
+  async function processAIInput() {
+    const text = document.getElementById('ai-text-input')?.value.trim() || '';
+    if (!text && !aiAttachedPhoto) { showToast('Add a photo or describe your meal'); return; }
+    const ai = await loadAI();
+    if (!ai || !(await ai.isAIConfigured())) { showToast('Set up an AI provider in Settings first'); return; }
+    aiProcessing = true;
+    aiResults = null;
+    renderModeContent();
+    try {
+      if (aiAttachedPhoto) {
+        // Photo mode (with optional text context)
+        const proc = await loadImageProcessor();
+        const result = await proc.analyzeImage(aiAttachedPhoto);
+        aiResults = result.success ? result : { foods: [], error: result.error };
+      } else {
+        // Text-only mode
+        const vp = await loadVoiceParser();
+        const parsed = await vp.parseTranscription(text);
+        aiResults = parsed.success ? parsed : { foods: [], error: parsed.error };
+      }
       if (aiResults?.foods?.length) await checkClarification();
-    } catch { aiResults = { foods: [], error: 'Voice processing failed' }; }
+    } catch { aiResults = { foods: [], error: 'AI analysis failed' }; }
     aiProcessing = false;
+    aiTextValue = '';
+    aiAttachedPhoto = null;
     renderModeContent();
   }
 
@@ -454,49 +494,14 @@ export function renderSearchPage(container, queryString) {
     if (recorder) { try { recorder.cancel(); } catch {} recorder = null; }
   }
 
-  // ===== TEXT AI MODE =====
-  function renderTextMode(el) {
-    if (aiProcessing) { el.innerHTML = renderAIProcessing('text'); return; }
-    if (clarificationData?.questions?.length) { el.innerHTML = renderClarificationUI(); wireClarificationEvents(); return; }
-    if (aiResults) { el.innerHTML = renderAIResults(); wireAIResultEvents(); return; }
-
-    el.innerHTML = `
-      <div class="ai-text-input">
-        <label class="control-group">
-          <span class="control-label">Describe what you ate</span>
-          <textarea class="ai-text-area" id="ai-text-input" rows="4" placeholder="e.g., Two scrambled eggs, a slice of whole wheat toast with butter, and a small glass of orange juice" aria-label="Describe your meal"></textarea>
-        </label>
-        <button class="btn btn-primary" id="ai-text-submit">Analyze with AI</button>
-        <div class="ai-disclaimer"><p>AI estimates are not exact. Review before confirming.</p></div>
-      </div>
-    `;
-    document.getElementById('ai-text-submit')?.addEventListener('click', processTextDescription);
-    document.getElementById('ai-text-input')?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) processTextDescription();
-    });
-  }
-
-  async function processTextDescription() {
-    const text = document.getElementById('ai-text-input')?.value.trim();
-    if (!text) { showToast('Please describe your meal'); return; }
-    const ai = await loadAI();
-    if (!ai || !(await ai.isAIConfigured())) { showToast('Set up an AI provider in Settings first'); return; }
-    aiProcessing = true;
-    renderModeContent();
-    try {
-      const vp = await loadVoiceParser();
-      const parsed = await vp.parseTranscription(text);
-      aiResults = parsed.success ? parsed : { foods: [], error: parsed.error };
-      if (aiResults?.foods?.length) await checkClarification();
-    } catch { aiResults = { foods: [], error: 'AI analysis failed' }; }
-    aiProcessing = false;
-    renderModeContent();
-  }
-
   // ===== CLARIFICATION =====
   async function checkClarification() {
     const engine = await loadClarification();
-    if (!engine || !engine.needsClarification(aiResults.foods)) {
+    if (!engine) {
+      clarificationData = null;
+      return;
+    }
+    if (!engine.needsClarification(aiResults.foods)) {
       clarificationData = null;
       return;
     }
@@ -599,7 +604,7 @@ export function renderSearchPage(container, queryString) {
             const unit = food.servingSize?.unit || 'g';
             return `<div class="ai-food-item"><label class="ai-food-row">
               <input type="checkbox" class="ai-food-check" data-index="${i}" checked>
-              <div class="ai-food-info"><div class="ai-food-name">${escapeHTML(food.name)}</div><div class="ai-food-portion">${qty}${unit}</div></div>
+              <div class="ai-food-info"><div class="ai-food-name">${escapeHTML(food.name)}</div><div class="ai-food-portion">${qty} ${unit}</div></div>
               <div class="ai-food-nutrition"><span class="ai-food-kcal">${Math.round(kcal)} kcal</span><span class="ai-food-macros">${Math.round(p)}P ${Math.round(c)}C ${Math.round(f)}F</span></div>
               <span class="ai-confidence ai-confidence-${cls}">${pct}%</span>
             </label></div>`;
@@ -681,7 +686,7 @@ function renderFoodResult(food) {
   const fat = food.nutrients?.macros?.fat?.g || 0;
   const kcal = food.nutrients?.energy?.kcal || 0;
   const macroSummary = `${Math.round(protein)}P ${Math.round(carbs)}C ${Math.round(fat)}F`;
-  const servingLabel = food.servingSize ? `${food.servingSize.quantity}${food.servingSize.unit}` : '100g';
+  const servingLabel = food.servingSize ? `${food.servingSize.quantity} ${food.servingSize.unit}` : '100g';
   const sourceType = food.source?.type || '';
   const sourceClass = sourceType === 'openFoodFacts' ? 'off' : sourceType;
   const sourceLabel = sourceType === 'openFoodFacts' ? 'OFF' : sourceType.toUpperCase();

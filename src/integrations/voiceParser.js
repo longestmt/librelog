@@ -9,7 +9,7 @@ const VOICE_PARSE_PROMPT = `You are a food logging assistant. Parse the user's s
 For each food mentioned, provide:
 - name: the food name
 - quantity: numeric amount
-- unit: unit of measurement (g, oz, cup, tbsp, piece, etc.)
+- unit: unit of measurement (g, ml, oz, cup, tbsp, tsp, piece, slice, tin, bowl, serving, etc.)
 - calories: estimated kcal
 - protein: grams
 - carbs: grams
@@ -21,6 +21,9 @@ Handle natural language quantities:
 - "two eggs" → 2 pieces
 - "a glass of milk" → 240ml
 - "some rice" → ~150g (one serving)
+- "a bowl of miso soup" → 1 bowl (NOT 250 bowl)
+
+Important: quantity and unit must be logically consistent. If using a container unit (bowl, tin, cup, glass), quantity should be the count of containers (e.g., 1 bowl, 2 cups). If using weight/volume units (g, ml, oz), quantity should be the amount in that unit (e.g., 250 g). Never combine a weight number with a container unit.
 
 Return a JSON object with a "foods" array. If uncertain about portions, use standard serving sizes.`;
 
