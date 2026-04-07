@@ -11,6 +11,8 @@ const REQUEST_TIMEOUT_MS = 8000;
 /** USDA nutrient ID mapping */
 const NUTRIENT_IDS = {
   ENERGY: 1008,
+  ENERGY_ATWATER_GENERAL: 2047,
+  ENERGY_ATWATER_SPECIFIC: 2048,
   PROTEIN: 1003,
   TOTAL_FAT: 1004,
   CARBS: 1005,
@@ -66,6 +68,8 @@ function normalizeFood(food) {
       nutrients: {
         energy: {
           kcal: getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY)
+            || getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_GENERAL)
+            || getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_SPECIFIC)
         },
         macros: {
           protein: {
