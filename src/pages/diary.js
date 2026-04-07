@@ -513,9 +513,16 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
   document.getElementById('modal-close').addEventListener('click', closeModal);
 
   document.getElementById('save-btn').addEventListener('click', async () => {
+    const multiplier = getNutritionMultiplier(quantity, unit, food);
     item.quantity = quantity;
     item.unit = unit;
     item.notes = notesInput.value;
+    item.nutrients = {
+      kcal: Math.round(baseNutrition.calories * multiplier),
+      protein: Math.round(baseNutrition.protein * multiplier),
+      carbs: Math.round(baseNutrition.carbs * multiplier),
+      fat: Math.round(baseNutrition.fat * multiplier),
+    };
     await put('meals', meal);
     showToast('Food updated');
     closeModal();
