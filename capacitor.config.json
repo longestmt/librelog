@@ -1,0 +1,13 @@
+{
+  "appId": "com.librelog.app",
+  "appName": "LibreLog",
+  "webDir": "dist",
+  "server": {
+    "cleartext": true
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}

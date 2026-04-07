@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- LibreLog Icon — fork & knife, monastic minimalism -->
+
+  <!-- Fork -->
+  <g fill="none" stroke="#d4ccb4" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Tines -->
+    <line x1="120" y1="64" x2="120" y2="192" />
+    <line x1="176" y1="64" x2="176" y2="192" />
+    <line x1="232" y1="64" x2="232" y2="192" />
+    <!-- Bridge -->
+    <path d="M106 192 Q106 256 176 256 Q246 256 246 192" />
+    <!-- Handle -->
+    <line x1="176" y1="256" x2="176" y2="448" />
+  </g>
+
+  <!-- Knife -->
+  <g fill="none" stroke="#d4ccb4" stroke-width="26" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Blade -->
+    <path d="M360 64 Q310 160 336 256" />
+    <!-- Spine -->
+    <line x1="360" y1="64" x2="360" y2="256" />
+    <!-- Handle -->
+    <line x1="348" y1="256" x2="348" y2="448" />
+  </g>
+</svg>
