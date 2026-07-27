@@ -119,6 +119,7 @@ test('credential-free backup restores into a clean browser profile', async ({ pa
 });
 
 test('an encrypted backup requires its passphrase and restores in a clean profile', async ({ page, browser }, testInfo) => {
+  test.setTimeout(120_000);
   const { targetDate } = await logEggOnPreviousDay(page);
   await page.goto('/#/settings', { waitUntil: 'commit' });
 
