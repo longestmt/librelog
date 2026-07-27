@@ -456,7 +456,7 @@ Implemented work includes:
 - optional encrypted credentials, portable backups, and WebDAV backups;
 - favorite foods, usual servings, and searchable meal history;
 - a portable-backup reminder;
-- Chromium full-page diary comparisons at desktop and mobile widths;
+- Chromium diary comparisons at desktop and mobile viewport widths;
 - centered desktop content in the available area;
 - route cleanup/fresh-container isolation;
 - calmer insights language and logged-day averages;
@@ -600,7 +600,7 @@ Final browser result on an uncached production preview:
 27. Add a portable-backup reminder.
 28. Add favorite foods and usual servings.
 29. Add searchable meal history.
-30. Add full-page Chromium comparisons for desktop and mobile diary layouts.
+30. Add Chromium comparisons for desktop and mobile diary layouts.
 
 ### Remaining immediate work
 

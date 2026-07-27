@@ -59,7 +59,6 @@ test('the diary keeps its release layout at desktop and mobile widths', async ({
   await expect(page.getByRole('main', { name: 'Diary' })).toBeVisible();
   await expect(page).toHaveScreenshot('diary-desktop.png', {
     animations: 'disabled',
-    fullPage: true,
     maxDiffPixelRatio: 0.02,
   });
 
@@ -68,7 +67,6 @@ test('the diary keeps its release layout at desktop and mobile widths', async ({
   await expect(page.getByRole('main', { name: 'Diary' })).toBeVisible();
   await expect(page).toHaveScreenshot('diary-mobile.png', {
     animations: 'disabled',
-    fullPage: true,
     maxDiffPixelRatio: 0.02,
   });
 });
