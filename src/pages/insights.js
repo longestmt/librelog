@@ -10,7 +10,7 @@ function formatDateShort(dateStr) {
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
-export function renderInsightsPage(container, queryString) {
+export async function renderInsightsPage(container, queryString) {
   let currentView = 'today';
 
   async function render() {
@@ -299,7 +299,7 @@ export function renderInsightsPage(container, queryString) {
     `;
   }
 
-  render();
+  await render();
 }
 
 function getDayLabel(dateStr) {

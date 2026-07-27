@@ -83,6 +83,12 @@ npm run test:unit
 # Build and run the Chromium release workflows
 npm run test:e2e
 
+# Build and run the Chromium, Firefox, and WebKit release workflows
+npm run test:e2e:all
+
+# Run all unit and cross-browser release checks
+npm run check:all
+
 # Preview production build
 npm run preview
 ```

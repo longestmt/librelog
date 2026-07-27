@@ -17,7 +17,7 @@ export default defineConfig({
         process.env.LIBRELOG_HTTPS === '1' ? basicSsl() : null,
         VitePWA({
             registerType: 'autoUpdate',
-            includeAssets: ['favicon.svg', 'icon-192.png', 'icon-512.png'],
+            includeAssets: ['favicon.png', 'icon.svg', 'icon-192.png', 'icon-512.png'],
             manifest: {
                 name: 'LibreLog',
                 short_name: 'LibreLog',
@@ -44,9 +44,9 @@ export default defineConfig({
                         purpose: 'maskable',
                     },
                     {
-                        src: 'favicon.svg',
-                        sizes: 'any',
-                        type: 'image/svg+xml',
+                        src: 'favicon.png',
+                        sizes: '32x32',
+                        type: 'image/png',
                     },
                 ],
             },

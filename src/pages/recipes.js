@@ -7,20 +7,21 @@ import { showToast } from '../components/toast.js';
 import { getNutritionMultiplier } from '../utils/units.js';
 import { scaleNutrients } from '../engine/nutrition.js';
 import { calculateRecipeNutrition } from '../engine/recipes.js';
+import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 
 function generateId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-export function renderRecipesPage(container, queryString) {
+export async function renderRecipesPage(container, queryString) {
   const params = new URLSearchParams(queryString);
   const recipeId = params.get('id');
   const isNew = params.get('new') === '1';
 
   if (recipeId || isNew) {
-    renderRecipeDetail(container, recipeId);
+    await renderRecipeDetail(container, recipeId);
   } else {
-    renderRecipeList(container);
+    await renderRecipeList(container);
   }
 }
 
@@ -241,10 +242,10 @@ async function renderRecipeDetail(container, recipeId) {
   }
 
   function syncFieldsFromDOM() {
-    const nameInput = document.getElementById('recipe-name');
-    const servingsInput = document.getElementById('recipe-servings');
-    const categoryInput = document.getElementById('recipe-category');
-    const instructionsInput = document.getElementById('recipe-instructions');
+    const nameInput = container.querySelector('#recipe-name');
+    const servingsInput = container.querySelector('#recipe-servings');
+    const categoryInput = container.querySelector('#recipe-category');
+    const instructionsInput = container.querySelector('#recipe-instructions');
     if (nameInput) name = nameInput.value.trim();
     if (servingsInput) servings = parseInt(servingsInput.value, 10) || 1;
     if (categoryInput) category = categoryInput.value.trim();
@@ -568,6 +569,7 @@ async function renderRecipeDetail(container, recipeId) {
   function openLogAsMealModal() {
     let portionServings = 1;
     let mealType = getMealTypeForTime();
+    const idempotencyKey = createIdempotencyKey('recipe');
 
     const modal = document.createElement('div');
     modal.className = 'modal-content';
@@ -668,7 +670,6 @@ async function renderRecipeDetail(container, recipeId) {
       });
 
       const meal = {
-        id: generateId(),
         date: todayStr(),
         type: mealType,
         items: mealItems,
@@ -677,7 +678,7 @@ async function renderRecipeDetail(container, recipeId) {
       };
 
       try {
-        await put('meals', meal);
+        await createMeal(meal, { idempotencyKey });
         showToast(`${recipe.name} logged to ${mealType.charAt(0).toUpperCase() + mealType.slice(1)}`);
         closeModal();
         setTimeout(() => {

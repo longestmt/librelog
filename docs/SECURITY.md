@@ -71,9 +71,9 @@ GitHub Pages does not provide repository-level custom response headers. A
 deployment that needs strict response headers must use a host or proxy that can
 set them.
 
-Capacitor currently permits cleartext traffic so a local HTTP Ollama server can
-be used. Release builds that do not support local HTTP providers should disable
-cleartext traffic.
+The Capacitor release configuration does not permit cleartext traffic. A native
+build cannot use an HTTP Ollama endpoint unless the project adds a documented,
+limited platform exception.
 
 ## Reporting and release checks
 
@@ -82,7 +82,7 @@ responses in bug reports. Revoke exposed provider credentials immediately.
 
 Before release:
 
-1. Run `npm run check`.
+1. Run `npm run check:all`.
 2. Confirm that the Playwright clean-profile backup test passes.
 3. Verify configured WebDAV and AI providers with non-production credentials.
 4. Test camera/microphone permission denial and navigation cleanup.

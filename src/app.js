@@ -34,6 +34,7 @@ const ROUTES = {
 
 let currentRoute = 'diary';
 let activePageCleanup = null;
+let routeSequence = 0;
 
 async function init() {
   try {
@@ -63,7 +64,7 @@ async function init() {
 
     await applyTheme();
     renderShell();
-    handleRoute();
+    await handleRoute();
 
     // Start auto-backup scheduler (6-hour intervals)
     initAutoBackup().catch(err => console.warn('Auto-backup init failed:', err));
@@ -110,6 +111,7 @@ function renderShell() {
       <main id="main-content" class="page-container" tabindex="-1"></main>
       <nav class="bottom-nav" role="navigation" aria-label="Main navigation">
         <div class="navbar-brand" aria-hidden="true">
+          <img src="/icon.svg" alt="" class="brand-logo" />
           <span class="brand-text">LibreLog</span>
         </div>
         ${Object.entries(ROUTES).filter(([, config]) => config.nav).map(([route, config]) => `
@@ -143,7 +145,8 @@ function renderShell() {
   });
 }
 
-function handleRoute() {
+async function handleRoute() {
+  const sequence = ++routeSequence;
   const hash = window.location.hash.slice(1) || '/diary';
   const [pathname, query] = hash.split('?');
   const route = pathname.slice(1) || 'diary';
@@ -180,10 +183,15 @@ function handleRoute() {
   document.title = `${ROUTES[route].label} · LibreLog`;
 
   try {
-    const cleanup = ROUTES[route].component(container, query);
+    const cleanup = await ROUTES[route].component(container, query);
+    if (sequence !== routeSequence || !container.isConnected) {
+      if (typeof cleanup === 'function') cleanup();
+      return;
+    }
     if (typeof cleanup === 'function') activePageCleanup = cleanup;
     requestAnimationFrame(() => container.focus({ preventScroll: true }));
   } catch (err) {
+    if (sequence !== routeSequence || !container.isConnected) return;
     console.error(`Error rendering ${route} page:`, err);
     container.innerHTML = `<div class="error-message"><p>Error loading page. Please refresh.</p></div>`;
   }

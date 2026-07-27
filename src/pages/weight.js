@@ -9,7 +9,7 @@ import { showToast } from '../components/toast.js';
  * @param {HTMLElement} container
  * @param {string} queryString
  */
-export function renderWeightPage(container, queryString) {
+export async function renderWeightPage(container, queryString) {
   let submitInProgress = false;
 
   async function render() {
@@ -349,5 +349,5 @@ export function renderWeightPage(container, queryString) {
     });
   }
 
-  render();
+  await render();
 }

@@ -46,7 +46,7 @@ Privacy boundary:
 ### Repository and environment
 
 - Existing logo/favicon work and other unrelated uncommitted files were
-  preserved.
+  preserved during the initial audit. The user later approved the logo work.
 - Runtime: Node `24.18`, npm `11.16`.
 - Detected build stack: Vite `6.4.2`, `vite-plugin-pwa` `0.21.2`, Capacitor
   `8.3.0`, Quagga2 `1.12.1`.
@@ -234,18 +234,23 @@ No known reproducible P0 remains.
 - **Problem:** A diary edit could remove fiber and sodium values.
 - **Files:** Diary, Search, Recipes, and Weight.
 - **Change:** Prevent a second save while the first save is active.
+- **Change:** Route new food, AI, and recipe meal writes through one command.
+- **Change:** Give each new meal command an idempotency key.
 - **Change:** Require a second confirmation action before deletion.
 - **Change:** Keep all nutrient values during an edit.
-- **Verification:** Diary and Weight browser checks pass.
+- **Verification:** The idempotency unit test passes.
+- **Verification:** Diary, Recipe, and Weight browser checks pass.
 
 #### P1-11: Old route content could replace new content
 
 - **Problem:** A slow route could write to the main element after navigation.
 - **Files:** `src/app.js` and page renderers.
 - **Change:** Make a new main element for each navigation.
+- **Change:** Wait for the initial page render before the route is ready.
+- **Change:** Ignore a page completion after a newer route starts.
 - **Change:** Stop resources from the prior page.
 - **Change:** Keep late output in the detached old element.
-- **Verification:** The multi-route browser check passes.
+- **Verification:** Chromium, Firefox, and WebKit route checks pass.
 
 #### P1-12: Invalid goal and measurement values
 
@@ -314,6 +319,15 @@ No known reproducible P0 remains.
 - **Change:** Add headings, labels, names, and regions to primary workflows.
 - **Verification:** The primary semantic browser check passes.
 
+#### P2-08: Incomplete product identity
+
+- **Problem:** The application shell and install assets used different marks.
+- **Change:** Use one muted fork-and-ring mark for the shell and install assets.
+- **Change:** Add 32, 192, and 512 pixel raster assets.
+- **Change:** Add one vector shell asset.
+- **Change:** Add a Chromium visual comparison for the rendered shell mark.
+- **Verification:** The logo asset and browser checks pass.
+
 ### P3 — opportunities, not release blockers
 
 - Add versioned data schemas and database migrations.
@@ -321,8 +335,6 @@ No known reproducible P0 remains.
 - Add native keychain storage.
 - Add favorites and saved servings.
 - Add a meal history page.
-- Add automated browser accessibility tests.
-- Add visual comparison tests.
 - Add optional live-provider tests.
 - Add multi-device synchronization only after user research confirms the need.
 
@@ -391,13 +403,19 @@ Final automated result:
 
 ```text
 npm run check
-  38 unit and fixture tests passed, 0 failed
-  12 Chromium workflow and accessibility tests passed, 0 failed
+  41 unit and fixture tests passed, 0 failed
+  13 Chromium workflow, accessibility, and visual tests passed, 0 failed
   Vite production build passed
-  44 modules transformed
-  PWA precache: 18 entries, 424.37 KiB
-  main JS: 175.23 KiB (46.13 KiB gzip)
+  45 modules transformed
+  PWA precache: 18 entries, 425.94 KiB
+  main JS: 176.83 KiB (46.65 KiB gzip)
   CSS: 75.80 KiB (10.85 KiB gzip)
+
+npm run test:e2e:all
+  Chromium, Firefox, and WebKit workflows passed
+  35 tests passed
+  4 browser-specific tests skipped
+  Offline-PWA control and the logo image comparison ran in Chromium only
 
 git diff --check
   passed
@@ -412,6 +430,8 @@ npm audit
 Final browser result on an uncached production preview:
 
 - Desktop 1440 × 1000 and mobile 390 × 844 diary layouts were visually checked.
+- The new fork-and-ring logo rendered at 32 × 32 in the desktop shell.
+- The 32, 192, and 512 pixel install assets loaded from the production build.
 - Final captures:
   `audit-artifacts/final-diary-desktop.jpg` and
   `audit-artifacts/final-diary-mobile.jpg`.
@@ -452,9 +472,9 @@ Final browser result on an uncached production preview:
    access. Native keychain storage remains recommended work.
 3. **Native release unverified:** no `ios/` or `android/` platform project was
    present. Capacitor build, permissions, camera/microphone behavior, secure
-   storage, cleartext-network policy, store signing, and device accessibility
-   require separate platform validation. `capacitor.config.json` currently
-   permits cleartext traffic, which must be reviewed before a native release.
+   storage, store signing, and device accessibility require separate platform
+   validation. The current Capacitor configuration does not permit cleartext
+   traffic.
 4. **WebDAV is backup/restore:** it has no revisions, merge semantics, or
    cross-device conflict resolution. A newer local state can be replaced by an
    older confirmed backup.
@@ -469,9 +489,9 @@ Final browser result on an uncached production preview:
 8. **Model/provider lifecycle:** configured model names and response behavior
    can change. Compatibility needs periodic smoke checks; do not silently
    switch a user's provider/model.
-9. **Automation depth:** Chromium workflow and axe tests now run locally and in
-   the deploy workflow. A cross-browser, device, and visual-difference matrix
-   does not exist.
+9. **Automation depth:** Chromium, Firefox, and WebKit workflows run for pull
+   requests. Chromium also checks the logo image and the offline PWA. A native
+   device and full-page visual-difference matrix does not exist.
 10. **Remote performance/offline:** remote search depends on public APIs and
     their rate/availability policies. Local results and cached data remain
     usable, but remote pagination/retry/backoff is basic.
@@ -493,6 +513,12 @@ Final browser result on an uncached production preview:
 9. Add an offline PWA test.
 10. Compare exported and imported backup data.
 11. Run all release checks before GitHub Pages deployment.
+12. Run Chromium, Firefox, and WebKit checks for each pull request.
+13. Add a visual comparison for the new logo.
+14. Replace the shell, favicon, and install icons with one product mark.
+15. Remove cleartext traffic from the Capacitor release configuration.
+16. Add a meal command for new food, AI, and recipe writes.
+17. Add an idempotency key to each new meal command.
 
 ### Remaining immediate work
 
@@ -501,7 +527,6 @@ Final browser result on an uncached production preview:
 3. Set an API cost limit for each live AI test.
 4. Set strict response headers on a host that supports them.
 5. Create the native platform projects before a native release.
-6. Remove cleartext network access unless a documented operation needs it.
 
 ### Medium-term architecture
 
@@ -510,13 +535,15 @@ Completed:
 1. Add version numbers to stored data and backup schemas.
 2. Add a version number to each normalized AI result.
 3. Put credential operations in one storage adapter.
+4. Add the first meal command boundary.
+5. Add idempotency keys to new food, AI, and recipe meal writes.
 
 Remaining:
 
 1. Use an operating-system keychain on native platforms.
 2. Add optional encrypted credential storage for the web application.
-3. Move meal operations from page code to testable commands.
-4. Add an idempotency token to each write command.
+3. Move edit, remove, import, copy, and template meal operations to commands.
+4. Add an idempotency token to each remaining write command.
 5. Define one interface for each remote integration.
 6. Use consistent timeout and cancellation errors.
 7. Remove meal data from diagnostic logs.
@@ -628,6 +655,7 @@ Remaining:
 
 ### C. Meal command/service boundary
 
+- **Status:** New food, AI, and recipe writes use the first command.
 - **Problem:** Page code contains display, calculation, integration, and storage operations.
 - **Change:** Add pure preview and validation functions.
 - **Change:** Add transaction commands for meal changes.
@@ -656,7 +684,8 @@ Remaining:
 
 ### E. Release verification matrix
 
-- **Status:** Chromium workflow, axe, CSP, backup, and offline-PWA tests are implemented.
+- **Status:** Chromium, Firefox, WebKit, axe, CSP, backup, offline-PWA, and logo
+  tests are implemented.
 - **Problem:** Browser, integration, PWA, and native checks are primarily manual.
 - **Change:** Run unit tests for each change.
 - **Change:** Run browser and accessibility tests for each pull request.
@@ -683,8 +712,7 @@ The five highest-value next investments are:
 
 1. **Production release validation**
    - Set strict response headers on a configurable production host.
-   - Add WebKit and Firefox workflows.
-   - Add visual comparison tests.
+   - Add full-page visual comparisons.
 2. **Live integration tests**
    - Use disposable data.
    - Set an API cost limit.

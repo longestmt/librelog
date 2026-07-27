@@ -22,7 +22,7 @@ import {
 const APP_VERSION = '0.3.0';
 const LICENSE = 'AGPL-3.0';
 
-export function renderSettingsPage(container, queryString) {
+export async function renderSettingsPage(container, queryString) {
   async function render() {
     const goals = await getGoals();
     const usdaApiKeyConfigured = await hasCredential('usdaApiKey');
@@ -545,7 +545,7 @@ export function renderSettingsPage(container, queryString) {
     render();
   }
 
-  render();
+  await render();
 }
 
 function computeMonthlyUsage(log) {

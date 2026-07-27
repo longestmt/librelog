@@ -10,8 +10,10 @@
     "preview": "vite preview",
     "test": "npm run test:unit",
     "test:unit": "node --test",
-    "test:e2e": "npm run build && playwright test",
-    "check": "npm run test:unit && npm run test:e2e"
+    "test:e2e": "npm run build && playwright test --project=chromium",
+    "test:e2e:all": "npm run build && playwright test",
+    "check": "npm run test:unit && npm run test:e2e",
+    "check:all": "npm run test:unit && npm run test:e2e:all"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",

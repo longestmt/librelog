@@ -12,7 +12,7 @@ function generateId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-export function renderDiaryPage(container, queryString) {
+export async function renderDiaryPage(container, queryString) {
   const params = new URLSearchParams(queryString);
   const dateParam = params.get('date');
   let currentDate = isCalendarDate(dateParam) ? dateParam : todayStr();
@@ -291,7 +291,7 @@ export function renderDiaryPage(container, queryString) {
     });
   }
 
-  render();
+  await render();
 }
 
 function createNutritionRing(consumed, target) {

@@ -64,7 +64,10 @@ test('recipe requires an ingredient and logs one serving to the diary', async ({
   await preparePage(page);
   await page.goto('/#/recipes', { waitUntil: 'commit' });
   await page.getByRole('button', { name: 'Create new recipe' }).click();
-  await page.getByRole('textbox', { name: 'Recipe Name' }).fill('Release Test Bowl');
+  await expect(page).toHaveURL(/#\/recipes\?new=1$/);
+  const recipeName = page.getByRole('textbox', { name: 'Recipe Name' });
+  await recipeName.fill('Release Test Bowl');
+  await expect(recipeName).toHaveValue('Release Test Bowl');
   await page.getByRole('button', { name: 'Save Recipe' }).click();
   await expect(page.getByRole('status')).toContainText('Add at least one ingredient');
 
@@ -148,7 +151,9 @@ test('Insights tabs report selection and support arrow keys', async ({ page }) =
   await expect(page.getByRole('tabpanel', { name: 'month insights' })).toBeVisible();
 });
 
-test('the production PWA shell and manifest remain available offline', async ({ browser }) => {
+test('the production PWA shell and manifest remain available offline', async ({ browser, browserName }) => {
+  test.skip(browserName !== 'chromium', 'Playwright offline service-worker control is Chromium-only.');
+
   const context = await browser.newContext({
     baseURL: 'http://127.0.0.1:4177',
     serviceWorkers: 'allow',

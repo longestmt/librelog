@@ -12,6 +12,7 @@ import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
 import { scaleNutrients } from '../engine/nutrition.js';
+import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 
 const MEAL_TYPES = ['Breakfast', 'Lunch', 'Dinner', 'Snacks'];
 const MODES = [
@@ -33,7 +34,7 @@ async function loadImageProcessor() { if (imageProcessorMod) return imageProcess
 async function loadVoiceParser() { if (voiceParserMod) return voiceParserMod; try { voiceParserMod = await import('../integrations/voiceParser.js'); return voiceParserMod; } catch { return null; } }
 async function loadClarification() { if (clarificationMod) return clarificationMod; try { clarificationMod = await import('../integrations/clarificationEngine.js'); return clarificationMod; } catch { return null; } }
 
-export function renderSearchPage(container, queryString) {
+export async function renderSearchPage(container, queryString) {
   const params = new URLSearchParams(queryString);
   const mealTypeParam = params.get('meal') || 'lunch';
   let mealType = mealTypeParam.charAt(0).toUpperCase() + mealTypeParam.slice(1);
@@ -62,6 +63,7 @@ export function renderSearchPage(container, queryString) {
   let amplitudeInterval = null;
   let aiProvider = null;
   let aiLogInProgress = false;
+  let aiLogBatchKey = createIdempotencyKey('ai');
   let searchSequence = 0;
   let preselectedHandled = false;
   let aiAbortController = null;
@@ -519,6 +521,7 @@ export function renderSearchPage(container, queryString) {
     if (!text && !aiAttachedPhoto) { showToast('Add a photo or describe your meal'); return; }
     aiProcessing = true;
     aiResults = null;
+    aiLogBatchKey = createIdempotencyKey('ai');
     renderModeContent();
     const ai = await loadAI();
     if (!ai || !(await ai.isAIConfigured())) {
@@ -754,8 +757,8 @@ export function renderSearchPage(container, queryString) {
         await put('foods', food);
         const qty = food.servingSize?.quantity ?? 100;
         const unit = food.servingSize?.unit || 'g';
-        await put('meals', {
-          id: generateId(), date: targetDate, type: mealType.toLowerCase(),
+        await createMeal({
+          date: targetDate, type: mealType.toLowerCase(),
           items: [{
             foodId: food.id,
             quantity: qty,
@@ -764,7 +767,7 @@ export function renderSearchPage(container, queryString) {
             nutrients: scaleNutrients(food, qty, unit),
           }],
           createdAt: new Date().toISOString(),
-        });
+        }, { idempotencyKey: `${aiLogBatchKey}:${idx}` });
         logged++;
       }
     } catch (error) {
@@ -794,7 +797,7 @@ export function renderSearchPage(container, queryString) {
     });
   }
 
-  render();
+  await render();
   // Cleanup on navigate away
   return () => {
     disposed = true;
@@ -848,6 +851,7 @@ function openPortionModal(food, mealType, targetDate = todayStr()) {
   let quantity = Number(food.servingSize?.quantity) > 0 ? Number(food.servingSize.quantity) : 100;
   let unit = food.servingSize?.unit || 'g', selectedMealType = mealType;
   let logInProgress = false;
+  const idempotencyKey = createIdempotencyKey('food');
   const availableUnits = getUnitsForFood(food);
 
   function updatePreview() {
@@ -883,7 +887,15 @@ function openPortionModal(food, mealType, targetDate = todayStr()) {
     logInProgress = true;
     event.currentTarget.disabled = true;
     event.currentTarget.textContent = 'Logging…';
-    const success = await logFood(food, quantity, unit, selectedMealType, document.getElementById('notes-input').value, targetDate);
+    const success = await logFood(
+      food,
+      quantity,
+      unit,
+      selectedMealType,
+      document.getElementById('notes-input').value,
+      targetDate,
+      idempotencyKey,
+    );
     if (!success) {
       logInProgress = false;
       event.currentTarget.disabled = false;
@@ -893,16 +905,16 @@ function openPortionModal(food, mealType, targetDate = todayStr()) {
   updatePreview();
 }
 
-async function logFood(food, quantity, unit, mealType, notes, targetDate = todayStr()) {
+async function logFood(food, quantity, unit, mealType, notes, targetDate = todayStr(), idempotencyKey) {
   try {
     if (!food.id) food.id = generateId();
     const existing = await getById('foods', food.id);
     if (!existing) await put('foods', food);
-    await put('meals', {
-      id: generateId(), date: targetDate, type: mealType.toLowerCase(),
+    await createMeal({
+      date: targetDate, type: mealType.toLowerCase(),
       items: [{ foodId: food.id, quantity, unit, notes, nutrients: scaleNutrients(food, quantity, unit) }],
       createdAt: new Date().toISOString(),
-    });
+    }, { idempotencyKey });
     showToast(`${food.name} logged to ${mealType}`);
     closeModal();
     setTimeout(() => { window.location.hash = `#/diary?date=${targetDate}`; }, 500);
