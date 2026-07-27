@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateBackupData } from '../src/data/db.js';
+import { DATA_SCHEMA_VERSION, validateBackupData } from '../src/data/db.js';
 
 const validBackup = {
   version: 1,
@@ -41,7 +41,7 @@ test('rejects unsupported schema version shapes', () => {
     /not supported/i,
   );
   assert.throws(
-    () => validateBackupData({ ...validBackup, dataVersion: 2 }),
+    () => validateBackupData({ ...validBackup, dataVersion: DATA_SCHEMA_VERSION + 1 }),
     /not supported/i,
   );
 });

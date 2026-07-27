@@ -4,6 +4,7 @@
  */
 
 import { getCredential } from '../data/credentials.js';
+import { logIntegrationFailure, requestJSON } from './request.js';
 
 const USDA_BASE_URL = 'https://api.nal.usda.gov/fdc/v1';
 const REQUEST_TIMEOUT_MS = 8000;
@@ -110,7 +111,7 @@ function normalizeFood(food) {
  * @param {number} [pageSize=20] - Results per page
  * @returns {Promise<Array>} Array of normalized food objects
  */
-async function searchFoods(query, page = 1, pageSize = 20) {
+async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {}) {
   if (!query || query.trim().length === 0) {
     return [];
   }
@@ -121,9 +122,6 @@ async function searchFoods(query, page = 1, pageSize = 20) {
     return [];
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
   try {
     const url = new URL(`${USDA_BASE_URL}/foods/search`);
     url.searchParams.set('api_key', apiKey);
@@ -132,19 +130,18 @@ async function searchFoods(query, page = 1, pageSize = 20) {
     url.searchParams.set('pageSize', pageSize.toString());
     url.searchParams.set('dataType', 'Foundation,SR Legacy');
 
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
-      }
+    const { data } = await requestJSON({
+      provider: 'USDA FoodData Central',
+      url: url.toString(),
+      init: {
+        headers: {
+          'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
+        },
+      },
+      signal,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      maxRetries: 1,
     });
-
-    if (!response.ok) {
-      console.warn(`USDA search returned status ${response.status}`);
-      return [];
-    }
-
-    const data = await response.json();
 
     if (!data.foods || !Array.isArray(data.foods)) {
       return [];
@@ -154,14 +151,8 @@ async function searchFoods(query, page = 1, pageSize = 20) {
       .map(normalizeFood)
       .filter(food => food !== null);
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('USDA search timeout');
-    } else {
-      console.error('Error searching USDA:', error);
-    }
+    logIntegrationFailure(error);
     return [];
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -170,7 +161,7 @@ async function searchFoods(query, page = 1, pageSize = 20) {
  * @param {string|number} fdcId - FDC ID
  * @returns {Promise<Object|null>} Normalized food object or null if not found
  */
-async function lookupFdcId(fdcId) {
+async function lookupFdcId(fdcId, { signal = null } = {}) {
   if (!fdcId) {
     return null;
   }
@@ -181,37 +172,27 @@ async function lookupFdcId(fdcId) {
     return null;
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
   try {
     const url = new URL(`${USDA_BASE_URL}/food/${fdcId}`);
     url.searchParams.set('api_key', apiKey);
 
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
-      }
+    const { data } = await requestJSON({
+      provider: 'USDA FoodData Central',
+      url: url.toString(),
+      init: {
+        headers: {
+          'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
+        },
+      },
+      signal,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      maxRetries: 1,
     });
-
-    if (!response.ok) {
-      console.warn(`USDA FDC lookup returned status ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json();
 
     return normalizeFood(data);
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('USDA FDC lookup timeout');
-    } else {
-      console.error('Error looking up USDA FDC ID:', error);
-    }
+    logIntegrationFailure(error);
     return null;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 

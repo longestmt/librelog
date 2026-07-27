@@ -37,8 +37,10 @@ Privacy boundary:
 - Meal and weight data stay in IndexedDB unless the user exports, backs up, or
   invokes a remote food/AI integration.
 - A selected AI provider receives the submitted description and/or image.
-- API and WebDAV credentials are currently stored as plaintext settings in the
-  browser/app profile. This is disclosed in the UI and security documentation.
+- API and WebDAV credentials use one storage adapter.
+- The web adapter can encrypt credentials at rest with a user passphrase.
+- Credentials stay as plaintext settings if the user does not enable this option.
+- The UI describes both storage modes and their limits.
 - Portable exports and remote backups now exclude credential fields.
 
 ## 2. Baseline
@@ -260,6 +262,30 @@ No known reproducible P0 remains.
 - **Change:** Permit only known date and unit formats.
 - **Verification:** The build and browser checks pass.
 
+#### P1-13: Database changes had no recovery checkpoint
+
+- **Problem:** A database upgrade had no independent recovery checkpoint.
+- **Files:** `src/data/db.js` and Settings.
+- **Change:** Increase the IndexedDB schema version to 2.
+- **Change:** Add the `idempotencyKey` meal index in one migration.
+- **Change:** Make a credential-free checkpoint before the migration.
+- **Change:** Stop the migration if LibreLog cannot make the checkpoint.
+- **Change:** Keep the three most recent migration checkpoints.
+- **Change:** Add a confirmed checkpoint restore operation.
+- **Verification:** The migration and rollback test passes.
+
+#### P1-14: Remote integrations used different request rules
+
+- **Problem:** Each integration used a different timeout and error shape.
+- **Problem:** An error could include remote response text.
+- **Files:** AI client, Open Food Facts, USDA, and the search engine.
+- **Change:** Use one JSON request contract.
+- **Change:** Use one timeout and cancellation model.
+- **Change:** Limit a read-only retry to one retry.
+- **Change:** Do not put a URL, request body, or response body in an error.
+- **Change:** Send the page cancellation signal to each remote food request.
+- **Verification:** The integration contract tests pass.
+
 ### P2 — usability, accessibility, and polish
 
 #### P2-01: Route and modal focus
@@ -328,15 +354,43 @@ No known reproducible P0 remains.
 - **Change:** Add a Chromium visual comparison for the rendered shell mark.
 - **Verification:** The logo asset and browser checks pass.
 
-### P3 — opportunities, not release blockers
+#### P2-09: Backup data had no optional encryption
 
-- Add versioned data schemas and database migrations.
-- Add encrypted portable backups.
-- Add native keychain storage.
-- Add favorites and saved servings.
-- Add a meal history page.
-- Add optional live-provider tests.
-- Add multi-device synchronization only after user research confirms the need.
+- **Problem:** A portable or WebDAV backup could contain private meal and weight data.
+- **Files:** Encryption, import/export, WebDAV, and Settings.
+- **Change:** Add AES-256-GCM authenticated encryption.
+- **Change:** Derive the key with PBKDF2-SHA-256 and 600,000 operations.
+- **Change:** Use a new random salt and initialization vector for each backup.
+- **Change:** Keep the passphrase in memory for one operation.
+- **Change:** Tell the user that LibreLog cannot recover the passphrase.
+- **Change:** Add a 30-day portable-backup reminder.
+- **Verification:** The encryption round-trip and failure tests pass.
+- **Reference:** [OWASP password storage guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
+- **Reference:** [Web Crypto `deriveKey`](https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/deriveKey).
+
+#### P2-10: Remote data use was not clear at first use
+
+- **Problem:** A user could enable a remote provider without provider-specific information.
+- **Files:** Settings, Search, Scan, and the privacy-consent component.
+- **Change:** Describe the data that each provider receives.
+- **Change:** State that LibreLog does not send diary history for a food lookup.
+- **Change:** Get confirmation before first remote use.
+- **Change:** Keep remote food sources off until the user gives confirmation.
+- **Verification:** The Settings accessibility check passes.
+
+### P3 — completed local product opportunities
+
+- The database has versioned schemas, a migration, a checkpoint, and a rollback operation.
+- Portable and WebDAV backups have optional passphrase encryption.
+- Web credentials have optional passphrase encryption at rest.
+- A user can save a favorite food and a usual serving.
+- A user can search meal history and log a reviewed meal again.
+- A user gets first-use remote-provider information.
+- A user gets a portable-backup reminder.
+
+Native keychain storage needs native platform projects.
+Live-provider tests need user consent and provider credentials.
+Multi-device synchronization still needs user research.
 
 ## 4. AI estimation evaluation
 
@@ -394,6 +448,16 @@ Implemented work includes:
   correction UI, cancellation, timeouts, and duplicate guards;
 - faster local-first search with stale-response protection;
 - full-nutrient edits, confirmation-based deletion, and guarded submissions;
+- command-based edit, remove, import, copy, template, scan, and AI meal writes;
+- idempotency keys for all meal commands;
+- an IndexedDB version 2 migration with a pre-migration checkpoint and rollback;
+- one safe request contract for AI, Open Food Facts, and USDA;
+- provider-specific first-use privacy confirmation;
+- optional encrypted credentials, portable backups, and WebDAV backups;
+- favorite foods, usual servings, and searchable meal history;
+- a portable-backup reminder;
+- Chromium full-page diary comparisons at desktop and mobile widths;
+- centered desktop content in the available area;
 - route cleanup/fresh-container isolation;
 - calmer insights language and logged-day averages;
 - responsive/accessibility polish and accurate privacy/security copy;
@@ -403,18 +467,18 @@ Final automated result:
 
 ```text
 npm run check
-  41 unit and fixture tests passed, 0 failed
-  13 Chromium workflow, accessibility, and visual tests passed, 0 failed
+  50 unit and fixture tests passed, 0 failed
+  17 Chromium workflow, accessibility, and visual tests passed, 0 failed
   Vite production build passed
-  45 modules transformed
-  PWA precache: 18 entries, 425.94 KiB
-  main JS: 176.83 KiB (46.65 KiB gzip)
-  CSS: 75.80 KiB (10.85 KiB gzip)
+  49 modules transformed
+  PWA precache: 18 entries, 451.98 KiB
+  main JS: 203.56 KiB (54.26 KiB gzip)
+  CSS: 76.64 KiB (11.03 KiB gzip)
 
 npm run test:e2e:all
   Chromium, Firefox, and WebKit workflows passed
-  35 tests passed
-  4 browser-specific tests skipped
+  45 tests passed
+  6 browser-specific tests skipped
   Offline-PWA control and the logo image comparison ran in Chromium only
 
 git diff --check
@@ -446,6 +510,10 @@ Final browser result on an uncached production preview:
 - Weight add/stats/delete completed, including confirmation.
 - Settings rendered the credential disclosure, blank secret inputs, backup and
   restore actions, and disconnected WebDAV state.
+- Settings rendered credential protection, encrypted backup controls,
+  provider-specific privacy information, and the portable-backup reminder.
+- A favorite egg kept its usual two-count serving.
+- Meal History found the egg and logged the reviewed meal again.
 - The AI journey was configured against local Ollama with a deliberately
   unavailable model. It rendered the approximate-estimate disclosure, entered a
   stable error state, and offered “Try Again” without creating a meal or making
@@ -466,10 +534,10 @@ Final browser result on an uncached production preview:
 1. **Live integrations not fully certified:** no real OpenAI, Anthropic, USDA,
    WebDAV, camera, microphone, or barcode hardware credential/session was
    available. Local deterministic substitutes and UI/error paths were used.
-2. **Plaintext secrets:** BYOK/WebDAV credentials remain readable to code with
-   the same browser profile/origin and to a compromised device account. The UI
-   states this accurately. One credential interface now isolates storage
-   access. Native keychain storage remains recommended work.
+2. **Credential protection limits:** Optional passphrase protection encrypts
+   web credentials at rest. Same-origin code can read a credential while the
+   credential store is unlocked. A lost passphrase cannot be recovered. Native
+   keychain storage remains recommended work.
 3. **Native release unverified:** no `ios/` or `android/` platform project was
    present. Capacitor build, permissions, camera/microphone behavior, secure
    storage, store signing, and device accessibility require separate platform
@@ -490,11 +558,12 @@ Final browser result on an uncached production preview:
    can change. Compatibility needs periodic smoke checks; do not silently
    switch a user's provider/model.
 9. **Automation depth:** Chromium, Firefox, and WebKit workflows run for pull
-   requests. Chromium also checks the logo image and the offline PWA. A native
-   device and full-page visual-difference matrix does not exist.
+   requests. Chromium also checks the logo, desktop diary, mobile diary, and
+   offline PWA. A native device and multi-browser visual-difference matrix does
+   not exist.
 10. **Remote performance/offline:** remote search depends on public APIs and
     their rate/availability policies. Local results and cached data remain
-    usable, but remote pagination/retry/backoff is basic.
+    usable. Read-only requests use one bounded retry.
 11. **Fonts:** remote web fonts may not load offline; system fallbacks preserve
     usability and should remain acceptable by design.
 
@@ -519,6 +588,19 @@ Final browser result on an uncached production preview:
 15. Remove cleartext traffic from the Capacitor release configuration.
 16. Add a meal command for new food, AI, and recipe writes.
 17. Add an idempotency key to each new meal command.
+18. Add one meal command boundary for all meal writes.
+19. Add an idempotency key to each meal write command.
+20. Add the IndexedDB version 2 migration.
+21. Make a checkpoint before the database migration.
+22. Add the migration rollback control.
+23. Add one remote JSON request contract.
+24. Add optional encrypted portable and WebDAV backups.
+25. Add optional encrypted web credential storage.
+26. Add provider-specific first-use privacy information.
+27. Add a portable-backup reminder.
+28. Add favorite foods and usual servings.
+29. Add searchable meal history.
+30. Add full-page Chromium comparisons for desktop and mobile diary layouts.
 
 ### Remaining immediate work
 
@@ -537,33 +619,40 @@ Completed:
 3. Put credential operations in one storage adapter.
 4. Add the first meal command boundary.
 5. Add idempotency keys to new food, AI, and recipe meal writes.
+6. Move edit, remove, import, copy, template, scan, and AI meal operations to commands.
+7. Add idempotency keys to all meal write commands.
+8. Define one remote JSON request contract.
+9. Use consistent timeout and cancellation errors.
+10. Remove request and response data from integration errors.
+11. Add an IndexedDB migration.
+12. Make a backup checkpoint before the migration.
+13. Add a rollback operation for the migration.
+14. Add optional encrypted credential storage for the web application.
 
 Remaining:
 
 1. Use an operating-system keychain on native platforms.
-2. Add optional encrypted credential storage for the web application.
-3. Move edit, remove, import, copy, and template meal operations to commands.
-4. Add an idempotency token to each remaining write command.
-5. Define one interface for each remote integration.
-6. Use consistent timeout and cancellation errors.
-7. Remove meal data from diagnostic logs.
-8. Add small IndexedDB migrations.
-9. Make a backup before each data migration.
-10. Keep a rollback operation for each migration.
+2. Add a platform request adapter after native projects exist.
 
 ### Optional product opportunities
+
+Completed:
 
 1. Add favorites and saved servings.
 2. Add a searchable meal history.
 3. Add first-use privacy information.
 4. Add a backup reminder.
 5. Add optional encrypted WebDAV backups.
-6. Add conflict-aware synchronization only after user research confirms the need.
+
+Remaining:
+
+1. Add conflict-aware synchronization only after user research confirms the need.
 
 ## 8. Feature proposals
 
 ### Favorites and saved servings
 
+- **Status:** Implemented.
 - **Problem:** A frequent food can still require a search.
 - **Change:** Let the user save a usual serving for a food.
 - **Value:** The user can log the food with one or two actions.
@@ -573,6 +662,7 @@ Remaining:
 
 ### Searchable meal history
 
+- **Status:** Implemented.
 - **Problem:** Quick re-log does not find an old meal by date or name.
 - **Change:** Add a searchable local meal history.
 - **Change:** Show a meal preview before reuse.
@@ -583,6 +673,7 @@ Remaining:
 
 ### First-run privacy information
 
+- **Status:** Implemented.
 - **Problem:** A user might not know when data goes to a remote provider.
 - **Change:** Show provider-specific privacy information during first use.
 - **Change:** Show how LibreLog stores each credential.
@@ -604,6 +695,7 @@ Remaining:
 
 ### Optional encrypted backup
 
+- **Status:** Implemented.
 - **Problem:** A backup can contain sensitive meal and weight data.
 - **Change:** Add passphrase encryption to portable and WebDAV backups.
 - **Value:** Encryption protects backup data outside the application profile.
@@ -626,7 +718,7 @@ Remaining:
 
 ### A. Versioned schemas and migrations
 
-- **Status:** Schema versions are implemented. Store migrations remain.
+- **Status:** Schema version 2, one store migration, a checkpoint, and rollback are implemented.
 - **Problem:** Data rules occur in multiple page and engine files.
 - **Change:** Define a versioned schema for each stored record.
 - **Change:** Define a versioned schema for each provider response.
@@ -639,8 +731,8 @@ Remaining:
 
 ### B. Secret-storage adapter
 
-- **Status:** The storage adapter is implemented. Secure platform backends remain.
-- **Problem:** IndexedDB contains plaintext credentials.
+- **Status:** The storage adapter and optional web encryption are implemented. Native keychain storage remains.
+- **Problem:** IndexedDB can contain plaintext credentials when optional protection is off.
 - **Change:** Add one credential storage interface.
 - **Change:** Use Keychain or Keystore on native platforms.
 - **Change:** Use session storage as the default web option.
@@ -655,7 +747,7 @@ Remaining:
 
 ### C. Meal command/service boundary
 
-- **Status:** New food, AI, and recipe writes use the first command.
+- **Status:** All meal writes use commands and idempotency keys.
 - **Problem:** Page code contains display, calculation, integration, and storage operations.
 - **Change:** Add pure preview and validation functions.
 - **Change:** Add transaction commands for meal changes.
@@ -670,6 +762,7 @@ Remaining:
 
 ### D. Integration contract
 
+- **Status:** AI, Open Food Facts, and USDA use one JSON request contract.
 - **Problem:** Integrations use different timeout, error, and configuration rules.
 - **Change:** Define one result format.
 - **Change:** Define one error format.
@@ -703,7 +796,8 @@ Remaining:
 **Assessment:** The web/PWA code is a release candidate.
 The production build passes.
 The application starts correctly.
-The changes keep the current data schema.
+The changes upgrade the IndexedDB schema from version 1 to version 2.
+LibreLog makes a recovery checkpoint before this upgrade.
 The deterministic tests pass.
 No known reproducible P0 remains.
 A native-store release is not certified.
@@ -722,7 +816,8 @@ The five highest-value next investments are:
    - Add operating-system keychain storage.
    - Do device accessibility and permission tests.
 4. **Backup protection**
-   - Add optional encrypted backups.
+   - Complete an independent cryptographic design review.
+   - Test large encrypted backups on low-memory devices.
 5. **Data schemas and migrations**
-   - Add small migrations.
-   - Add a backup checkpoint before each migration.
+   - Test the version 2 migration with a large production-shaped data set.
+   - Keep one old schema fixture for each future migration.

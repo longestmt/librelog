@@ -7,6 +7,7 @@
  */
 
 import { getSetting, setSetting } from './db.js';
+import { decryptBackup, encryptBackup, isEncryptedBackup } from './encryption.js';
 
 const CREDENTIAL_KEYS = Object.freeze({
   aiApiKey: 'ai_api_key',
@@ -18,6 +19,10 @@ const CREDENTIAL_KEYS = Object.freeze({
 const LEGACY_KEYS = Object.freeze({
   webdavPassword: ['webdav_password'],
 });
+const ENCRYPTION_SETTING = 'credentialEncryptionEnabled';
+const ENCRYPTION_VERIFIER_SETTING = 'credentialEncryptionVerifier';
+const unlockedCredentials = new Map();
+let credentialPassphrase = null;
 
 function settingKey(name) {
   const key = CREDENTIAL_KEYS[name];
@@ -27,6 +32,9 @@ function settingKey(name) {
 
 export async function getCredential(name) {
   const value = await getSetting(settingKey(name), null);
+  if (isEncryptedBackup(value)) {
+    return unlockedCredentials.get(name) || null;
+  }
   if (typeof value === 'string' && value) return value;
   for (const legacyKey of LEGACY_KEYS[name] || []) {
     const legacyValue = await getSetting(legacyKey, null);
@@ -41,7 +49,19 @@ export async function hasCredential(name) {
 
 export async function setCredential(name, value) {
   const normalized = typeof value === 'string' ? value.trim() : '';
-  await setSetting(settingKey(name), normalized || null);
+  if (await isCredentialEncryptionEnabled()) {
+    if (!credentialPassphrase) {
+      throw new Error('Unlock credential protection before you change a credential');
+    }
+    const encrypted = normalized
+      ? await encryptBackup({ credential: name, value: normalized }, credentialPassphrase)
+      : null;
+    await setSetting(settingKey(name), encrypted);
+    if (normalized) unlockedCredentials.set(name, normalized);
+    else unlockedCredentials.delete(name);
+  } else {
+    await setSetting(settingKey(name), normalized || null);
+  }
   for (const legacyKey of LEGACY_KEYS[name] || []) {
     await setSetting(legacyKey, null);
   }
@@ -49,6 +69,86 @@ export async function setCredential(name, value) {
 
 export async function removeCredential(name) {
   await setCredential(name, null);
+}
+
+export async function hasStoredCredential(name) {
+  const value = await getSetting(settingKey(name), null);
+  if (isEncryptedBackup(value)) return true;
+  if (typeof value === 'string' && value) return true;
+  for (const legacyKey of LEGACY_KEYS[name] || []) {
+    const legacyValue = await getSetting(legacyKey, null);
+    if (typeof legacyValue === 'string' && legacyValue) return true;
+  }
+  return false;
+}
+
+export async function isCredentialEncryptionEnabled() {
+  return Boolean(await getSetting(ENCRYPTION_SETTING, false));
+}
+
+export async function isCredentialStoreUnlocked() {
+  return !(await isCredentialEncryptionEnabled()) || Boolean(credentialPassphrase);
+}
+
+export async function enableCredentialEncryption(passphrase) {
+  if (typeof passphrase !== 'string' || passphrase.length < 8) {
+    throw new Error('Passphrase must contain at least 8 characters');
+  }
+  const encryptedValues = new Map();
+  const plaintextValues = new Map();
+  const verifier = await encryptBackup({ credential: 'verifier', value: 'librelog' }, passphrase);
+
+  for (const name of Object.keys(CREDENTIAL_KEYS)) {
+    const value = await getCredential(name);
+    if (!value) continue;
+    plaintextValues.set(name, value);
+    encryptedValues.set(
+      name,
+      await encryptBackup({ credential: name, value }, passphrase),
+    );
+  }
+
+  for (const [name, encrypted] of encryptedValues) {
+    await setSetting(settingKey(name), encrypted);
+    for (const legacyKey of LEGACY_KEYS[name] || []) {
+      await setSetting(legacyKey, null);
+    }
+  }
+  await setSetting(ENCRYPTION_VERIFIER_SETTING, verifier);
+  await setSetting(ENCRYPTION_SETTING, true);
+  credentialPassphrase = passphrase;
+  unlockedCredentials.clear();
+  for (const [name, value] of plaintextValues) unlockedCredentials.set(name, value);
+}
+
+export async function unlockCredentialStore(passphrase) {
+  if (!(await isCredentialEncryptionEnabled())) return true;
+  const verifier = await getSetting(ENCRYPTION_VERIFIER_SETTING, null);
+  const verifierData = await decryptBackup(verifier, passphrase);
+  if (verifierData?.credential !== 'verifier' || verifierData.value !== 'librelog') {
+    throw new Error('Credential passphrase is incorrect');
+  }
+  const decryptedValues = new Map();
+
+  for (const name of Object.keys(CREDENTIAL_KEYS)) {
+    const stored = await getSetting(settingKey(name), null);
+    if (!isEncryptedBackup(stored)) continue;
+    const decrypted = await decryptBackup(stored, passphrase);
+    if (decrypted?.credential !== name || typeof decrypted.value !== 'string') {
+      throw new Error('Encrypted credential data is invalid');
+    }
+    decryptedValues.set(name, decrypted.value);
+  }
+
+  credentialPassphrase = passphrase;
+  unlockedCredentials.clear();
+  for (const [name, value] of decryptedValues) unlockedCredentials.set(name, value);
+  return true;
+}
+
+export function lockCredentialStore() {
+  credentialPassphrase = null;
+  unlockedCredentials.clear();
 }
 
 export { CREDENTIAL_KEYS };

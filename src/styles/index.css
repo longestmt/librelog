@@ -96,6 +96,7 @@
   --nav-height: 64px;
   --sidebar-width: 240px;
   --max-content: 640px;
+  --desktop-page-half-gap: 232px;
 
   color-scheme: dark;
 }

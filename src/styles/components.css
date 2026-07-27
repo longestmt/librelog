@@ -1166,7 +1166,12 @@ textarea.input {
     }
 
     .page-container {
-        margin-left: var(--sidebar-width);
+        width: calc(100% - var(--sidebar-width));
+        margin-left: max(
+            var(--sidebar-width),
+            calc(50vw - var(--desktop-page-half-gap))
+        );
+        margin-right: 0;
         padding-bottom: var(--sp-8);
         max-width: calc(var(--max-content) + var(--sp-8) * 2);
     }
@@ -3331,6 +3336,56 @@ textarea.input {
 
 .diary-actions .btn-ghost:hover {
     color: var(--text-primary);
+}
+
+/* ---------- Meal History ---------- */
+.history-page {
+    width: min(760px, 100%);
+    margin: 0 auto;
+    padding: var(--sp-4);
+}
+
+.history-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(150px, 1fr);
+    gap: var(--sp-3);
+    margin-bottom: var(--sp-4);
+}
+
+.meal-history-list {
+    display: grid;
+    gap: var(--sp-3);
+}
+
+.meal-history-card {
+    padding: var(--sp-4);
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+}
+
+.meal-history-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--sp-3);
+}
+
+.meal-history-heading h2 {
+    margin: 0;
+    font-size: var(--text-base);
+}
+
+.meal-history-heading p,
+.meal-history-items {
+    margin: var(--sp-1) 0 var(--sp-3);
+    color: var(--text-muted);
+}
+
+@media (max-width: 520px) {
+    .history-controls {
+        grid-template-columns: 1fr;
+    }
 }
 
 /* ---------- Phase 2: Template List ---------- */

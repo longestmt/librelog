@@ -2,7 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import 'fake-indexeddb/auto';
 import { clearAllData, getAll } from '../src/data/db.js';
-import { createMeal, validateMealInput } from '../src/data/meal-commands.js';
+import {
+  copyMealsToDate,
+  createMeal,
+  removeMealItem,
+  updateMealItem,
+  validateMealInput,
+} from '../src/data/meal-commands.js';
 
 const validMeal = {
   date: '2026-07-27',
@@ -37,4 +43,48 @@ test('a meal command rejects invalid dates, meal types, and quantities', () => {
     }),
     /positive quantity/i,
   );
+});
+
+test('edit and remove commands apply each idempotency key one time', async () => {
+  await clearAllData();
+  const { meal } = await createMeal(validMeal, { idempotencyKey: 'test:meal-mutation-create' });
+  const changedItem = { ...validMeal.items[0], quantity: 2 };
+
+  const firstEdit = await updateMealItem(meal.id, 0, changedItem, {
+    idempotencyKey: 'test:meal-mutation-edit',
+  });
+  const repeatedEdit = await updateMealItem(meal.id, 0, changedItem, {
+    idempotencyKey: 'test:meal-mutation-edit',
+  });
+  assert.equal(firstEdit.changed, true);
+  assert.equal(repeatedEdit.changed, false);
+  assert.equal(repeatedEdit.meal.items[0].quantity, 2);
+
+  const firstRemove = await removeMealItem(meal.id, 0, {
+    idempotencyKey: 'test:meal-mutation-remove',
+  });
+  const repeatedRemove = await removeMealItem(meal.id, 0, {
+    idempotencyKey: 'test:meal-mutation-remove',
+  });
+  assert.equal(firstRemove.changed, true);
+  assert.equal(repeatedRemove.changed, false);
+  assert.equal((await getAll('meals')).length, 0);
+});
+
+test('copy commands do not duplicate a meal batch after a retry', async () => {
+  await clearAllData();
+  const sourceMeals = [
+    validMeal,
+    { ...validMeal, type: 'dinner' },
+  ];
+  await copyMealsToDate(sourceMeals, '2026-07-28', {
+    idempotencyKey: 'test:copy-meal-batch',
+  });
+  await copyMealsToDate(sourceMeals, '2026-07-28', {
+    idempotencyKey: 'test:copy-meal-batch',
+  });
+
+  const meals = await getAll('meals');
+  assert.equal(meals.length, 2);
+  assert.equal(meals.every(meal => meal.date === '2026-07-28'), true);
 });

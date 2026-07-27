@@ -12,20 +12,27 @@ This document describes the current application, not a future design.
 - Browser auto-backups use localStorage. They improve recovery from an
   accidental application-level write, but are not independent of the same
   browser profile.
-- Food search terms are sent to Open Food Facts and, when configured, USDA
-  FoodData Central.
+- LibreLog gets first-use confirmation before it sends food search terms to
+  Open Food Facts or USDA FoodData Central.
 - Optional AI features send the user-selected description, audio, or photo to
   the configured OpenAI, Anthropic, or Ollama endpoint.
-- Optional WebDAV sync sends a JSON backup to the server configured by the
+- Optional WebDAV backup sends a JSON backup to the server configured by the
   user.
+- Portable and WebDAV backups can use passphrase encryption.
 - LibreLog has no account service, analytics, or first-party application
   backend.
 
 ## Credentials
 
-AI, USDA, and WebDAV credentials are stored unencrypted in IndexedDB. This is
-local storage, not a hardware-backed secret store. Anyone or any script with
-access to the browser profile may be able to read them.
+AI, USDA, and WebDAV credentials use one IndexedDB storage adapter. Optional
+credential protection encrypts them at rest with AES-GCM and a key derived
+from a user passphrase. The passphrase stays in memory until the user locks the
+store or reloads the application.
+
+If credential protection is off, credentials are plaintext IndexedDB settings.
+Same-origin code can read credentials while the protected store is unlocked.
+This control is not a hardware-backed secret store. LibreLog cannot recover a
+lost passphrase.
 
 JSON exports, browser auto-backups, and WebDAV backups exclude credential
 settings. Replacement imports preserve credentials already on the device and
@@ -41,11 +48,18 @@ compromised.
   `textContent`.
 - JSON backups are shape-checked before import and replacement runs in one
   multi-store IndexedDB transaction.
+- IndexedDB schema version 2 adds the meal idempotency index.
+- LibreLog makes a credential-free checkpoint before the version 2 migration.
+- Settings can restore the migration checkpoint.
+- Portable and WebDAV backups support authenticated AES-256-GCM encryption.
+- Backup keys use PBKDF2-SHA-256 with a new salt for each backup.
 - AI nutrition responses pass deterministic type, range, count, and
   plausibility validation before they can be reviewed or logged.
 - AI estimates retain confidence, assumptions, warnings, and an estimate source
   marker.
-- Network requests use timeouts where supported by the integration.
+- AI, Open Food Facts, and USDA use one timeout and cancellation contract.
+- Integration errors do not include request data, response data, or a URL.
+- Read-only food requests use no more than one retry.
 - PWA cache rules cover static application assets and public food-database
   responses, not IndexedDB diary records or API credentials.
 

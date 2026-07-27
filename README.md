@@ -6,7 +6,8 @@ A privacy-first, open-source meal tracking and calorie counting app. Part of the
 
 Food searches are sent to the enabled food database. Optional AI features send
 the description, audio, or photo you choose to your configured provider.
-Optional WebDAV sync uploads a credential-free backup to your server.
+Optional WebDAV backup uploads a credential-free backup to your server.
+You can encrypt portable and WebDAV backups with a passphrase.
 
 ## Features
 
@@ -29,6 +30,8 @@ Optional WebDAV sync uploads a credential-free backup to your server.
 - **Recipe builder** — Combine foods with per-serving nutrition
 - **Meal templates** — Save and load typical day meals
 - **Day copy** — Clone meals from any previous day
+- **Favorites and usual servings** — Keep frequent food portions ready
+- **Meal history** — Search old meals and review them before reuse
 
 ### Weight Tracking
 - **Daily logging** — Weight, body fat %, kg/lb
@@ -38,11 +41,13 @@ Optional WebDAV sync uploads a credential-free backup to your server.
 
 ### Data & Privacy
 - **Offline-first** — Works without internet via service worker
-- **Local storage** — All data in IndexedDB, never sent to servers
+- **Local-first storage** — Core data stays in IndexedDB unless you use an explicit remote feature
 - **Auto-backup** — Every 6 hours to filesystem or localStorage
 - **JSON export/import** — Full data portability
+- **Encrypted backup** — Optional passphrase encryption for portable and WebDAV files
 - **MyFitnessPal import** — CSV migration from MFP
 - **WebDAV backup/restore** — Optional self-hosted backup (Nextcloud, etc.)
+- **Migration checkpoints** — Credential-free recovery data before a schema change
 
 ### Design
 - **3 themes** — Compline (dark), Lauds (light), Vigil (AMOLED)
@@ -102,9 +107,11 @@ LibreLog works fully without AI. To enable photo/voice/text food logging:
 3. Enter your API key
 4. Photo, Voice, and AI Text tabs appear in the search page
 
-Keys are stored unencrypted in this browser's IndexedDB and excluded from JSON
-exports and WebDAV backups. Protect the device/browser profile and use
-provider-side spending limits. Costs vary by provider and model.
+Keys are excluded from JSON exports and WebDAV backups. Credential protection
+can encrypt keys at rest with a passphrase. If protection is off, keys are
+plaintext IndexedDB settings. Same-origin code can read keys while protection
+is unlocked. Protect the device/browser profile and use provider-side spending
+limits. Costs vary by provider and model.
 
 AI nutrition is always an estimate. LibreLog validates model output and asks you
 to review/edit portions and nutrition before logging it.
@@ -116,6 +123,7 @@ src/
 ├── app.js                 # SPA router & shell
 ├── pages/                 # Route pages
 │   ├── diary.js           # Daily food diary
+│   ├── history.js         # Searchable meal history
 │   ├── search.js          # Unified search (text/scan/photo/voice/AI)
 │   ├── insights.js        # Statistics & progress
 │   ├── weight.js          # Weight tracking

@@ -10,6 +10,10 @@ import { todayStr, formatDate } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
+import {
+  hasPrivacyConsent,
+  requestPrivacyConsent,
+} from '../components/privacy-consent.js';
 import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
 import { scaleNutrients } from '../engine/nutrition.js';
 import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
@@ -67,9 +71,20 @@ export async function renderSearchPage(container, queryString) {
   let searchSequence = 0;
   let preselectedHandled = false;
   let aiAbortController = null;
+  let searchAbortController = null;
   let disposed = false;
+  let privacySourcesInitialized = false;
 
   async function render() {
+    if (!privacySourcesInitialized) {
+      const [offConsent, usdaConsent] = await Promise.all([
+        hasPrivacyConsent('openfoodfacts'),
+        hasPrivacyConsent('usda'),
+      ]);
+      searchSources.off = offConsent;
+      searchSources.usda = usdaConsent;
+      privacySourcesInitialized = true;
+    }
     // Determine which modes to show based on AI config
     const ai = await loadAI();
     const aiConfigured = ai ? await ai.isAIConfigured() : false;
@@ -195,8 +210,12 @@ export async function renderSearchPage(container, queryString) {
 
     // Source filter chips
     document.querySelectorAll('.source-filter-chip').forEach(chip => {
-      chip.addEventListener('click', () => {
+      chip.addEventListener('click', async () => {
         const source = chip.dataset.source;
+        if (source !== 'local' && !searchSources[source]) {
+          const consent = await requestFoodSourceConsent(source);
+          if (!consent) return;
+        }
         searchSources[source] = !searchSources[source];
         if (!searchSources.local && !searchSources.usda && !searchSources.off) {
           searchSources[source] = true;
@@ -233,6 +252,9 @@ export async function renderSearchPage(container, queryString) {
     if (!area) return;
     const requestedQuery = searchQuery;
     const sequence = ++searchSequence;
+    searchAbortController?.abort();
+    searchAbortController = new AbortController();
+    const { signal } = searchAbortController;
     if (!loadMore) {
       area.innerHTML = '<div class="search-loading">Searching...</div>';
     }
@@ -257,7 +279,8 @@ export async function renderSearchPage(container, queryString) {
         limit: 50,
         sources: searchSources,
         offPage,
-        usdaPage
+        usdaPage,
+        signal,
       });
       if (sequence !== searchSequence || requestedQuery !== searchQuery) return;
       if (loadMore) {
@@ -298,6 +321,11 @@ export async function renderSearchPage(container, queryString) {
   async function performBarcodeLookup(code) {
     const area = document.getElementById('search-results-area');
     if (!area) return;
+    const consent = await requestFoodSourceConsent('off');
+    if (!consent) {
+      area.innerHTML = '<div class="search-empty"><p>Remote barcode lookup is off. Local foods remain available.</p></div>';
+      return;
+    }
     area.innerHTML = '<div class="search-loading">Looking up barcode...</div>';
     try {
       const food = await lookupBarcode(code);
@@ -382,6 +410,11 @@ export async function renderSearchPage(container, queryString) {
   async function handleBarcodeResult(code) {
     const resultDiv = document.getElementById('scan-result');
     if (!resultDiv) return;
+    const consent = await requestFoodSourceConsent('off');
+    if (!consent) {
+      resultDiv.innerHTML = '<div class="search-empty"><p>Remote barcode lookup is off.</p></div>';
+      return;
+    }
     resultDiv.innerHTML = '<div class="search-loading">Looking up barcode...</div>';
     try {
       const food = await lookupBarcode(code);
@@ -803,11 +836,30 @@ export async function renderSearchPage(container, queryString) {
     disposed = true;
     aiAbortController?.abort();
     aiAbortController = null;
+    searchAbortController?.abort();
+    searchAbortController = null;
     searchSequence++;
     clearTimeout(searchTimeout);
     stopScanner();
     stopVoice();
   };
+}
+
+function requestFoodSourceConsent(source) {
+  if (source === 'usda') {
+    return requestPrivacyConsent({
+      key: 'usda',
+      title: 'Use USDA FoodData Central?',
+      message: 'LibreLog sends food search terms and food identifiers to USDA FoodData Central. LibreLog does not send your diary history.',
+      confirmLabel: 'Use USDA Search',
+    });
+  }
+  return requestPrivacyConsent({
+    key: 'openfoodfacts',
+    title: 'Use Open Food Facts?',
+    message: 'LibreLog sends food search terms and barcodes to Open Food Facts. LibreLog does not send your diary history.',
+    confirmLabel: 'Use Open Food Facts',
+  });
 }
 
 // ===== STANDALONE FUNCTIONS =====
@@ -848,8 +900,10 @@ function renderFoodResult(food) {
 
 function openPortionModal(food, mealType, targetDate = todayStr()) {
   const baseNutrition = { calories: food.nutrients?.energy?.kcal || 0, protein: food.nutrients?.macros?.protein?.g || 0, carbs: food.nutrients?.macros?.carbs?.g || 0, fat: food.nutrients?.macros?.fat?.g || 0 };
-  let quantity = Number(food.servingSize?.quantity) > 0 ? Number(food.servingSize.quantity) : 100;
-  let unit = food.servingSize?.unit || 'g', selectedMealType = mealType;
+  let quantity = Number(food.usualServing?.quantity) > 0
+    ? Number(food.usualServing.quantity)
+    : (Number(food.servingSize?.quantity) > 0 ? Number(food.servingSize.quantity) : 100);
+  let unit = food.usualServing?.unit || food.servingSize?.unit || 'g', selectedMealType = mealType;
   let logInProgress = false;
   const idempotencyKey = createIdempotencyKey('food');
   const availableUnits = getUnitsForFood(food);
@@ -871,6 +925,8 @@ function openPortionModal(food, mealType, targetDate = todayStr()) {
     </div>
     <div id="nutrition-preview"></div>
     <label class="control-group"><span class="control-label">Notes (optional)</span><input type="text" class="notes-input" id="notes-input" maxlength="500" placeholder="e.g., with milk"></label>
+    <label class="control-group"><span><input type="checkbox" id="favorite-food" ${food.favorite ? 'checked' : ''}> Add this food to Favorites</span></label>
+    <label class="control-group"><span><input type="checkbox" id="save-usual-serving" ${food.usualServing ? 'checked' : ''}> Save this quantity and unit as my usual serving</span></label>
     <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Cancel</button><button class="btn btn-primary" id="log-btn">Log Food</button></div>
   `;
   openModal(modal);
@@ -887,6 +943,12 @@ function openPortionModal(food, mealType, targetDate = todayStr()) {
     logInProgress = true;
     event.currentTarget.disabled = true;
     event.currentTarget.textContent = 'Logging…';
+    food.favorite = document.getElementById('favorite-food').checked;
+    if (document.getElementById('save-usual-serving').checked) {
+      food.usualServing = { quantity, unit };
+    } else {
+      delete food.usualServing;
+    }
     const success = await logFood(
       food,
       quantity,
@@ -909,7 +971,7 @@ async function logFood(food, quantity, unit, mealType, notes, targetDate = today
   try {
     if (!food.id) food.id = generateId();
     const existing = await getById('foods', food.id);
-    if (!existing) await put('foods', food);
+    await put('foods', { ...(existing || {}), ...food });
     await createMeal({
       date: targetDate, type: mealType.toLowerCase(),
       items: [{ foodId: food.id, quantity, unit, notes, nutrients: scaleNutrients(food, quantity, unit) }],

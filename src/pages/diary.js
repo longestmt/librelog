@@ -1,4 +1,11 @@
-import { getById, getByIndex, getAll, put, softDelete, getSetting, setSetting } from '../data/db.js';
+import { getById, getByIndex, getAll, put, getSetting, setSetting } from '../data/db.js';
+import {
+  copyMealsToDate,
+  createIdempotencyKey,
+  createMealBatch,
+  removeMealItem,
+  updateMealItem,
+} from '../data/meal-commands.js';
 import { getGoals } from '../engine/goal-tracking.js';
 import { calculateDayTotalsSimple, scaleNutrients } from '../engine/nutrition.js';
 import { todayStr, formatDate, addCalendarDays } from '../utils/format.js';
@@ -185,6 +192,9 @@ export async function renderDiaryPage(container, queryString) {
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
             Load Template
           </button>
+          <button class="btn btn-ghost btn-small" id="meal-history-btn" aria-label="Search meal history">
+            Meal History
+          </button>
         </div>
 
         <!-- FAB Button -->
@@ -261,6 +271,9 @@ export async function renderDiaryPage(container, queryString) {
 
     // Load template
     document.getElementById('load-template-btn')?.addEventListener('click', () => openLoadTemplateModal(currentDate, render));
+    document.getElementById('meal-history-btn')?.addEventListener('click', () => {
+      window.location.hash = '#/history';
+    });
 
     // Meal section add food buttons
     document.querySelectorAll('.meal-add-btn').forEach(btn => {
@@ -484,6 +497,8 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
   const qtyInput = document.getElementById('qty-input');
   const unitSelect = document.getElementById('unit-select');
   const notesInput = document.getElementById('notes-input');
+  const updateCommandKey = createIdempotencyKey('edit');
+  const removeCommandKey = createIdempotencyKey('remove');
 
   document.getElementById('qty-minus').addEventListener('click', () => {
     qtyInput.value = Math.max(0.1, parseFloat(qtyInput.value) - 0.5);
@@ -510,11 +525,13 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
   document.getElementById('modal-close').addEventListener('click', closeModal);
 
   document.getElementById('save-btn').addEventListener('click', async () => {
-    item.quantity = quantity;
-    item.unit = unit;
-    item.notes = notesInput.value;
-    item.nutrients = scaleNutrients(food, quantity, unit);
-    await put('meals', meal);
+    await updateMealItem(meal.id, foodIndex, {
+      ...item,
+      quantity,
+      unit,
+      notes: notesInput.value,
+      nutrients: scaleNutrients(food, quantity, unit),
+    }, { idempotencyKey: updateCommandKey });
     showToast('Food updated');
     closeModal();
     if (onComplete) onComplete();
@@ -528,12 +545,7 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
       event.currentTarget.setAttribute('aria-label', 'Confirm removal of this food');
       return;
     }
-    meal.items.splice(foodIndex, 1);
-    if (meal.items.length === 0) {
-      await softDelete('meals', meal.id);
-    } else {
-      await put('meals', meal);
-    }
+    await removeMealItem(meal.id, foodIndex, { idempotencyKey: removeCommandKey });
     showToast('Food removed');
     closeModal();
     if (onComplete) onComplete();
@@ -603,24 +615,24 @@ async function openCopyDayModal(targetDate, onComplete) {
   openModal(modal);
   document.getElementById('modal-close').addEventListener('click', closeModal);
   document.getElementById('cancel-btn').addEventListener('click', closeModal);
-  document.getElementById('copy-btn').addEventListener('click', async () => {
+  const copyCommandKey = createIdempotencyKey('copy-day');
+  document.getElementById('copy-btn').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
     const sourceDate = document.getElementById('copy-source-date').value;
-    if (!sourceDate) { showToast('Please select a date'); return; }
-    const sourceMeals = await getByIndex('meals', 'date', sourceDate) || [];
-    if (sourceMeals.length === 0) { showToast('No meals found on that date'); return; }
-    let count = 0;
-    for (const meal of sourceMeals) {
-      if (!meal.items || meal.items.length === 0) continue;
-      const newMeal = {
-        id: generateId(),
-        date: targetDate,
-        type: meal.type,
-        items: meal.items.map(item => ({ ...item })),
-        createdAt: new Date().toISOString(),
-      };
-      await put('meals', newMeal);
-      count += meal.items.length;
+    if (!sourceDate) {
+      showToast('Please select a date');
+      button.disabled = false;
+      return;
     }
+    const sourceMeals = await getByIndex('meals', 'date', sourceDate) || [];
+    if (sourceMeals.length === 0) {
+      showToast('No meals found on that date');
+      button.disabled = false;
+      return;
+    }
+    await copyMealsToDate(sourceMeals, targetDate, { idempotencyKey: copyCommandKey });
+    const count = sourceMeals.reduce((total, meal) => total + (meal.items?.length || 0), 0);
     showToast(`Copied ${count} food items`);
     closeModal();
     onComplete();
@@ -658,6 +670,7 @@ async function openLoadTemplateModal(targetDate, onComplete) {
   document.getElementById('cancel-btn').addEventListener('click', closeModal);
 
   document.querySelectorAll('.template-item').forEach(el => {
+    const templateCommandKey = createIdempotencyKey('template');
     const handler = async () => {
       const idx = parseInt(el.dataset.idx);
       const template = templates[idx];
@@ -669,15 +682,14 @@ async function openLoadTemplateModal(targetDate, onComplete) {
         if (!byType[type]) byType[type] = [];
         byType[type].push(item);
       }
-      for (const [type, items] of Object.entries(byType)) {
-        await put('meals', {
-          id: generateId(),
+      await createMealBatch(
+        Object.entries(byType).map(([type, items]) => ({
           date: targetDate,
           type,
           items: items.map(({ mealType, ...rest }) => ({ ...rest })),
-          createdAt: new Date().toISOString(),
-        });
-      }
+        })),
+        { idempotencyKey: templateCommandKey },
+      );
       showToast(`Template "${template.name}" loaded`);
       closeModal();
       onComplete();

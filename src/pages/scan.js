@@ -1,10 +1,12 @@
 import { lookupBarcode } from '../integrations/openfoodfacts.js';
 import { searchFoods, getRecentFoods, getFavoriteFoods } from '../engine/food-search.js';
 import { getById, put } from '../data/db.js';
+import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 import { todayStr } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
+import { requestPrivacyConsent } from '../components/privacy-consent.js';
 import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
 
 let Quagga = null;
@@ -217,6 +219,16 @@ export function renderScanPage(container, queryString) {
   async function performBarcodeLookup(code) {
     const contentDiv = document.getElementById('scan-search-content');
     const resultDiv = document.getElementById('scan-result');
+    const consent = await requestPrivacyConsent({
+      key: 'openfoodfacts',
+      title: 'Use Open Food Facts?',
+      message: 'LibreLog sends this barcode to Open Food Facts. LibreLog does not send your diary history.',
+      confirmLabel: 'Look Up Barcode',
+    });
+    if (!consent) {
+      contentDiv.innerHTML = '<div class="search-empty"><p>Remote barcode lookup is off.</p></div>';
+      return;
+    }
     contentDiv.innerHTML = '<div class="search-loading">Looking up barcode...</div>';
     resultDiv.innerHTML = '';
 
@@ -369,6 +381,7 @@ export function renderScanPage(container, queryString) {
     const unitSelect = document.getElementById('unit-select');
     const mealTypeSelect = document.getElementById('meal-type-select');
     const notesInput = document.getElementById('notes-input');
+    const logCommandKey = createIdempotencyKey('scan');
 
     document.getElementById('qty-minus').addEventListener('click', () => {
       qtyInput.value = Math.max(0.1, parseFloat(qtyInput.value) - 0.5);
@@ -392,14 +405,15 @@ export function renderScanPage(container, queryString) {
     document.getElementById('modal-close').addEventListener('click', closeModal);
     document.getElementById('cancel-btn').addEventListener('click', closeModal);
 
-    document.getElementById('log-btn').addEventListener('click', async () => {
-      await logFood(food, quantity, unit, selectedMealType, notesInput.value);
+    document.getElementById('log-btn').addEventListener('click', async (event) => {
+      event.currentTarget.disabled = true;
+      await logFood(food, quantity, unit, selectedMealType, notesInput.value, logCommandKey);
     });
 
     updatePreview();
   }
 
-  async function logFood(food, quantity, unit, mealType, notes) {
+  async function logFood(food, quantity, unit, mealType, notes, idempotencyKey) {
     try {
       if (!food.id) food.id = generateId();
       const existing = await getById('foods', food.id);
@@ -415,13 +429,11 @@ export function renderScanPage(container, queryString) {
         sodium: (food.nutrients?.sodium?.mg || 0) * multiplier,
       };
 
-      await put('meals', {
-        id: generateId(),
+      await createMeal({
         date: todayStr(),
         type: mealType.toLowerCase(),
         items: [{ foodId: food.id, quantity, unit, notes, nutrients: scaledNutrients }],
-        createdAt: new Date().toISOString(),
-      });
+      }, { idempotencyKey });
 
       showToast(`${food.name} logged to ${mealType}`);
       closeModal();

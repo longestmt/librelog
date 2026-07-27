@@ -5,10 +5,12 @@
  */
 
 const DB_NAME = 'librelog';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 export const DATA_SCHEMA_VERSION = DB_VERSION;
 export const BACKUP_SCHEMA_VERSION = 1;
 const DATA_STORES = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
+const MIGRATION_BACKUP_KEY = 'librelog_migration_backups';
+const MAX_MIGRATION_BACKUPS = 3;
 const SENSITIVE_SETTING_KEYS = new Set([
     'ai_api_key',
     'usda_api_key',
@@ -21,9 +23,141 @@ const SENSITIVE_SETTING_KEYS = new Set([
     'webdav_connected',
     'githubPAT',
     'githubGistId',
+    'credentialEncryptionEnabled',
+    'credentialEncryptionVerifier',
 ]);
 
 let dbInstance = null;
+
+function readMigrationBackups() {
+    if (typeof localStorage === 'undefined') return [];
+    const raw = localStorage.getItem(MIGRATION_BACKUP_KEY);
+    if (!raw) return [];
+    const backups = JSON.parse(raw);
+    return Array.isArray(backups) ? backups : [];
+}
+
+function writeMigrationBackup(backup) {
+    if (typeof localStorage === 'undefined') {
+        throw new Error('Migration backup storage is not available');
+    }
+    const backups = [backup, ...readMigrationBackups()]
+        .slice(0, MAX_MIGRATION_BACKUPS);
+    localStorage.setItem(MIGRATION_BACKUP_KEY, JSON.stringify(backups));
+}
+
+function filterExportRecords(storeName, records) {
+    return storeName === 'settings'
+        ? records.filter(record => !SENSITIVE_SETTING_KEYS.has(record.key))
+        : records;
+}
+
+function createStoresAndIndexes(db, transaction) {
+    let foods;
+    if (!db.objectStoreNames.contains('foods')) {
+        foods = db.createObjectStore('foods', { keyPath: 'id' });
+    } else {
+        foods = transaction.objectStore('foods');
+    }
+    if (!foods.indexNames.contains('name')) foods.createIndex('name', 'name', { unique: false });
+    if (!foods.indexNames.contains('barcode')) foods.createIndex('barcode', 'barcode', { unique: false });
+    if (!foods.indexNames.contains('source')) foods.createIndex('source', 'source', { unique: false });
+
+    let meals;
+    if (!db.objectStoreNames.contains('meals')) {
+        meals = db.createObjectStore('meals', { keyPath: 'id' });
+    } else {
+        meals = transaction.objectStore('meals');
+    }
+    if (!meals.indexNames.contains('date')) meals.createIndex('date', 'date', { unique: false });
+    if (!meals.indexNames.contains('mealType')) meals.createIndex('mealType', 'mealType', { unique: false });
+    if (!meals.indexNames.contains('idempotencyKey')) {
+        meals.createIndex('idempotencyKey', 'idempotencyKey', { unique: false });
+    }
+
+    let recipes;
+    if (!db.objectStoreNames.contains('recipes')) {
+        recipes = db.createObjectStore('recipes', { keyPath: 'id' });
+    } else {
+        recipes = transaction.objectStore('recipes');
+    }
+    if (!recipes.indexNames.contains('name')) recipes.createIndex('name', 'name', { unique: false });
+    if (!recipes.indexNames.contains('category')) recipes.createIndex('category', 'category', { unique: false });
+
+    let measurements;
+    if (!db.objectStoreNames.contains('measurements')) {
+        measurements = db.createObjectStore('measurements', { keyPath: 'id' });
+    } else {
+        measurements = transaction.objectStore('measurements');
+    }
+    if (!measurements.indexNames.contains('date')) {
+        measurements.createIndex('date', 'date', { unique: false });
+    }
+
+    if (!db.objectStoreNames.contains('settings')) {
+        db.createObjectStore('settings', { keyPath: 'key' });
+    }
+
+    let apiCache;
+    if (!db.objectStoreNames.contains('apiCache')) {
+        apiCache = db.createObjectStore('apiCache', { keyPath: 'id' });
+    } else {
+        apiCache = transaction.objectStore('apiCache');
+    }
+    if (!apiCache.indexNames.contains('source')) apiCache.createIndex('source', 'source', { unique: false });
+    if (!apiCache.indexNames.contains('query')) apiCache.createIndex('query', 'query', { unique: false });
+    if (!apiCache.indexNames.contains('expiresAt')) {
+        apiCache.createIndex('expiresAt', 'expiresAt', { unique: false });
+    }
+}
+
+function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
+    const stores = DATA_STORES.filter(name => db.objectStoreNames.contains(name));
+    const exportedStores = {};
+    let pending = stores.length;
+
+    const fail = () => {
+        try {
+            transaction.abort();
+        } catch {
+            // The request error also stops the version-change transaction.
+        }
+    };
+
+    if (pending === 0) {
+        onComplete();
+        return;
+    }
+
+    for (const name of stores) {
+        const request = transaction.objectStore(name).getAll();
+        request.onerror = fail;
+        request.onsuccess = () => {
+            exportedStores[name] = filterExportRecords(name, request.result);
+            pending -= 1;
+            if (pending !== 0) return;
+
+            try {
+                const timestamp = now();
+                writeMigrationBackup({
+                    timestamp,
+                    fromVersion: oldVersion,
+                    toVersion: DB_VERSION,
+                    data: {
+                        version: BACKUP_SCHEMA_VERSION,
+                        dataVersion: oldVersion,
+                        exportedAt: timestamp,
+                        secretsExcluded: true,
+                        stores: exportedStores,
+                    },
+                });
+                onComplete();
+            } catch {
+                fail();
+            }
+        };
+    }
+}
 
 /**
  * Generate a UUID v4 string
@@ -56,47 +190,14 @@ function openDB() {
 
         req.onupgradeneeded = (e) => {
             const db = e.target.result;
-
-            // Foods store
-            if (!db.objectStoreNames.contains('foods')) {
-                const store = db.createObjectStore('foods', { keyPath: 'id' });
-                store.createIndex('name', 'name', { unique: false });
-                store.createIndex('barcode', 'barcode', { unique: false });
-                store.createIndex('source', 'source', { unique: false });
+            const transaction = e.target.transaction;
+            if (e.oldVersion === 0) {
+                createStoresAndIndexes(db, transaction);
+                return;
             }
-
-            // Meals store
-            if (!db.objectStoreNames.contains('meals')) {
-                const store = db.createObjectStore('meals', { keyPath: 'id' });
-                store.createIndex('date', 'date', { unique: false });
-                store.createIndex('mealType', 'mealType', { unique: false });
-            }
-
-            // Recipes store
-            if (!db.objectStoreNames.contains('recipes')) {
-                const store = db.createObjectStore('recipes', { keyPath: 'id' });
-                store.createIndex('name', 'name', { unique: false });
-                store.createIndex('category', 'category', { unique: false });
-            }
-
-            // Measurements store (body weight, etc.)
-            if (!db.objectStoreNames.contains('measurements')) {
-                const store = db.createObjectStore('measurements', { keyPath: 'id' });
-                store.createIndex('date', 'date', { unique: false });
-            }
-
-            // Settings (key-value)
-            if (!db.objectStoreNames.contains('settings')) {
-                db.createObjectStore('settings', { keyPath: 'key' });
-            }
-
-            // API Cache (for Open Food Facts, USDA, etc.)
-            if (!db.objectStoreNames.contains('apiCache')) {
-                const store = db.createObjectStore('apiCache', { keyPath: 'id' });
-                store.createIndex('source', 'source', { unique: false });
-                store.createIndex('query', 'query', { unique: false });
-                store.createIndex('expiresAt', 'expiresAt', { unique: false });
-            }
+            captureMigrationBackup(db, transaction, e.oldVersion, () => {
+                createStoresAndIndexes(db, transaction);
+            });
         };
 
         req.onsuccess = (e) => {
@@ -290,9 +391,7 @@ export async function exportAllData() {
         if (!db.objectStoreNames.contains(name)) continue;
         const store = await getStore(name);
         const records = await promisifyRequest(store.getAll());
-        data.stores[name] = name === 'settings'
-            ? records.filter(record => !SENSITIVE_SETTING_KEYS.has(record.key))
-            : records;
+        data.stores[name] = filterExportRecords(name, records);
     }
     return data;
 }
@@ -410,6 +509,32 @@ export async function importAllData(data, merge = false) {
 export async function clearAllData() {
     for (const name of DATA_STORES) {
         await hardDeleteAll(name);
+    }
+    clearMigrationBackups();
+}
+
+export function getMigrationBackups() {
+    try {
+        return readMigrationBackups().map(backup => ({
+            timestamp: backup.timestamp,
+            fromVersion: backup.fromVersion,
+            toVersion: backup.toVersion,
+        }));
+    } catch {
+        return [];
+    }
+}
+
+export function getMigrationBackupData(timestamp) {
+    const backup = readMigrationBackups()
+        .find(item => item.timestamp === timestamp);
+    if (!backup?.data) throw new Error('Migration checkpoint was not found');
+    return structuredClone(backup.data);
+}
+
+export function clearMigrationBackups() {
+    if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(MIGRATION_BACKUP_KEY);
     }
 }
 

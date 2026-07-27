@@ -6,6 +6,11 @@
 
 import { getSetting, setSetting } from '../data/db.js';
 import { getCredential } from '../data/credentials.js';
+import {
+    getSafeIntegrationMessage,
+    logIntegrationFailure,
+    requestJSON,
+} from './request.js';
 
 // ---------------------------------------------------------------------------
 // Configuration helpers
@@ -44,26 +49,6 @@ export async function getAIConfig() {
 const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
- * Perform a fetch with a 15-second abort timeout.
- * @param {string} url
- * @param {RequestInit} init
- * @returns {Promise<Response>}
- */
-async function fetchWithTimeout(url, init = {}, externalSignal = null) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    const handleExternalAbort = () => controller.abort();
-    externalSignal?.addEventListener('abort', handleExternalAbort, { once: true });
-    try {
-        const res = await fetch(url, { ...init, signal: controller.signal });
-        return res;
-    } finally {
-        clearTimeout(timer);
-        externalSignal?.removeEventListener('abort', handleExternalAbort);
-    }
-}
-
-/**
  * Route a chat completion request to OpenAI.
  */
 async function openaiCompletion(messages, { apiKey, model, maxTokens, temperature, jsonMode, signal }) {
@@ -77,21 +62,20 @@ async function openaiCompletion(messages, { apiKey, model, maxTokens, temperatur
         body.response_format = { type: 'json_object' };
     }
 
-    const res = await fetchWithTimeout('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
+    const { data } = await requestJSON({
+        provider: 'OpenAI',
+        url: 'https://api.openai.com/v1/chat/completions',
+        init: {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
         },
-        body: JSON.stringify(body),
-    }, signal);
-
-    if (!res.ok) {
-        const text = await res.text().catch(() => res.statusText);
-        throw new Error(`OpenAI ${res.status}: ${text}`);
-    }
-
-    const data = await res.json();
+        signal,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+    });
     const choice = data.choices?.[0];
     const usage = data.usage || {};
     return {
@@ -169,23 +153,22 @@ async function anthropicCompletion(messages, { apiKey, model, maxTokens, tempera
         body.system = system;
     }
 
-    const res = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01',
-            'anthropic-dangerous-direct-browser-access': 'true',
-            'Content-Type': 'application/json',
+    const { data } = await requestJSON({
+        provider: 'Anthropic',
+        url: 'https://api.anthropic.com/v1/messages',
+        init: {
+            method: 'POST',
+            headers: {
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+                'anthropic-dangerous-direct-browser-access': 'true',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
         },
-        body: JSON.stringify(body),
-    }, signal);
-
-    if (!res.ok) {
-        const text = await res.text().catch(() => res.statusText);
-        throw new Error(`Anthropic ${res.status}: ${text}`);
-    }
-
-    const data = await res.json();
+        signal,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+    });
     const content = data.content?.map((b) => b.text).join('') ?? null;
     const usage = data.usage || {};
     return {
@@ -212,18 +195,17 @@ async function ollamaCompletion(messages, { model, ollamaUrl, jsonMode, signal }
     };
     if (jsonMode) body.format = 'json';
 
-    const res = await fetchWithTimeout(`${ollamaUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    }, signal);
-
-    if (!res.ok) {
-        const text = await res.text().catch(() => res.statusText);
-        throw new Error(`Ollama ${res.status}: ${text}`);
-    }
-
-    const data = await res.json();
+    const { data } = await requestJSON({
+        provider: 'Ollama',
+        url: `${ollamaUrl}/api/chat`,
+        init: {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        },
+        signal,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+    });
     const content = data.message?.content ?? null;
 
     // Ollama doesn't always report token usage — estimate from content length
@@ -266,6 +248,9 @@ export async function chatCompletion(messages, options = {}) {
         if (provider !== 'ollama' && !apiKey) {
             return { content: null, error: `API key not set for provider "${provider}"` };
         }
+        if (provider === 'ollama' && !model) {
+            return { content: null, error: 'Choose an installed Ollama model in Settings' };
+        }
 
         const params = { apiKey, model, maxTokens, temperature, jsonMode, ollamaUrl, signal };
 
@@ -286,10 +271,8 @@ export async function chatCompletion(messages, options = {}) {
 
         return result;
     } catch (err) {
-        const message = err.name === 'AbortError'
-            ? (options.signal?.aborted ? 'AI request cancelled' : 'AI request timed out (15 s)')
-            : err.message || String(err);
-        console.warn('[aiClient] chatCompletion failed:', message);
+        const message = getSafeIntegrationMessage(err, 'AI request failed.');
+        logIntegrationFailure(err);
         return { content: null, error: message };
     }
 }

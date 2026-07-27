@@ -4,6 +4,7 @@
  */
 
 import { getById, put } from '../data/db.js';
+import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 import { todayStr } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
@@ -37,6 +38,7 @@ export function renderAIChatPage(container, queryString) {
   let recorder = null;
   let isRecording = false;
   let amplitudeInterval = null;
+  let confirmCommandKey = null;
 
   async function render() {
     const ai = await loadAIModules();
@@ -369,6 +371,7 @@ export function renderAIChatPage(container, queryString) {
     }
 
     let logged = 0;
+    confirmCommandKey ||= createIdempotencyKey(`ai-${currentMode}`);
     for (const idx of indices) {
       const food = analysisResults.foods[idx];
       if (!food) continue;
@@ -383,8 +386,7 @@ export function renderAIChatPage(container, queryString) {
       const unit = food.servingSize?.unit || 'g';
       const multiplier = getNutritionMultiplier(qty, unit, food);
 
-      await put('meals', {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      const result = await createMeal({
         date: todayStr(),
         type: mealType,
         items: [{
@@ -401,9 +403,8 @@ export function renderAIChatPage(container, queryString) {
             sodium: (food.nutrients?.sodium?.mg || 0) * multiplier,
           },
         }],
-        createdAt: new Date().toISOString(),
-      });
-      logged++;
+      }, { idempotencyKey: `${confirmCommandKey}:${idx}` });
+      if (result.created) logged++;
     }
 
     showToast(`Logged ${logged} food${logged !== 1 ? 's' : ''}`);

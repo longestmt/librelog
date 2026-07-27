@@ -9,6 +9,7 @@ import { exportAllData, importAllData } from './db.js';
 import { getSetting, setSetting } from './db.js';
 import { Capacitor } from '@capacitor/core';
 import { getCredential, removeCredential, setCredential } from './credentials.js';
+import { decryptBackup, encryptBackup, isEncryptedBackup } from './encryption.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -132,7 +133,7 @@ function getAuthHeader(username, password) {
  * Excludes webdav/github credentials from backup
  * @returns {Promise<boolean>}
  */
-export async function pushToWebDav() {
+export async function pushToWebDav({ passphrase = null } = {}) {
     const config = await getWebDavConfig();
     if (!config.url || !config.username || !config.password) {
         throw new Error('WebDAV is not fully configured.');
@@ -146,8 +147,9 @@ export async function pushToWebDav() {
         );
     }
 
-    const jsonStr = JSON.stringify(data, null, 2);
-    const targetUrl = `${config.url}librelog_backup.json`;
+    const backup = passphrase ? await encryptBackup(data, passphrase) : data;
+    const jsonStr = JSON.stringify(backup, null, 2);
+    const targetUrl = `${config.url}${passphrase ? 'librelog_backup.encrypted.json' : 'librelog_backup.json'}`;
 
     let res;
     try {
@@ -189,13 +191,13 @@ export async function pushToWebDav() {
  * Restores credentials that are excluded from backup
  * @returns {Promise<boolean>}
  */
-export async function pullFromWebDav() {
+export async function pullFromWebDav({ passphrase = null } = {}) {
     const config = await getWebDavConfig();
     if (!config.url || !config.username || !config.password) {
         throw new Error('WebDAV is not fully configured.');
     }
 
-    const targetUrl = `${config.url}librelog_backup.json`;
+    const targetUrl = `${config.url}${passphrase ? 'librelog_backup.encrypted.json' : 'librelog_backup.json'}`;
 
     let res;
     try {
@@ -240,29 +242,34 @@ export async function pullFromWebDav() {
         throw new Error(`WebDAV HTTP Error: ${res.status} ${res.statusText || res.status}`);
     }
 
+    let parsedData;
     try {
-        // CapacitorHttp parses JSON natively, fetch does not
-        const jsonData = (Capacitor.isNativePlatform() && Capacitor.Plugins.CapacitorHttp) ? res.data : await res.json();
-
-        // Sometimes CapacitorHttp returns a string if it couldn't parse it
-        const parsedData = typeof jsonData === 'string' ? JSON.parse(jsonData) : jsonData;
-
-        // Preserve credentials before import (importAllData wipes all settings)
-        const savedConfig = await getWebDavConfig();
-        const githubPAT = await getCredential('githubPat');
-        const githubGistId = await getSetting('githubGistId', null);
-
-        await importAllData(parsedData);
-
-        // Restore credentials that were stripped from the backup
-        if (savedConfig.url) await setSetting('webdavUrl', savedConfig.url);
-        if (savedConfig.username) await setSetting('webdavUsername', savedConfig.username);
-        if (savedConfig.password) await setCredential('webdavPassword', savedConfig.password);
-        if (githubPAT) await setCredential('githubPat', githubPAT);
-        if (githubGistId) await setSetting('githubGistId', githubGistId);
-
-        return true;
-    } catch (e) {
+        // CapacitorHttp parses JSON natively, fetch does not.
+        const jsonData = (Capacitor.isNativePlatform() && Capacitor.Plugins.CapacitorHttp)
+            ? res.data
+            : await res.json();
+        parsedData = typeof jsonData === 'string' ? JSON.parse(jsonData) : jsonData;
+    } catch {
         throw new Error('Failed to parse the WebDAV backup file. It may be corrupted.');
     }
+
+    if (isEncryptedBackup(parsedData)) {
+        if (!passphrase) throw new Error('This WebDAV backup requires its passphrase.');
+        parsedData = await decryptBackup(parsedData, passphrase);
+    }
+
+    // Preserve credentials before import.
+    const savedConfig = await getWebDavConfig();
+    const githubPAT = await getCredential('githubPat');
+    const githubGistId = await getSetting('githubGistId', null);
+
+    await importAllData(parsedData);
+
+    if (savedConfig.url) await setSetting('webdavUrl', savedConfig.url);
+    if (savedConfig.username) await setSetting('webdavUsername', savedConfig.username);
+    if (savedConfig.password) await setCredential('webdavPassword', savedConfig.password);
+    if (githubPAT) await setCredential('githubPat', githubPAT);
+    if (githubGistId) await setSetting('githubGistId', githubGistId);
+
+    return true;
 }

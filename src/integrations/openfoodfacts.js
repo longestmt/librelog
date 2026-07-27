@@ -3,6 +3,8 @@
  * Handles food product searches and barcode lookups
  */
 
+import { logIntegrationFailure, requestJSON } from './request.js';
+
 const OFF_BASE_URL = 'https://world.openfoodfacts.org';
 const REQUEST_TIMEOUT_MS = 8000;
 
@@ -74,13 +76,10 @@ function optionalNumber(value) {
  * @param {number} [pageSize=20] - Results per page
  * @returns {Promise<Array>} Array of normalized food objects
  */
-async function searchFoods(query, page = 1, pageSize = 20) {
+async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {}) {
   if (!query || query.trim().length === 0) {
     return [];
   }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
     const url = new URL(`${OFF_BASE_URL}/cgi/search.pl`);
@@ -91,19 +90,18 @@ async function searchFoods(query, page = 1, pageSize = 20) {
     url.searchParams.set('page', page.toString());
     url.searchParams.set('page_size', pageSize.toString());
 
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
-      }
+    const { data } = await requestJSON({
+      provider: 'Open Food Facts',
+      url: url.toString(),
+      init: {
+        headers: {
+          'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
+        },
+      },
+      signal,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      maxRetries: 1,
     });
-
-    if (!response.ok) {
-      console.warn(`OFF search returned status ${response.status}`);
-      return [];
-    }
-
-    const data = await response.json();
 
     if (!data.products || !Array.isArray(data.products)) {
       return [];
@@ -113,14 +111,8 @@ async function searchFoods(query, page = 1, pageSize = 20) {
       .map(normalizeProduct)
       .filter(product => product !== null);
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('OFF search timeout');
-    } else {
-      console.error('Error searching OFF:', error);
-    }
+    logIntegrationFailure(error);
     return [];
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -129,30 +121,25 @@ async function searchFoods(query, page = 1, pageSize = 20) {
  * @param {string} barcode - EAN-13 barcode
  * @returns {Promise<Object|null>} Normalized food object or null if not found
  */
-async function lookupBarcode(barcode) {
+async function lookupBarcode(barcode, { signal = null } = {}) {
   if (!barcode || barcode.trim().length === 0) {
     return null;
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
   try {
     const url = `${OFF_BASE_URL}/api/v0/product/${barcode.trim()}.json`;
-
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
-      }
+    const { data } = await requestJSON({
+      provider: 'Open Food Facts',
+      url,
+      init: {
+        headers: {
+          'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
+        },
+      },
+      signal,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      maxRetries: 1,
     });
-
-    if (!response.ok) {
-      console.warn(`OFF barcode lookup returned status ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json();
 
     // OFF API returns status === 1 for successful lookups
     if (data.status !== 1 || !data.product) {
@@ -161,14 +148,8 @@ async function lookupBarcode(barcode) {
 
     return normalizeProduct(data.product);
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('OFF barcode lookup timeout');
-    } else {
-      console.error('Error looking up OFF barcode:', error);
-    }
+    logIntegrationFailure(error);
     return null;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 

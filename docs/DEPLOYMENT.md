@@ -694,7 +694,7 @@ Before each release:
 **Security:**
 - [ ] CSP headers set
 - [ ] HTTPS enforced
-- [ ] No unencrypted BYOK keys
+- [ ] Credential storage mode is disclosed and meets the deployment policy
 - [ ] Input validation in place
 - [ ] XSS/injection tests passing
 

@@ -89,6 +89,7 @@ test('credential-free backup restores into a clean browser profile', async ({ pa
   await page.goto('/#/settings', { waitUntil: 'commit' });
   await page.getByRole('combobox', { name: 'AI provider' }).selectOption('openai');
   await page.getByRole('textbox', { name: 'API Key', exact: true }).fill('test-secret-that-must-not-export');
+  await page.getByRole('checkbox', { name: 'I understand this remote data use.' }).first().check();
   await page.getByRole('button', { name: 'Save AI Settings' }).click();
 
   const downloadPromise = page.waitForEvent('download');
@@ -117,7 +118,68 @@ test('credential-free backup restores into a clean browser profile', async ({ pa
   await cleanContext.close();
 });
 
-for (const route of ['diary', 'insights', 'weight', 'recipes', 'settings']) {
+test('an encrypted backup requires its passphrase and restores in a clean profile', async ({ page, browser }, testInfo) => {
+  const { targetDate } = await logEggOnPreviousDay(page);
+  await page.goto('/#/settings', { waitUntil: 'commit' });
+
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export Encrypted Data' }).click();
+  const exportDialog = page.getByRole('dialog', { name: 'Export Encrypted Data' });
+  await exportDialog.getByLabel('Passphrase', { exact: true }).fill('release backup passphrase');
+  await exportDialog.getByLabel('Confirm Passphrase').fill('release backup passphrase');
+  await exportDialog.getByRole('button', { name: 'Export Encrypted Data' }).click();
+  const download = await downloadPromise;
+  const backupPath = testInfo.outputPath('librelog-backup.encrypted.json');
+  await download.saveAs(backupPath);
+
+  const encrypted = JSON.parse(await readFile(backupPath, 'utf8'));
+  expect(encrypted.format).toBe('librelog-encrypted-backup');
+  expect(JSON.stringify(encrypted)).not.toContain('Egg, large');
+
+  const cleanContext = await browser.newContext({ serviceWorkers: 'block' });
+  const cleanPage = await cleanContext.newPage();
+  await preparePage(cleanPage);
+  await cleanPage.goto('/#/settings', { waitUntil: 'commit' });
+  const chooserPromise = cleanPage.waitForEvent('filechooser');
+  await cleanPage.getByRole('button', { name: 'Import Data' }).click();
+  const chooser = await chooserPromise;
+  await chooser.setFiles(backupPath);
+
+  const importDialog = cleanPage.getByRole('dialog', { name: 'Unlock Encrypted Backup' });
+  await importDialog.getByLabel('Passphrase', { exact: true }).fill('release backup passphrase');
+  await importDialog.getByRole('button', { name: 'Unlock and Import' }).click();
+  await expect(cleanPage.getByRole('status')).toContainText('Encrypted data imported');
+
+  await cleanPage.goto(`/#/diary?date=${targetDate}`, { waitUntil: 'commit' });
+  await expect(cleanPage.getByRole('button', { name: /Egg, large, 1 large, 70 calories/i })).toBeVisible();
+  await cleanContext.close();
+});
+
+test('a favorite usual serving can be found and logged again from meal history', async ({ page }) => {
+  await preparePage(page);
+  await page.getByRole('button', { name: 'Add food to Lunch' }).click();
+  await page.getByRole('searchbox', { name: 'Search for foods' }).fill('egg');
+  await page.getByRole('button', { name: /Egg, large.*70 calories/i }).first().click();
+
+  const dialog = page.getByRole('dialog', { name: 'Egg, large' });
+  await dialog.getByRole('spinbutton', { name: 'Quantity' }).fill('2');
+  await dialog.getByRole('spinbutton', { name: 'Quantity' }).press('Tab');
+  await dialog.getByRole('checkbox', { name: 'Add this food to Favorites' }).check();
+  await dialog.getByRole('checkbox', { name: 'Save this quantity and unit as my usual serving' }).check();
+  await dialog.getByRole('button', { name: 'Log Food' }).click();
+
+  await page.getByRole('button', { name: 'Search meal history' }).click();
+  await expect(page.getByRole('main', { name: 'Meal History' })).toBeVisible();
+  await page.getByRole('searchbox', { name: 'Search History' }).fill('egg');
+  await expect(page.getByRole('listitem')).toContainText('Egg, large');
+  await page.getByRole('button', { name: 'Log Again' }).click();
+  await expect(page.getByRole('status')).toContainText('Meal logged');
+
+  await page.goto('/#/diary', { waitUntil: 'commit' });
+  await expect(page.getByRole('button', { name: /Egg, large, 2 large, 140 calories/i })).toHaveCount(2);
+});
+
+for (const route of ['diary', 'history', 'insights', 'weight', 'recipes', 'settings']) {
   test(`${route} has no automatically detectable WCAG A or AA violations`, async ({ page }) => {
     await preparePage(page);
     await page.goto(`/#/${route}`, { waitUntil: 'commit' });

@@ -9,6 +9,7 @@ import { renderInsightsPage } from './pages/insights.js';
 import { renderWeightPage } from './pages/weight.js';
 import { renderRecipesPage } from './pages/recipes.js';
 import { renderSettingsPage } from './pages/settings.js';
+import { renderHistoryPage } from './pages/history.js';
 
 // SVG Icons (Lucide-style)
 const ICONS = {
@@ -29,6 +30,7 @@ const ROUTES = {
   insights: { component: renderInsightsPage, label: 'Insights', icon: ICONS.barchart, nav: true },
   weight: { component: renderWeightPage, label: 'Weight', icon: ICONS.weight, nav: true },
   recipes: { component: renderRecipesPage, label: 'Recipes', icon: ICONS.recipe, nav: true },
+  history: { component: renderHistoryPage, label: 'Meal History', icon: ICONS.book, nav: false },
   settings: { component: renderSettingsPage, label: 'Settings', icon: ICONS.settings, nav: true },
 };
 

@@ -3,7 +3,9 @@
  * Handles JSON backups, CSV diary exports, and MyFitnessPal CSV import
  */
 
-import { exportAllData, importAllData, put, getAll } from './db.js';
+import { exportAllData, importAllData, put, getAll, setSetting } from './db.js';
+import { decryptBackup, encryptBackup, isEncryptedBackup } from './encryption.js';
+import { createDeterministicKey, createMeal } from './meal-commands.js';
 import { todayStr } from '../utils/format.js';
 
 /**
@@ -35,7 +37,17 @@ export async function exportData() {
     const data = await exportAllData();
     const date = todayStr();
     downloadJSON(data, `librelog-backup-${date}.json`);
+    await setSetting('lastPortableBackupTime', Date.now());
     return data;
+}
+
+export async function exportEncryptedData(passphrase) {
+    const data = await exportAllData();
+    const encrypted = await encryptBackup(data, passphrase);
+    const date = todayStr();
+    downloadJSON(encrypted, `librelog-backup-${date}.encrypted.json`);
+    await setSetting('lastPortableBackupTime', Date.now());
+    return encrypted;
 }
 
 /**
@@ -69,8 +81,16 @@ export function readFileAsJSON(file) {
  * @param {boolean} merge - if false, clears existing data first
  * @returns {Promise<void>}
  */
-export async function importData(file, merge = false) {
-    const data = await readFileAsJSON(file);
+export async function importData(file, merge = false, { passphrase = null } = {}) {
+    let data = await readFileAsJSON(file);
+    if (isEncryptedBackup(data)) {
+        if (!passphrase) {
+            const error = new Error('This backup requires its passphrase');
+            error.code = 'BACKUP_PASSPHRASE_REQUIRED';
+            throw error;
+        }
+        data = await decryptBackup(data, passphrase);
+    }
     if (!data.stores) throw new Error('Invalid LibreLog backup file');
     await importAllData(data, merge);
 }
@@ -153,9 +173,8 @@ export async function importMyFitnessPalCSV(file) {
     });
 
     // Create meal entry
-    const mealId = `mfp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    await put('meals', {
-      id: mealId,
+    const idempotencyKey = createDeterministicKey('mfp', `${i}|${lines[i]}`);
+    const result = await createMeal({
       date,
       type: mealType,
       items: [{
@@ -165,10 +184,10 @@ export async function importMyFitnessPalCSV(file) {
         notes: 'Imported from MyFitnessPal',
         nutrients: { kcal, protein, carbs, fat, fiber, sodium },
       }],
-      createdAt: new Date().toISOString(),
-    });
+    }, { idempotencyKey });
 
-    imported++;
+    if (result.created) imported++;
+    else skipped++;
   }
 
   return { imported, skipped };
