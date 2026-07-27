@@ -5,6 +5,8 @@ import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { getNutritionMultiplier } from '../utils/units.js';
+import { scaleNutrients } from '../engine/nutrition.js';
+import { calculateRecipeNutrition } from '../engine/recipes.js';
 
 function generateId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -30,7 +32,7 @@ async function renderRecipeList(container) {
   const recipes = await getAll('recipes');
 
   container.innerHTML = `
-    <div class="recipes-page" role="main" aria-label="Recipes">
+    <div class="recipes-page">
       <div class="page-header">
         <h1 class="page-title">Recipes</h1>
       </div>
@@ -48,7 +50,7 @@ async function renderRecipeList(container) {
             const carbs = Math.round(perServing.carbs || 0);
             const fat = Math.round(perServing.fat || 0);
             return `
-              <div class="recipe-card" data-recipe-id="${recipe.id}" role="listitem" tabindex="0"
+              <div class="recipe-card" data-recipe-id="${escapeHTML(String(recipe.id))}" role="listitem" tabindex="0"
                    aria-label="${escapeHTML(recipe.name)}, ${kcal} calories per serving">
                 <div class="recipe-card-info">
                   <div class="recipe-card-name">${escapeHTML(recipe.name)}</div>
@@ -81,7 +83,7 @@ async function renderRecipeList(container) {
   container.querySelectorAll('.recipe-card').forEach(card => {
     const handler = () => {
       const id = card.dataset.recipeId;
-      window.location.hash = `#/recipes?id=${id}`;
+      window.location.hash = `#/recipes?id=${encodeURIComponent(id)}`;
     };
     card.addEventListener('click', handler);
     card.addEventListener('keydown', (e) => {
@@ -106,6 +108,8 @@ async function renderRecipeDetail(container, recipeId) {
   let category = recipe?.category || '';
   let instructions = recipe?.instructions || '';
   let items = recipe?.items ? recipe.items.map(i => ({ ...i })) : [];
+  let saveInProgress = false;
+  let mealLogInProgress = false;
 
   // Resolve all foods for current ingredients
   const foodsMap = new Map();
@@ -115,32 +119,20 @@ async function renderRecipeDetail(container, recipeId) {
   }
 
   function calcNutritionPerServing() {
-    const totals = { kcal: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 };
-    for (const item of items) {
-      const food = foodsMap.get(item.foodId);
-      if (!food) continue;
-      const multiplier = getNutritionMultiplier(item.quantity, item.unit, food);
-      totals.kcal += (food.nutrients?.energy?.kcal || 0) * multiplier;
-      totals.protein += (food.nutrients?.macros?.protein?.g || 0) * multiplier;
-      totals.carbs += (food.nutrients?.macros?.carbs?.g || 0) * multiplier;
-      totals.fat += (food.nutrients?.macros?.fat?.g || 0) * multiplier;
-      totals.fiber += (food.nutrients?.fiber?.g || 0) * multiplier;
-    }
-    const s = servings || 1;
-    return {
-      kcal: totals.kcal / s,
-      protein: totals.protein / s,
-      carbs: totals.carbs / s,
-      fat: totals.fat / s,
-      fiber: totals.fiber / s,
-    };
+    return calculateRecipeNutrition(items, foodsMap, servings);
+  }
+
+  function formatNutritionValue(perServing, key, suffix = '') {
+    return perServing.incomplete.includes(key)
+      ? '—'
+      : `${Math.round(perServing[key])}${suffix}`;
   }
 
   function render() {
     const perServing = calcNutritionPerServing();
 
     container.innerHTML = `
-      <div class="recipes-page recipe-detail" role="main" aria-label="${recipe ? 'Edit recipe' : 'New recipe'}">
+      <div class="recipes-page recipe-detail">
         <div class="page-header">
           <button class="btn btn-ghost" id="back-btn" aria-label="Back to recipes">
             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"></polyline></svg>
@@ -150,7 +142,7 @@ async function renderRecipeDetail(container, recipeId) {
 
         <div class="form-group">
           <label class="control-label" for="recipe-name">Recipe Name</label>
-          <input type="text" id="recipe-name" class="form-input" value="${escapeHTML(name)}" placeholder="e.g., Overnight Oats" required aria-required="true">
+          <input type="text" id="recipe-name" class="form-input" maxlength="120" value="${escapeHTML(name)}" placeholder="e.g., Overnight Oats" required aria-required="true">
         </div>
 
         <div class="form-row">
@@ -160,7 +152,7 @@ async function renderRecipeDetail(container, recipeId) {
           </div>
           <div class="form-group">
             <label class="control-label" for="recipe-category">Category</label>
-            <input type="text" id="recipe-category" class="form-input" value="${escapeHTML(category)}" placeholder="e.g., Breakfast, Main, Snack">
+            <input type="text" id="recipe-category" class="form-input" maxlength="80" value="${escapeHTML(category)}" placeholder="e.g., Breakfast, Main, Snack">
           </div>
         </div>
 
@@ -202,32 +194,38 @@ async function renderRecipeDetail(container, recipeId) {
           <h3 class="section-title">Per-Serving Nutrition</h3>
           <div class="nutrition-grid">
             <div class="nutrition-stat">
-              <span class="nutrition-stat-value">${Math.round(perServing.kcal)}</span>
+              <span class="nutrition-stat-value">${formatNutritionValue(perServing, 'kcal')}</span>
               <span class="nutrition-stat-label">kcal</span>
             </div>
             <div class="nutrition-stat">
-              <span class="nutrition-stat-value">${Math.round(perServing.protein)}g</span>
+              <span class="nutrition-stat-value">${formatNutritionValue(perServing, 'protein', 'g')}</span>
               <span class="nutrition-stat-label">Protein</span>
             </div>
             <div class="nutrition-stat">
-              <span class="nutrition-stat-value">${Math.round(perServing.carbs)}g</span>
+              <span class="nutrition-stat-value">${formatNutritionValue(perServing, 'carbs', 'g')}</span>
               <span class="nutrition-stat-label">Carbs</span>
             </div>
             <div class="nutrition-stat">
-              <span class="nutrition-stat-value">${Math.round(perServing.fat)}g</span>
+              <span class="nutrition-stat-value">${formatNutritionValue(perServing, 'fat', 'g')}</span>
               <span class="nutrition-stat-label">Fat</span>
             </div>
             <div class="nutrition-stat">
-              <span class="nutrition-stat-value">${Math.round(perServing.fiber)}g</span>
+              <span class="nutrition-stat-value">${formatNutritionValue(perServing, 'fiber', 'g')}</span>
               <span class="nutrition-stat-label">Fiber</span>
             </div>
           </div>
+          ${perServing.incomplete.length > 0 ? `
+            <details class="nutrition-data-note">
+              <summary>Some nutrition data is unavailable</summary>
+              <p>LibreLog does not count unknown ${perServing.incomplete.map(escapeHTML).join(', ')} values as zero.</p>
+            </details>
+          ` : ''}
         </div>
 
         <!-- Instructions -->
         <div class="form-group">
           <label class="control-label" for="recipe-instructions">Instructions (optional)</label>
-          <textarea id="recipe-instructions" class="form-input form-textarea" rows="5" placeholder="Add preparation steps...">${escapeHTML(instructions)}</textarea>
+          <textarea id="recipe-instructions" class="form-input form-textarea" rows="5" maxlength="10000" placeholder="Add preparation steps...">${escapeHTML(instructions)}</textarea>
         </div>
 
         <!-- Actions -->
@@ -282,34 +280,52 @@ async function renderRecipeDetail(container, recipeId) {
 
     // Save
     document.getElementById('save-recipe-btn').addEventListener('click', async () => {
+      if (saveInProgress) return;
       syncFieldsFromDOM();
       if (!name) {
         showToast('Please enter a recipe name');
         return;
       }
+      if (items.length === 0) {
+        showToast('Add at least one ingredient');
+        return;
+      }
+      saveInProgress = true;
+      const saveButton = document.getElementById('save-recipe-btn');
+      saveButton.disabled = true;
+      saveButton.textContent = 'Saving…';
 
-      const perServing = calcNutritionPerServing();
-      const record = {
-        id: recipe?.id || generateId(),
-        name,
-        servings,
-        category,
-        items: items.map(i => ({ foodId: i.foodId, quantity: i.quantity, unit: i.unit })),
-        instructions,
-        nutritionPerServing: {
-          kcal: perServing.kcal,
-          protein: perServing.protein,
-          carbs: perServing.carbs,
-          fat: perServing.fat,
-          fiber: perServing.fiber,
-        },
-        createdAt: recipe?.createdAt || new Date().toISOString(),
-      };
+      try {
+        const perServing = calcNutritionPerServing();
+        const record = {
+          id: recipe?.id || generateId(),
+          name,
+          servings,
+          category,
+          items: items.map(i => ({ foodId: i.foodId, quantity: i.quantity, unit: i.unit })),
+          instructions,
+          nutritionPerServing: {
+            kcal: perServing.kcal,
+            protein: perServing.protein,
+            carbs: perServing.carbs,
+            fat: perServing.fat,
+            fiber: perServing.fiber,
+            incomplete: perServing.incomplete,
+          },
+          createdAt: recipe?.createdAt || new Date().toISOString(),
+        };
 
-      const saved = await put('recipes', record);
-      recipe = saved;
-      showToast('Recipe saved');
-      window.location.hash = `#/recipes?id=${saved.id}`;
+        const saved = await put('recipes', record);
+        recipe = saved;
+        showToast('Recipe saved');
+        window.location.hash = `#/recipes?id=${encodeURIComponent(saved.id)}`;
+      } catch (error) {
+        console.error('Recipe save failed:', error);
+        showToast('Could not save recipe');
+        saveInProgress = false;
+        saveButton.disabled = false;
+        saveButton.textContent = 'Save Recipe';
+      }
     });
 
     // Delete
@@ -375,12 +391,12 @@ async function renderRecipeDetail(container, recipeId) {
                 const kcal = food.nutrients?.energy?.kcal || 0;
                 const servingLabel = food.servingSize ? `${food.servingSize.quantity}${food.servingSize.unit}` : '100g';
                 return `
-                  <div class="food-result-item" data-food-id="${food.id}" role="button" tabindex="0" aria-label="${escapeHTML(food.name)}, ${Math.round(kcal)} calories per ${servingLabel}">
+                  <div class="food-result-item" data-food-id="${escapeHTML(String(food.id))}" role="button" tabindex="0" aria-label="${escapeHTML(food.name)}, ${Math.round(kcal)} calories per ${escapeHTML(String(servingLabel))}">
                     <div class="food-result-info">
                       <div class="food-result-name">${escapeHTML(food.name)}</div>
                       ${food.brand ? `<div class="food-result-brand">${escapeHTML(food.brand)}</div>` : ''}
                       <div class="food-result-meta">
-                        <span class="kcal-badge">${Math.round(kcal)} kcal/${servingLabel}</span>
+                        <span class="kcal-badge">${Math.round(kcal)} kcal/${escapeHTML(String(servingLabel))}</span>
                       </div>
                     </div>
                     <div class="food-result-action" aria-hidden="true">
@@ -630,34 +646,24 @@ async function renderRecipeDetail(container, recipeId) {
     document.getElementById('cancel-log-btn').addEventListener('click', closeModal);
 
     document.getElementById('confirm-log-btn').addEventListener('click', async () => {
-      const perServing = recipe.nutritionPerServing || calcNutritionPerServing();
-      const scaledNutrients = {
-        kcal: perServing.kcal * portionServings,
-        protein: perServing.protein * portionServings,
-        carbs: perServing.carbs * portionServings,
-        fat: perServing.fat * portionServings,
-        fiber: (perServing.fiber || 0) * portionServings,
-        sodium: 0,
-      };
+      if (mealLogInProgress) return;
+      mealLogInProgress = true;
+      const logButton = document.getElementById('confirm-log-btn');
+      logButton.disabled = true;
+      logButton.textContent = 'Logging…';
 
       // Build meal items from recipe ingredients, scaled by portion
       const mealItems = items.map(item => {
         const food = foodsMap.get(item.foodId);
         const recipeServings = recipe.servings || 1;
         const itemQty = (item.quantity / recipeServings) * portionServings;
-        const multiplier = food ? getNutritionMultiplier(itemQty, item.unit, food) : 0;
         return {
           foodId: item.foodId,
           quantity: parseFloat(itemQty.toFixed(2)),
           unit: item.unit,
-          nutrients: {
-            kcal: food ? (food.nutrients?.energy?.kcal || 0) * multiplier : 0,
-            protein: food ? (food.nutrients?.macros?.protein?.g || 0) * multiplier : 0,
-            carbs: food ? (food.nutrients?.macros?.carbs?.g || 0) * multiplier : 0,
-            fat: food ? (food.nutrients?.macros?.fat?.g || 0) * multiplier : 0,
-            fiber: food ? (food.nutrients?.fiber?.g || 0) * multiplier : 0,
-            sodium: food ? (food.nutrients?.sodium?.mg || 0) * multiplier : 0,
-          },
+          nutrients: food
+            ? scaleNutrients(food, itemQty, item.unit)
+            : { kcal: null, protein: null, carbs: null, fat: null, fiber: null, sodium: null },
         };
       });
 
@@ -670,12 +676,20 @@ async function renderRecipeDetail(container, recipeId) {
         createdAt: new Date().toISOString(),
       };
 
-      await put('meals', meal);
-      showToast(`${recipe.name} logged to ${mealType.charAt(0).toUpperCase() + mealType.slice(1)}`);
-      closeModal();
-      setTimeout(() => {
-        window.location.hash = '#/diary';
-      }, 500);
+      try {
+        await put('meals', meal);
+        showToast(`${recipe.name} logged to ${mealType.charAt(0).toUpperCase() + mealType.slice(1)}`);
+        closeModal();
+        setTimeout(() => {
+          window.location.hash = '#/diary';
+        }, 500);
+      } catch (error) {
+        console.error('Recipe logging failed:', error);
+        showToast('Could not log recipe');
+        mealLogInProgress = false;
+        logButton.disabled = false;
+        logButton.textContent = 'Log Meal';
+      }
     });
   }
 

@@ -19,9 +19,9 @@ export function showToast(message, type = 'info', duration = 3000) {
     const c = ensureContainer();
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
-    toast.innerHTML = `
-    <span>${message}</span>
-  `;
+    const text = document.createElement('span');
+    text.textContent = String(message ?? '');
+    toast.appendChild(text);
     c.appendChild(toast);
 
     setTimeout(() => {

@@ -20,6 +20,23 @@ const DEFAULT_GOALS = {
   sodiumMg: 2300
 };
 
+const GOAL_RANGES = {
+  calorieTarget: [500, 10_000],
+  proteinG: [0, 1_000],
+  carbG: [0, 2_000],
+  fatG: [0, 1_000],
+  fiberG: [0, 500],
+  sodiumMg: [0, 50_000],
+};
+
+function validGoal(value, key) {
+  const number = Number(value);
+  const [minimum, maximum] = GOAL_RANGES[key];
+  return Number.isFinite(number) && number >= minimum && number <= maximum
+    ? number
+    : DEFAULT_GOALS[key];
+}
+
 /**
  * Retrieve user's nutrition goals from settings
  * Returns defaults if not yet configured
@@ -35,12 +52,12 @@ async function getGoals() {
 
     // Merge stored goals with defaults to handle new goal types
     return {
-      calorieTarget: stored.calorieTarget ?? DEFAULT_GOALS.calorieTarget,
-      proteinG: stored.proteinG ?? DEFAULT_GOALS.proteinG,
-      carbG: stored.carbG ?? DEFAULT_GOALS.carbG,
-      fatG: stored.fatG ?? DEFAULT_GOALS.fatG,
-      fiberG: stored.fiberG ?? DEFAULT_GOALS.fiberG,
-      sodiumMg: stored.sodiumMg ?? DEFAULT_GOALS.sodiumMg
+      calorieTarget: validGoal(stored.calorieTarget, 'calorieTarget'),
+      proteinG: validGoal(stored.proteinG, 'proteinG'),
+      carbG: validGoal(stored.carbG, 'carbG'),
+      fatG: validGoal(stored.fatG, 'fatG'),
+      fiberG: validGoal(stored.fiberG, 'fiberG'),
+      sodiumMg: validGoal(stored.sodiumMg, 'sodiumMg')
     };
   } catch (error) {
     console.error('Error retrieving goals:', error);
@@ -68,20 +85,13 @@ async function setGoals(goals) {
   try {
     // Validate numeric values
     const validatedGoals = {
-      calorieTarget: Number(goals.calorieTarget) || DEFAULT_GOALS.calorieTarget,
-      proteinG: Number(goals.proteinG) || DEFAULT_GOALS.proteinG,
-      carbG: Number(goals.carbG) || DEFAULT_GOALS.carbG,
-      fatG: Number(goals.fatG) || DEFAULT_GOALS.fatG,
-      fiberG: Number(goals.fiberG) || DEFAULT_GOALS.fiberG,
-      sodiumMg: Number(goals.sodiumMg) || DEFAULT_GOALS.sodiumMg
+      calorieTarget: validGoal(goals.calorieTarget, 'calorieTarget'),
+      proteinG: validGoal(goals.proteinG, 'proteinG'),
+      carbG: validGoal(goals.carbG, 'carbG'),
+      fatG: validGoal(goals.fatG, 'fatG'),
+      fiberG: validGoal(goals.fiberG, 'fiberG'),
+      sodiumMg: validGoal(goals.sodiumMg, 'sodiumMg')
     };
-
-    // Ensure all values are positive
-    for (const key in validatedGoals) {
-      if (validatedGoals[key] < 0) {
-        validatedGoals[key] = DEFAULT_GOALS[key];
-      }
-    }
 
     await setSetting(GOALS_KEY, validatedGoals);
   } catch (error) {

@@ -27,7 +27,12 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - run: npm run build
+      - name: Check production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run release checks
+        run: npm run check
       - uses: actions/configure-pages@v4
         with:
           enablement: true

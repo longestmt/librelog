@@ -14,7 +14,7 @@ export default defineConfig({
         emptyOutDir: true,
     },
     plugins: [
-        basicSsl(),
+        process.env.LIBRELOG_HTTPS === '1' ? basicSsl() : null,
         VitePWA({
             registerType: 'autoUpdate',
             includeAssets: ['favicon.svg', 'icon-192.png', 'icon-512.png'],
@@ -64,5 +64,5 @@ export default defineConfig({
                 ],
             },
         }),
-    ],
+    ].filter(Boolean),
 });

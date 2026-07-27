@@ -5,6 +5,7 @@
  */
 
 import { chatCompletion, getAIConfig, logUsage } from './aiClient.js';
+import { validateAIResponse } from './aiValidation.js';
 
 const CONFIDENCE_THRESHOLD = 0.85;
 
@@ -58,9 +59,10 @@ export function needsClarification(foods, threshold = CONFIDENCE_THRESHOLD) {
  * Makes one AI call that returns questions with pre-computed answers.
  * @param {Array} foods - Normalized food objects
  * @param {Array} originalMessages - Original message thread (for context, e.g. photo)
+ * @param {{signal?: AbortSignal}} [options]
  * @returns {Promise<{questions: Array}>}
  */
-export async function generateClarifications(foods, originalMessages = []) {
+export async function generateClarifications(foods, originalMessages = [], options = {}) {
   try {
     const foodSummary = foods.map((f, i) => ({
       index: i,
@@ -90,6 +92,7 @@ export async function generateClarifications(foods, originalMessages = []) {
       maxTokens: 1024,
       temperature: 0.2,
       jsonMode: true,
+      signal: options.signal,
     });
 
     if (!response.content) {
@@ -110,7 +113,7 @@ export async function generateClarifications(foods, originalMessages = []) {
       await logUsage(config.provider, tokens, cost);
     }
 
-    return { questions: Array.isArray(parsed.questions) ? parsed.questions : [] };
+    return { questions: normalizeQuestions(parsed.questions, foods.length) };
   } catch (err) {
     console.warn('Clarification generation failed:', err);
     return { questions: [] };
@@ -129,34 +132,69 @@ export function applyRefinement(foods, foodIndex, selectedOption) {
   if (!selectedOption?.refinedFood) return foods;
 
   const refined = selectedOption.refinedFood;
+  let normalized;
+  try {
+    normalized = validateAIResponse(
+      { foods: [refined] },
+      { sourceType: foods[foodIndex]?.source?.type || 'ai-text', idPrefix: 'ai-refined' },
+    ).foods[0];
+  } catch {
+    return foods;
+  }
+
   return foods.map((food, i) => {
     if (i !== foodIndex) return food;
     return {
       ...food,
-      name: refined.name || food.name,
-      servingSize: {
-        quantity: refined.portion_grams ?? food.servingSize?.quantity ?? 100,
-        unit: food.servingSize?.unit ?? 'g',
-      },
+      name: normalized.name,
+      servingSize: normalized.servingSize,
       nutrients: {
-        energy: { kcal: refined.calories ?? food.nutrients?.energy?.kcal ?? 0 },
-        macros: {
-          protein: { g: refined.protein ?? food.nutrients?.macros?.protein?.g ?? 0 },
-          carbs: { g: refined.carbs ?? food.nutrients?.macros?.carbs?.g ?? 0 },
-          fat: { g: refined.fat ?? food.nutrients?.macros?.fat?.g ?? 0 },
-        },
-        fiber: food.nutrients?.fiber ?? { g: 0 },
-        sodium: food.nutrients?.sodium ?? { mg: 0 },
+        ...normalized.nutrients,
+        fiber: food.nutrients?.fiber ?? { g: null },
+        sodium: food.nutrients?.sodium ?? { mg: null },
       },
       source: {
         ...food.source,
-        confidence: refined.confidence ?? food.source?.confidence,
+        confidence: normalized.source.confidence,
       },
       _aiMeta: {
         ...food._aiMeta,
-        confidence: refined.confidence ?? food._aiMeta?.confidence,
+        confidence: normalized._aiMeta.confidence,
+        assumptions: [
+          ...(food._aiMeta?.assumptions || []),
+          ...normalized._aiMeta.assumptions,
+        ].slice(0, 6),
+        warnings: normalized._aiMeta.warnings,
         refined: true,
       },
     };
+  });
+}
+
+function normalizeQuestions(value, foodCount) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 3).flatMap(question => {
+    const foodIndex = Number(question?.foodIndex);
+    const text = typeof question?.question === 'string'
+      ? question.question.replace(/\s+/g, ' ').trim().slice(0, 240)
+      : '';
+    if (!Number.isInteger(foodIndex) || foodIndex < 0 || foodIndex >= foodCount || !text) return [];
+
+    const options = Array.isArray(question.options)
+      ? question.options.slice(0, 4).flatMap(option => {
+        const label = typeof option?.label === 'string'
+          ? option.label.replace(/\s+/g, ' ').trim().slice(0, 80)
+          : '';
+        if (!label || !option?.refinedFood) return [];
+        try {
+          validateAIResponse({ foods: [option.refinedFood] });
+          return [{ label, refinedFood: option.refinedFood }];
+        } catch {
+          return [];
+        }
+      })
+      : [];
+
+    return options.length >= 2 ? [{ foodIndex, question: text, options }] : [];
   });
 }

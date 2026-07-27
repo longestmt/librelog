@@ -1,8 +1,8 @@
-import { openDB, getSetting, setSetting, putMany } from './data/db.js';
+import { openDB, getSetting, setSetting, putMany, importAllData } from './data/db.js';
 import { setGoals } from './engine/goal-tracking.js';
 import { DEFAULT_FOODS } from './data/seed-foods.js';
 import { hapticLight } from './utils/haptics.js';
-import { initAutoBackup } from './data/auto-backup.js';
+import { initAutoBackup, getAvailableBackups, getBackupData } from './data/auto-backup.js';
 import { renderDiaryPage } from './pages/diary.js';
 import { renderSearchPage } from './pages/search.js';
 import { renderInsightsPage } from './pages/insights.js';
@@ -33,6 +33,7 @@ const ROUTES = {
 };
 
 let currentRoute = 'diary';
+let activePageCleanup = null;
 
 async function init() {
   try {
@@ -71,18 +72,14 @@ async function init() {
     window.addEventListener('librelog:dataloss', (e) => {
       const msg = e.detail?.message || 'Possible data loss detected.';
       if (confirm(msg)) {
-        import('./data/auto-backup.js').then(({ getAvailableBackups, getBackupData }) => {
-          const backups = getAvailableBackups();
-          if (backups.length > 0) {
-            const latest = backups[backups.length - 1];
-            const data = getBackupData(latest.timestamp);
-            if (data) {
-              import('./data/db.js').then(({ importAllData }) => {
-                importAllData(data, false).then(() => window.location.reload());
-              });
-            }
+        const backups = getAvailableBackups();
+        if (backups.length > 0) {
+          const latest = backups[backups.length - 1];
+          const data = getBackupData(latest.timestamp);
+          if (data) {
+            importAllData(data, false).then(() => window.location.reload());
           }
-        });
+        }
       }
     });
   } catch (err) {
@@ -110,7 +107,7 @@ function renderShell() {
   document.body.innerHTML = `
     <div id="app" class="app">
       <a href="#main-content" class="sr-only skip-link">Skip to main content</a>
-      <main id="page-container" class="page-container" tabindex="-1"></main>
+      <main id="main-content" class="page-container" tabindex="-1"></main>
       <nav class="bottom-nav" role="navigation" aria-label="Main navigation">
         <div class="navbar-brand" aria-hidden="true">
           <span class="brand-text">LibreLog</span>
@@ -166,11 +163,26 @@ function handleRoute() {
   });
 
   // Render page
-  const container = document.getElementById('page-container');
-  container.innerHTML = '';
+  if (typeof activePageCleanup === 'function') {
+    try { activePageCleanup(); } catch (err) { console.warn('Page cleanup failed:', err); }
+    activePageCleanup = null;
+  }
+
+  // Give each route its own main element. Async work from a previous page may
+  // finish later, but can then only update its disconnected container.
+  const previousContainer = document.getElementById('main-content');
+  const container = document.createElement('main');
+  container.id = 'main-content';
+  container.className = 'page-container';
+  container.tabIndex = -1;
+  previousContainer.replaceWith(container);
+  container.setAttribute('aria-label', ROUTES[route].label);
+  document.title = `${ROUTES[route].label} · LibreLog`;
 
   try {
-    ROUTES[route].component(container, query);
+    const cleanup = ROUTES[route].component(container, query);
+    if (typeof cleanup === 'function') activePageCleanup = cleanup;
+    requestAnimationFrame(() => container.focus({ preventScroll: true }));
   } catch (err) {
     console.error(`Error rendering ${route} page:`, err);
     container.innerHTML = `<div class="error-message"><p>Error loading page. Please refresh.</p></div>`;

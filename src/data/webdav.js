@@ -8,16 +8,36 @@
 import { exportAllData, importAllData } from './db.js';
 import { getSetting, setSetting } from './db.js';
 import { Capacitor } from '@capacitor/core';
+import { getCredential, removeCredential, setCredential } from './credentials.js';
+
+const REQUEST_TIMEOUT_MS = 15_000;
+
+async function browserFetchWithTimeout(url, init = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+        return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 /**
  * Get WebDAV configuration
  * @returns {Promise<{url: string|null, username: string|null, password: string|null}>}
  */
 export async function getWebDavConfig() {
+    const [url, username, password, legacyUrl, legacyUsername] = await Promise.all([
+        getSetting('webdavUrl', null),
+        getSetting('webdavUsername', null),
+        getCredential('webdavPassword'),
+        getSetting('webdav_url', null),
+        getSetting('webdav_username', null),
+    ]);
     return {
-        url: await getSetting('webdavUrl', null),
-        username: await getSetting('webdavUsername', null),
-        password: await getSetting('webdavPassword', null)
+        url: url || legacyUrl,
+        username: username || legacyUsername,
+        password,
     };
 }
 
@@ -55,9 +75,12 @@ export async function setWebDavConfig(url, username, password) {
             res = await Capacitor.Plugins.CapacitorHttp.request(options);
             res.ok = res.status >= 200 && res.status < 300;
         } else {
-            res = await fetch(options.url, options);
+            res = await browserFetchWithTimeout(options.url, options);
         }
     } catch (e) {
+        if (e.name === 'AbortError') {
+            throw new Error('WebDAV request timed out after 15 seconds.');
+        }
         if (e.message && e.message.includes('Failed to fetch')) {
             throw new Error('Network Error (CORS, Mixed Content, or invalid SSL). Check browser console.');
         }
@@ -73,7 +96,10 @@ export async function setWebDavConfig(url, username, password) {
 
     await setSetting('webdavUrl', url);
     await setSetting('webdavUsername', username);
-    await setSetting('webdavPassword', password);
+    await setCredential('webdavPassword', password);
+    // Remove keys written by the earlier, incompatible settings UI.
+    await setSetting('webdav_url', null);
+    await setSetting('webdav_username', null);
 }
 
 /**
@@ -83,7 +109,9 @@ export async function setWebDavConfig(url, username, password) {
 export async function disconnectWebDav() {
     await setSetting('webdavUrl', null);
     await setSetting('webdavUsername', null);
-    await setSetting('webdavPassword', null);
+    await removeCredential('webdavPassword');
+    await setSetting('webdav_url', null);
+    await setSetting('webdav_username', null);
 }
 
 /**
@@ -93,7 +121,10 @@ export async function disconnectWebDav() {
  * @returns {string}
  */
 function getAuthHeader(username, password) {
-    return 'Basic ' + btoa(`${username}:${password}`);
+    const bytes = new TextEncoder().encode(`${username}:${password}`);
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return `Basic ${btoa(binary)}`;
 }
 
 /**
@@ -134,9 +165,12 @@ export async function pushToWebDav() {
             res = await Capacitor.Plugins.CapacitorHttp.request(options);
             res.ok = res.status >= 200 && res.status < 300;
         } else {
-            res = await fetch(options.url, { ...options, body: options.data });
+            res = await browserFetchWithTimeout(options.url, { ...options, body: options.data });
         }
     } catch (e) {
+        if (e.name === 'AbortError') {
+            throw new Error('WebDAV request timed out after 15 seconds.');
+        }
         if (e.message && e.message.includes('Failed to fetch')) {
             throw new Error('Network Error (CORS, Mixed Content, or invalid SSL). Check browser console.');
         }
@@ -182,13 +216,16 @@ export async function pullFromWebDav() {
             // Omit Cache-Control header to avoid CORS preflight rejection;
             // fetch's cache option handles this instead.
             const { 'Cache-Control': _, ...browserHeaders } = options.headers;
-            res = await fetch(options.url, {
+            res = await browserFetchWithTimeout(options.url, {
                 method: options.method,
                 headers: browserHeaders,
                 cache: 'no-store'
             });
         }
     } catch (e) {
+        if (e.name === 'AbortError') {
+            throw new Error('WebDAV request timed out after 15 seconds.');
+        }
         if (e.message && e.message.includes('Failed to fetch')) {
             throw new Error('Network Error (CORS, Mixed Content, or invalid SSL). Check browser console.');
         }
@@ -212,7 +249,7 @@ export async function pullFromWebDav() {
 
         // Preserve credentials before import (importAllData wipes all settings)
         const savedConfig = await getWebDavConfig();
-        const githubPAT = await getSetting('githubPAT', null);
+        const githubPAT = await getCredential('githubPat');
         const githubGistId = await getSetting('githubGistId', null);
 
         await importAllData(parsedData);
@@ -220,8 +257,8 @@ export async function pullFromWebDav() {
         // Restore credentials that were stripped from the backup
         if (savedConfig.url) await setSetting('webdavUrl', savedConfig.url);
         if (savedConfig.username) await setSetting('webdavUsername', savedConfig.username);
-        if (savedConfig.password) await setSetting('webdavPassword', savedConfig.password);
-        if (githubPAT) await setSetting('githubPAT', githubPAT);
+        if (savedConfig.password) await setCredential('webdavPassword', savedConfig.password);
+        if (githubPAT) await setCredential('githubPat', githubPAT);
         if (githubGistId) await setSetting('githubGistId', githubGistId);
 
         return true;

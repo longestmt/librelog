@@ -3,7 +3,7 @@
  * Handles food searches and FDC ID lookups
  */
 
-import { getSetting } from '../data/db.js';
+import { getCredential } from '../data/credentials.js';
 
 const USDA_BASE_URL = 'https://api.nal.usda.gov/fdc/v1';
 const REQUEST_TIMEOUT_MS = 8000;
@@ -25,11 +25,11 @@ const NUTRIENT_IDS = {
  * @private
  * @param {Array} foodNutrients - Array of nutrient objects
  * @param {number} nutrientId - USDA nutrient number
- * @returns {number} Nutrient value or 0
+ * @returns {number|null} Nutrient value, or null when USDA did not provide it
  */
 function getNutrientValue(foodNutrients, nutrientId) {
   if (!Array.isArray(foodNutrients)) {
-    return 0;
+    return null;
   }
 
   const nutrient = foodNutrients.find(
@@ -37,10 +37,12 @@ function getNutrientValue(foodNutrients, nutrientId) {
   );
 
   if (!nutrient) {
-    return 0;
+    return null;
   }
 
-  return nutrient.value ?? nutrient.amount ?? 0;
+  const value = nutrient.value ?? nutrient.amount;
+  const number = typeof value === 'number' ? value : Number.parseFloat(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 /**
@@ -68,8 +70,8 @@ function normalizeFood(food) {
       nutrients: {
         energy: {
           kcal: getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY)
-            || getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_GENERAL)
-            || getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_SPECIFIC)
+            ?? getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_GENERAL)
+            ?? getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_SPECIFIC)
         },
         macros: {
           protein: {
@@ -113,7 +115,7 @@ async function searchFoods(query, page = 1, pageSize = 20) {
     return [];
   }
 
-  const apiKey = await getSetting('usda_api_key');
+  const apiKey = await getCredential('usdaApiKey');
   if (!apiKey) {
     console.warn('USDA API key not configured');
     return [];
@@ -173,7 +175,7 @@ async function lookupFdcId(fdcId) {
     return null;
   }
 
-  const apiKey = await getSetting('usda_api_key');
+  const apiKey = await getCredential('usdaApiKey');
   if (!apiKey) {
     console.warn('USDA API key not configured');
     return null;

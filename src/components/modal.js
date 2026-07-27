@@ -6,6 +6,9 @@ let activeModal = null;
 
 export function openModal(content, { title = '', onClose = null } = {}) {
     closeModal();
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
 
     const backdrop = document.createElement('div');
     backdrop.className = 'modal-backdrop';
@@ -56,7 +59,7 @@ export function openModal(content, { title = '', onClose = null } = {}) {
     document.body.appendChild(backdrop);
     document.body.style.overflow = 'hidden';
 
-    activeModal = { backdrop, content: wrapper, onClose };
+    activeModal = { backdrop, content: wrapper, onClose, previouslyFocused };
 
     // Focus the first focusable element in the modal
     const focusable = wrapper.querySelectorAll('button, input, select, textarea, [tabindex]:not([tabindex="-1"])');
@@ -91,7 +94,7 @@ export function openModal(content, { title = '', onClose = null } = {}) {
 
 export function closeModal() {
     if (!activeModal) return;
-    const { backdrop, onClose, handleKeydown } = activeModal;
+    const { backdrop, onClose, handleKeydown, previouslyFocused } = activeModal;
     document.removeEventListener('keydown', handleKeydown);
     backdrop.style.opacity = '0';
     backdrop.querySelector('.modal-content').style.transform = 'translateY(16px)';
@@ -100,6 +103,7 @@ export function closeModal() {
         backdrop.remove();
         document.body.style.overflow = '';
         if (onClose) onClose();
+        if (previouslyFocused?.isConnected) previouslyFocused.focus();
     }, 150);
     activeModal = null;
 }

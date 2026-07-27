@@ -2,7 +2,11 @@
 
 A privacy-first, open-source meal tracking and calorie counting app. Part of the **Libre Suite** alongside [LibreLift](https://github.com/longestmt/librelift).
 
-**No accounts. No subscriptions. No data harvesting. Your nutrition data stays on your device.**
+**No accounts. No subscriptions. No analytics. Your diary is stored on your device.**
+
+Food searches are sent to the enabled food database. Optional AI features send
+the description, audio, or photo you choose to your configured provider.
+Optional WebDAV sync uploads a credential-free backup to your server.
 
 ## Features
 
@@ -38,11 +42,11 @@ A privacy-first, open-source meal tracking and calorie counting app. Part of the
 - **Auto-backup** — Every 6 hours to filesystem or localStorage
 - **JSON export/import** — Full data portability
 - **MyFitnessPal import** — CSV migration from MFP
-- **WebDAV sync** — Optional self-hosted sync (Nextcloud, etc.)
+- **WebDAV backup/restore** — Optional self-hosted backup (Nextcloud, etc.)
 
 ### Design
 - **3 themes** — Compline (dark), Lauds (light), Vigil (AMOLED)
-- **WCAG 2.1 AA** — Screen reader support, keyboard navigation, skip links
+- **Accessibility foundations** — Screen reader labels, keyboard navigation, skip links, and focus-managed dialogs
 - **Responsive** — Mobile-first with desktop sidebar layout
 - **PWA** — Installable, works offline
 
@@ -70,6 +74,15 @@ npm run dev
 # Build for production
 npm run build
 
+# Run unit, production build, browser, offline-PWA, and accessibility checks
+npm run check
+
+# Run only the deterministic local tests
+npm run test:unit
+
+# Build and run the Chromium release workflows
+npm run test:e2e
+
 # Preview production build
 npm run preview
 ```
@@ -83,7 +96,12 @@ LibreLog works fully without AI. To enable photo/voice/text food logging:
 3. Enter your API key
 4. Photo, Voice, and AI Text tabs appear in the search page
 
-Keys are stored locally on your device. Estimated cost: $0.01–0.03 per analysis.
+Keys are stored unencrypted in this browser's IndexedDB and excluded from JSON
+exports and WebDAV backups. Protect the device/browser profile and use
+provider-side spending limits. Costs vary by provider and model.
+
+AI nutrition is always an estimate. LibreLog validates model output and asks you
+to review/edit portions and nutrition before logging it.
 
 ## Project Structure
 

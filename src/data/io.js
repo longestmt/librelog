@@ -4,6 +4,7 @@
  */
 
 import { exportAllData, importAllData, put, getAll } from './db.js';
+import { todayStr } from '../utils/format.js';
 
 /**
  * Download JSON data as a file
@@ -32,8 +33,9 @@ export function downloadJSON(data, filename) {
  */
 export async function exportData() {
     const data = await exportAllData();
-    const date = new Date().toISOString().split('T')[0];
+    const date = todayStr();
     downloadJSON(data, `librelog-backup-${date}.json`);
+    return data;
 }
 
 /**
@@ -43,6 +45,14 @@ export async function exportData() {
  */
 export function readFileAsJSON(file) {
     return new Promise((resolve, reject) => {
+        if (!(file instanceof Blob)) {
+            reject(new Error('Import requires a JSON file'));
+            return;
+        }
+        if (file.size > 25 * 1024 * 1024) {
+            reject(new Error('Backup is larger than the 25 MB import limit'));
+            return;
+        }
         const reader = new FileReader();
         reader.onload = () => {
             try { resolve(JSON.parse(reader.result)); }
@@ -113,12 +123,17 @@ export async function importMyFitnessPalCSV(file) {
     const mealRaw = colMap.meal >= 0 ? cols[colMap.meal]?.trim().toLowerCase() : '';
     const mealType = normalizeMealType(mealRaw);
 
-    const kcal = parseFloat(cols[colMap.calories]) || 0;
-    const protein = colMap.protein >= 0 ? parseFloat(cols[colMap.protein]) || 0 : 0;
-    const carbs = colMap.carbs >= 0 ? parseFloat(cols[colMap.carbs]) || 0 : 0;
-    const fat = colMap.fat >= 0 ? parseFloat(cols[colMap.fat]) || 0 : 0;
-    const fiber = colMap.fiber >= 0 ? parseFloat(cols[colMap.fiber]) || 0 : 0;
-    const sodium = colMap.sodium >= 0 ? parseFloat(cols[colMap.sodium]) || 0 : 0;
+    const kcal = parseOptionalNumber(cols, colMap.calories);
+    const protein = parseOptionalNumber(cols, colMap.protein);
+    const carbs = parseOptionalNumber(cols, colMap.carbs);
+    const fat = parseOptionalNumber(cols, colMap.fat);
+    const fiber = parseOptionalNumber(cols, colMap.fiber);
+    const sodium = parseOptionalNumber(cols, colMap.sodium);
+
+    if (kcal === null && protein === null && carbs === null && fat === null) {
+      skipped++;
+      continue;
+    }
 
     // Create or find food entry
     const foodId = `mfp-${name.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 50)}`;
@@ -201,19 +216,46 @@ function findCol(header, candidates) {
   return -1;
 }
 
+function parseOptionalNumber(columns, index) {
+  if (index < 0) return null;
+  const raw = columns[index];
+  if (raw == null || String(raw).trim() === '') return null;
+  const value = Number.parseFloat(raw);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 function normalizeDate(raw) {
   // Try ISO format first
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return isValidDateParts(raw) ? raw : null;
   // MM/DD/YYYY
   const mdy = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (mdy) return `${mdy[3]}-${mdy[1].padStart(2, '0')}-${mdy[2].padStart(2, '0')}`;
+  if (mdy) {
+    const normalized = `${mdy[3]}-${mdy[1].padStart(2, '0')}-${mdy[2].padStart(2, '0')}`;
+    return isValidDateParts(normalized) ? normalized : null;
+  }
   // DD/MM/YYYY
   const dmy = raw.match(/^(\d{1,2})[-.](\d{1,2})[-.](\d{4})$/);
-  if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+  if (dmy) {
+    const normalized = `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+    return isValidDateParts(normalized) ? normalized : null;
+  }
   // Try Date.parse as last resort
   const parsed = new Date(raw);
-  if (!isNaN(parsed)) return parsed.toISOString().split('T')[0];
+  if (!isNaN(parsed)) {
+    const year = parsed.getFullYear();
+    const month = String(parsed.getMonth() + 1).padStart(2, '0');
+    const day = String(parsed.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
   return null;
+}
+
+function isValidDateParts(dateStr) {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year
+    && date.getMonth() === month - 1
+    && date.getDate() === day;
 }
 
 function normalizeMealType(raw) {

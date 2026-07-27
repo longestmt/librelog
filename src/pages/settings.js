@@ -1,9 +1,23 @@
 import { getSetting, setSetting, clearAllData } from '../data/db.js';
 import { getGoals, setGoals } from '../engine/goal-tracking.js';
 import { exportData, importData, importMyFitnessPalCSV } from '../data/io.js';
-import { pushToWebDav, pullFromWebDav } from '../data/webdav.js';
+import {
+  getWebDavConfig,
+  setWebDavConfig,
+  disconnectWebDav,
+  pushToWebDav,
+  pullFromWebDav,
+} from '../data/webdav.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
+import { escapeHTML } from '../utils/sanitize.js';
+import { clearAutoBackups, stopAutoBackup } from '../data/auto-backup.js';
+import {
+  getCredential,
+  hasCredential,
+  removeCredential,
+  setCredential,
+} from '../data/credentials.js';
 
 const APP_VERSION = '0.3.0';
 const LICENSE = 'AGPL-3.0';
@@ -11,9 +25,9 @@ const LICENSE = 'AGPL-3.0';
 export function renderSettingsPage(container, queryString) {
   async function render() {
     const goals = await getGoals();
-    const usdaApiKey = await getSetting('usda_api_key') || '';
+    const usdaApiKeyConfigured = await hasCredential('usdaApiKey');
     const aiProvider = await getSetting('ai_provider') || '';
-    const aiApiKey = await getSetting('ai_api_key') || '';
+    const aiApiKeyConfigured = await hasCredential('aiApiKey');
     const aiModel = await getSetting('ai_model') || '';
     const aiOllamaUrl = await getSetting('ai_ollama_url') || 'http://localhost:11434';
     const aiUsageLog = await getSetting('ai_usage_log') || [];
@@ -25,12 +39,13 @@ export function renderSettingsPage(container, queryString) {
       theme = themeMap[theme];
       await setSetting('theme', theme);
     }
-    const webdavConnected = await getSetting('webdav_connected') || false;
-    const webdavUrl = await getSetting('webdav_url') || '';
-    const webdavUsername = await getSetting('webdav_username') || '';
+    const webdavConfig = await getWebDavConfig();
+    const webdavConnected = Boolean(webdavConfig.url && webdavConfig.username && webdavConfig.password);
+    const webdavUrl = webdavConfig.url || '';
+    const webdavUsername = webdavConfig.username || '';
 
     container.innerHTML = `
-      <div class="settings-page" role="main" aria-label="Settings">
+      <div class="settings-page">
         <div class="settings-header">
           <h1>Settings</h1>
         </div>
@@ -67,7 +82,7 @@ export function renderSettingsPage(container, queryString) {
 
               <label class="setting-input">
                 <span class="setting-label">Sodium Limit (mg)
-                  <span class="setting-hint">WHO recommends &lt;2000mg/day</span>
+                  <span class="setting-hint">Choose a personal limit appropriate for your needs</span>
                 </span>
                 <input type="number" id="goal-sodium" min="0" step="100" value="${goals.sodiumMg || 2300}">
               </label>
@@ -92,7 +107,7 @@ export function renderSettingsPage(container, queryString) {
           <!-- AI / BYOK Section -->
           <section class="settings-section">
             <h2 class="section-title">AI Features (Optional)</h2>
-            <p class="setting-hint" style="margin-bottom:var(--sp-3)">Bring your own API key for photo & voice food logging. Keys stay on your device.</p>
+            <p class="setting-hint" style="margin-bottom:var(--sp-3)">Bring your own API key for photo &amp; voice logging. Credentials are stored in this browser and excluded from exports; they are not encrypted by LibreLog.</p>
             <div class="settings-group">
               <label class="setting-input">
                 <span class="setting-label">AI Provider</span>
@@ -107,22 +122,22 @@ export function renderSettingsPage(container, queryString) {
               <div id="ai-key-fields" style="${aiProvider === 'ollama' || !aiProvider ? 'display:none' : ''}">
                 <label class="setting-input">
                   <span class="setting-label">API Key</span>
-                  <input type="password" id="ai-api-key" placeholder="sk-... or sk-ant-..." value="${aiApiKey}" autocomplete="off">
+                  <input type="password" id="ai-api-key" placeholder="${aiApiKeyConfigured ? 'Key saved — enter a new value to replace it' : 'sk-... or sk-ant-...'}" value="" autocomplete="new-password">
                 </label>
               </div>
 
               <div id="ai-ollama-fields" style="${aiProvider === 'ollama' ? '' : 'display:none'}">
                 <label class="setting-input">
                   <span class="setting-label">Ollama URL</span>
-                  <input type="url" id="ai-ollama-url" placeholder="http://localhost:11434" value="${aiOllamaUrl}">
+                  <input type="url" id="ai-ollama-url" placeholder="http://localhost:11434" value="${escapeHTML(aiOllamaUrl)}">
                 </label>
               </div>
 
               <label class="setting-input">
                 <span class="setting-label">Model Override
-                  <span class="setting-hint">Leave blank for default (gpt-4o / claude-sonnet-4-5-20250929 / llama3)</span>
+                  <span class="setting-hint">Cloud providers have a default. For Ollama, enter an installed model name.</span>
                 </span>
-                <input type="text" id="ai-model" placeholder="Default" value="${aiModel}">
+                <input type="text" id="ai-model" placeholder="Default" value="${escapeHTML(aiModel)}">
               </label>
 
               <button class="btn btn-primary btn-small" id="save-ai-btn">Save AI Settings</button>
@@ -140,10 +155,11 @@ export function renderSettingsPage(container, queryString) {
                       <span class="ai-cost-value">${monthlyUsage.tokens.toLocaleString()}</span>
                     </div>
                     <div class="ai-cost-stat">
-                      <span class="ai-cost-label">Est. Cost</span>
+                      <span class="ai-cost-label">Rough Cost</span>
                       <span class="ai-cost-value">$${monthlyUsage.cost.toFixed(3)}</span>
                     </div>
                   </div>
+                  <p class="setting-hint">Approximation only; verify billing with your provider.</p>
                 </div>
               ` : ''}
             </div>
@@ -157,9 +173,10 @@ export function renderSettingsPage(container, queryString) {
                 <span class="setting-label">USDA FoodData Central API Key
                   <span class="setting-hint">Free key from fdc.nal.usda.gov — enables US food database</span>
                 </span>
-                <input type="text" id="usda-api-key" placeholder="Your USDA API key (optional)" value="${usdaApiKey}">
+                <input type="password" id="usda-api-key" placeholder="${usdaApiKeyConfigured ? 'Key saved — enter a new value to replace it' : 'Your USDA API key (optional)'}" value="" autocomplete="new-password">
               </label>
               <button class="btn btn-primary btn-small" id="save-usda-key-btn">Save API Key</button>
+              ${usdaApiKeyConfigured ? '<button class="btn btn-outline btn-small" id="remove-usda-key-btn">Remove API Key</button>' : ''}
             </div>
           </section>
 
@@ -189,9 +206,9 @@ export function renderSettingsPage(container, queryString) {
             </div>
           </section>
 
-          <!-- WebDAV Sync Section -->
+          <!-- WebDAV Backup Section -->
           <section class="settings-section">
-            <h2 class="section-title">WebDAV Sync</h2>
+            <h2 class="section-title">WebDAV Backup</h2>
             <div class="settings-group">
               <div id="webdav-status" class="webdav-status">
                 <span class="status-label">Connection Status:</span>
@@ -202,19 +219,19 @@ export function renderSettingsPage(container, queryString) {
 
               ${webdavConnected ? `
                 <div class="webdav-actions">
-                  <button class="btn btn-small" id="webdav-push">Push Data</button>
-                  <button class="btn btn-small" id="webdav-pull">Pull Data</button>
+                  <button class="btn btn-small" id="webdav-push">Create Backup</button>
+                  <button class="btn btn-small" id="webdav-pull">Restore Backup</button>
                   <button class="btn btn-small btn-outline" id="webdav-disconnect">Disconnect</button>
                 </div>
               ` : `
                 <label class="setting-input">
                   <span class="setting-label">WebDAV Server URL</span>
-                  <input type="url" id="webdav-url" placeholder="https://example.com/remote.php/webdav/" value="${webdavUrl}">
+                  <input type="url" id="webdav-url" placeholder="https://example.com/remote.php/webdav/" value="${escapeHTML(webdavUrl)}">
                 </label>
 
                 <label class="setting-input">
                   <span class="setting-label">Username</span>
-                  <input type="text" id="webdav-username" placeholder="username" value="${webdavUsername}">
+                  <input type="text" id="webdav-username" placeholder="username" value="${escapeHTML(webdavUsername)}">
                 </label>
 
                 <label class="setting-input">
@@ -222,7 +239,7 @@ export function renderSettingsPage(container, queryString) {
                   <input type="password" id="webdav-password" placeholder="password" value="">
                 </label>
 
-                <button class="btn btn-primary" id="webdav-test">Test Connection</button>
+                <button class="btn btn-primary" id="webdav-test">Connect</button>
               `}
             </div>
           </section>
@@ -244,15 +261,15 @@ export function renderSettingsPage(container, queryString) {
                 <span class="about-value">Free &amp; Open Source</span>
               </div>
               <div class="about-links">
-                <a href="https://github.com/libresuite/librelog" target="_blank" class="about-link">
+                <a href="https://github.com/libresuite/librelog" target="_blank" rel="noopener noreferrer" class="about-link">
                   Source Code
                 </a>
-                <a href="https://openfoodfacts.org/" target="_blank" class="about-link">
+                <a href="https://openfoodfacts.org/" target="_blank" rel="noopener noreferrer" class="about-link">
                   Open Food Facts
                 </a>
               </div>
               <div class="about-attribution">
-                <p>Compline &amp; Lauds themes by <a href="https://joshuablais.com" target="_blank">Joshua Blais</a></p>
+                <p>Compline &amp; Lauds themes by <a href="https://joshuablais.com" target="_blank" rel="noopener noreferrer">Joshua Blais</a></p>
                 <p>Built with care for your health and your privacy.</p>
               </div>
             </div>
@@ -287,16 +304,22 @@ export function renderSettingsPage(container, queryString) {
     document.getElementById('save-ai-btn')?.addEventListener('click', async () => {
       const provider = document.getElementById('ai-provider').value;
       const apiKey = document.getElementById('ai-api-key')?.value.trim() || '';
+      const existingApiKey = await getCredential('aiApiKey') || '';
       const model = document.getElementById('ai-model')?.value.trim() || '';
       const ollamaUrl = document.getElementById('ai-ollama-url')?.value.trim() || 'http://localhost:11434';
 
-      if (provider && provider !== 'ollama' && !apiKey) {
+      if (provider && provider !== 'ollama' && !apiKey && !existingApiKey) {
         showToast('Please enter an API key for ' + provider);
+        return;
+      }
+      if (provider === 'ollama' && !model) {
+        showToast('Enter the name of an installed Ollama model');
         return;
       }
 
       await setSetting('ai_provider', provider);
-      await setSetting('ai_api_key', apiKey);
+      if (!provider) await removeCredential('aiApiKey');
+      else if (apiKey) await setCredential('aiApiKey', apiKey);
       await setSetting('ai_model', model);
       await setSetting('ai_ollama_url', ollamaUrl);
       showToast(provider ? `AI configured with ${provider}` : 'AI features disabled');
@@ -305,8 +328,18 @@ export function renderSettingsPage(container, queryString) {
 
     document.getElementById('save-usda-key-btn')?.addEventListener('click', async () => {
       const key = document.getElementById('usda-api-key').value.trim();
-      await setSetting('usda_api_key', key);
-      showToast(key ? 'USDA API key saved' : 'USDA API key removed');
+      if (!key) {
+        showToast(usdaApiKeyConfigured ? 'Enter a new key, or use Remove API Key' : 'Enter an API key');
+        return;
+      }
+      await setCredential('usdaApiKey', key);
+      showToast('USDA API key saved');
+      render();
+    });
+    document.getElementById('remove-usda-key-btn')?.addEventListener('click', async () => {
+      await removeCredential('usdaApiKey');
+      showToast('USDA API key removed');
+      render();
     });
 
     document.getElementById('export-btn')?.addEventListener('click', handleExport);
@@ -321,12 +354,12 @@ export function renderSettingsPage(container, queryString) {
   }
 
   async function saveGoals() {
-    const calorieTarget = parseInt(document.getElementById('goal-calories').value) || 2000;
-    const proteinG = parseInt(document.getElementById('goal-protein').value) || 150;
-    const carbG = parseInt(document.getElementById('goal-carbs').value) || 200;
-    const fatG = parseInt(document.getElementById('goal-fat').value) || 65;
-    const fiberG = parseInt(document.getElementById('goal-fiber').value) || 30;
-    const sodiumMg = parseInt(document.getElementById('goal-sodium').value) || 2300;
+    const calorieTarget = Number(document.getElementById('goal-calories').value);
+    const proteinG = Number(document.getElementById('goal-protein').value);
+    const carbG = Number(document.getElementById('goal-carbs').value);
+    const fatG = Number(document.getElementById('goal-fat').value);
+    const fiberG = Number(document.getElementById('goal-fiber').value);
+    const sodiumMg = Number(document.getElementById('goal-sodium').value);
 
     await setGoals({ calorieTarget, proteinG, carbG, fatG, fiberG, sodiumMg });
     showToast('Goals saved');
@@ -342,14 +375,7 @@ export function renderSettingsPage(container, queryString) {
 
   async function handleExport() {
     try {
-      const data = await exportData();
-      const blob = new Blob([data], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `librelog-export-${new Date().toISOString().split('T')[0]}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
+      await exportData();
       showToast('Data exported');
     } catch (err) {
       console.error('Export failed:', err);
@@ -365,18 +391,14 @@ export function renderSettingsPage(container, queryString) {
       const file = e.target.files[0];
       if (!file) return;
 
-      const reader = new FileReader();
-      reader.addEventListener('load', async (event) => {
-        try {
-          await importData(event.target.result);
-          showToast('Data imported successfully');
-          render();
-        } catch (err) {
-          console.error('Import failed:', err);
-          showToast('Import failed. Please check the file format.');
-        }
-      });
-      reader.readAsText(file);
+      try {
+        await importData(file);
+        showToast('Data imported successfully');
+        render();
+      } catch (err) {
+        console.error('Import failed:', err);
+        showToast(`Import failed: ${err.message || 'check the file format'}`);
+      }
     });
     input.click();
   }
@@ -400,6 +422,8 @@ export function renderSettingsPage(container, queryString) {
     document.getElementById('cancel-btn').addEventListener('click', closeModal);
     document.getElementById('confirm-btn').addEventListener('click', async () => {
       try {
+        stopAutoBackup();
+        await clearAutoBackups();
         await clearAllData();
         closeModal();
         showToast('All data cleared');
@@ -448,23 +472,15 @@ export function renderSettingsPage(container, queryString) {
     btn.innerHTML = '<span class="spinner"></span> Testing...';
 
     try {
-      const data = await exportData();
-      const result = await pushToWebDav(url, username, password, data);
-      if (result.success) {
-        await setSetting('webdav_url', url);
-        await setSetting('webdav_username', username);
-        await setSetting('webdav_connected', true);
-        showToast('Connection successful');
-        render();
-      } else {
-        showToast('Connection failed: ' + result.error);
-      }
+      await setWebDavConfig(url, username, password);
+      showToast('Connection successful');
+      render();
     } catch (err) {
       console.error('WebDAV test failed:', err);
       showToast('Connection error. Check your credentials and URL.');
     } finally {
       btn.disabled = false;
-      btn.innerHTML = 'Test Connection';
+      btn.innerHTML = 'Connect';
     }
   }
 
@@ -474,58 +490,57 @@ export function renderSettingsPage(container, queryString) {
     btn.innerHTML = '<span class="spinner"></span> Pushing...';
 
     try {
-      const url = await getSetting('webdav_url');
-      const username = await getSetting('webdav_username');
-      const password = await getSetting('webdav_password');
-      const data = await exportData();
-
-      const result = await pushToWebDav(url, username, password, data);
-      if (result.success) {
-        showToast('Data pushed to server');
-      } else {
-        showToast('Push failed: ' + result.error);
-      }
+      await pushToWebDav();
+      showToast('WebDAV backup created');
     } catch (err) {
       console.error('Push failed:', err);
       showToast('Failed to push data');
     } finally {
       btn.disabled = false;
-      btn.innerHTML = 'Push Data';
+      btn.innerHTML = 'Create Backup';
     }
   }
 
-  async function handleWebDAVPull() {
-    const btn = document.getElementById('webdav-pull');
+  function handleWebDAVPull() {
+    const modal = document.createElement('div');
+    modal.className = 'modal-content confirm-modal';
+    modal.innerHTML = `
+      <div class="modal-header"><h2>Restore WebDAV Backup?</h2></div>
+      <p class="confirm-message">This replaces local meals, foods, recipes, measurements, and non-secret settings with the server backup. Local credentials are preserved.</p>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="cancel-btn">Cancel</button>
+        <button class="btn btn-danger" id="confirm-btn">Restore Backup</button>
+      </div>
+    `;
+    openModal(modal);
+    document.getElementById('cancel-btn').addEventListener('click', closeModal);
+    document.getElementById('confirm-btn').addEventListener('click', async (event) => {
+      await performWebDAVPull(event.currentTarget);
+    });
+  }
+
+  async function performWebDAVPull(btn) {
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Pulling...';
+    btn.innerHTML = '<span class="spinner"></span> Restoring...';
 
     try {
-      const url = await getSetting('webdav_url');
-      const username = await getSetting('webdav_username');
-      const password = await getSetting('webdav_password');
-
-      const result = await pullFromWebDav(url, username, password);
-      if (result.success) {
-        await importData(result.data);
-        showToast('Data pulled from server');
-        render();
-      } else {
-        showToast('Pull failed: ' + result.error);
-      }
+      await pullFromWebDav();
+      closeModal();
+      showToast('WebDAV backup restored');
+      render();
     } catch (err) {
       console.error('Pull failed:', err);
-      showToast('Failed to pull data');
+      showToast(`Restore failed: ${err.message || 'check the connection'}`);
     } finally {
-      btn.disabled = false;
-      btn.innerHTML = 'Pull Data';
+      if (btn.isConnected) {
+        btn.disabled = false;
+        btn.innerHTML = 'Restore Backup';
+      }
     }
   }
 
   async function handleWebDAVDisconnect() {
-    await setSetting('webdav_url', null);
-    await setSetting('webdav_username', null);
-    await setSetting('webdav_password', null);
-    await setSetting('webdav_connected', false);
+    await disconnectWebDav();
     showToast('WebDAV disconnected');
     render();
   }

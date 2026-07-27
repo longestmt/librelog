@@ -1,18 +1,12 @@
 import { getByIndex, getAll, getById } from '../data/db.js';
 import { getGoals } from '../engine/goal-tracking.js';
 import { calculateDayTotalsSimple } from '../engine/nutrition.js';
-import { todayStr } from '../utils/format.js';
+import { todayStr, addCalendarDays, toLocalDate } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { showToast } from '../components/toast.js';
 
-function addDays(dateStr, days) {
-  const date = new Date(dateStr + 'T00:00:00');
-  date.setDate(date.getDate() + days);
-  return date.toISOString().split('T')[0];
-}
-
 function formatDateShort(dateStr) {
-  const date = new Date(dateStr + 'T00:00:00');
+  const date = toLocalDate(dateStr);
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
@@ -21,7 +15,7 @@ export function renderInsightsPage(container, queryString) {
 
   async function render() {
     container.innerHTML = `
-      <div class="insights-page" role="main" aria-label="Nutrition insights">
+      <div class="insights-page">
         <div class="insights-header">
           <h1>Insights</h1>
         </div>
@@ -38,10 +32,21 @@ export function renderInsightsPage(container, queryString) {
       </div>
     `;
 
-    document.querySelectorAll('.tab-btn').forEach(btn => {
+    const tabButtons = [...document.querySelectorAll('.tab-btn')];
+    tabButtons.forEach((btn, index) => {
       btn.addEventListener('click', (e) => {
-        currentView = e.target.dataset.view;
+        currentView = e.currentTarget.dataset.view;
         renderContent();
+      });
+      btn.addEventListener('keydown', (event) => {
+        const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End'];
+        if (!keys.includes(event.key)) return;
+        event.preventDefault();
+        const nextIndex = event.key === 'Home' ? 0
+          : event.key === 'End' ? tabButtons.length - 1
+            : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabButtons.length) % tabButtons.length;
+        tabButtons[nextIndex].focus();
+        tabButtons[nextIndex].click();
       });
     });
 
@@ -49,11 +54,13 @@ export function renderInsightsPage(container, queryString) {
   }
 
   async function renderContent() {
-    const activeBtn = document.querySelector('.tab-btn.active');
-    if (activeBtn) {
-      activeBtn.classList.remove('active');
-    }
-    document.querySelector(`.tab-btn[data-view="${currentView}"]`)?.classList.add('active');
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      const selected = btn.dataset.view === currentView;
+      btn.classList.toggle('active', selected);
+      btn.setAttribute('aria-selected', String(selected));
+      btn.tabIndex = selected ? 0 : -1;
+    });
+    document.getElementById('insights-content')?.setAttribute('aria-label', `${currentView} insights`);
 
     switch (currentView) {
       case 'today':
@@ -81,7 +88,7 @@ export function renderInsightsPage(container, queryString) {
       { label: 'Fat', value: Math.round(totals.fat), unit: `/${goals.fatG}g`, color: 'fat' },
     ];
 
-    const caloriesRemaining = Math.max(0, goals.calorieTarget - totals.kcal);
+    const caloriesRemaining = goals.calorieTarget - totals.kcal;
     const caloriesPercent = Math.min(100, (totals.kcal / goals.calorieTarget) * 100);
 
     const contentDiv = document.getElementById('insights-content');
@@ -102,7 +109,7 @@ export function renderInsightsPage(container, queryString) {
         <div class="calorie-progress">
           <div class="progress-header">
             <span class="progress-label">Daily Calorie Target</span>
-            <span class="progress-remaining">${caloriesRemaining} remaining</span>
+            <span class="progress-remaining">${caloriesRemaining >= 0 ? `${caloriesRemaining} remaining` : `${Math.abs(caloriesRemaining)} above target`}</span>
           </div>
           <div class="progress-bar">
             <div class="progress-fill" style="width: ${caloriesPercent}%"></div>
@@ -115,7 +122,7 @@ export function renderInsightsPage(container, queryString) {
 
         ${totals.sodium > (goals.sodiumMg || 2300) ? `
           <div class="alert alert-warning" role="alert">
-            <strong>Sodium Alert:</strong> You've exceeded your daily sodium limit (${totals.sodium}mg / ${goals.sodiumMg || 2300}mg). WHO recommends &lt;2000mg/day.
+            <strong>Sodium:</strong> Today’s logged total is above your selected limit (${totals.sodium}mg / ${goals.sodiumMg || 2300}mg).
           </div>
         ` : ''}
 
@@ -137,7 +144,7 @@ export function renderInsightsPage(container, queryString) {
     const goals = await getGoals();
 
     for (let i = 6; i >= 0; i--) {
-      const date = addDays(today, -i);
+      const date = addCalendarDays(today, -i);
       const meals = await getByIndex('meals', 'date', date) || [];
       const totals = calculateDayTotalsSimple(meals);
       weekData.push({
@@ -148,7 +155,10 @@ export function renderInsightsPage(container, queryString) {
     }
 
     const maxCalories = Math.max(...weekData.map(d => d.calories), goals.calorieTarget);
-    const avgCalories = Math.round(weekData.reduce((sum, d) => sum + d.calories, 0) / weekData.length);
+    const loggedDays = weekData.filter(day => day.calories > 0);
+    const avgCalories = loggedDays.length
+      ? Math.round(loggedDays.reduce((sum, day) => sum + day.calories, 0) / loggedDays.length)
+      : 0;
 
     const contentDiv = document.getElementById('insights-content');
     contentDiv.innerHTML = `
@@ -157,7 +167,7 @@ export function renderInsightsPage(container, queryString) {
 
         <div class="week-stats">
           <div class="week-stat">
-            <span class="week-stat-label">Average Daily</span>
+            <span class="week-stat-label">Average Logged Day</span>
             <span class="week-stat-value">${avgCalories} kcal</span>
           </div>
           <div class="week-stat">
@@ -204,7 +214,7 @@ export function renderInsightsPage(container, queryString) {
     const monthData = [];
 
     for (let i = 29; i >= 0; i--) {
-      const date = addDays(today, -i);
+      const date = addCalendarDays(today, -i);
       const meals = await getByIndex('meals', 'date', date) || [];
       const totals = calculateDayTotalsSimple(meals);
       monthData.push({
@@ -214,10 +224,19 @@ export function renderInsightsPage(container, queryString) {
       });
     }
 
-    const loggingStreak = calculateStreak(monthData);
-    const avgCalories = Math.round(monthData.reduce((sum, d) => sum + d.calories, 0) / monthData.length);
+    const loggedMonthDays = monthData.filter(day => day.hasData);
+    const avgCalories = loggedMonthDays.length
+      ? Math.round(loggedMonthDays.reduce((sum, day) => sum + day.calories, 0) / loggedMonthDays.length)
+      : 0;
 
-    const measurements = await getAll('measurements') || [];
+    const measurements = (await getAll('measurements') || [])
+      .filter(m => Number.isFinite(Number(m?.weight)) && Number(m.weight) > 0 && /^\d{4}-\d{2}-\d{2}$/.test(m?.date || ''))
+      .map(m => ({
+        date: m.date,
+        weight: Number(m.weight),
+        unit: m.unit === 'lb' ? 'lb' : 'kg',
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date));
     const recentMeasurements = measurements.slice(-3);
 
     const contentDiv = document.getElementById('insights-content');
@@ -227,16 +246,9 @@ export function renderInsightsPage(container, queryString) {
 
         <div class="month-stats">
           <div class="month-stat">
-            <div class="stat-icon">🔥</div>
-            <div class="stat-info">
-              <span class="stat-label">Logging Streak</span>
-              <span class="stat-value">${loggingStreak} days</span>
-            </div>
-          </div>
-          <div class="month-stat">
             <div class="stat-icon">📊</div>
             <div class="stat-info">
-              <span class="stat-label">Average Daily</span>
+              <span class="stat-label">Average Logged Day</span>
               <span class="stat-value">${avgCalories} kcal</span>
             </div>
           </div>
@@ -291,21 +303,9 @@ export function renderInsightsPage(container, queryString) {
 }
 
 function getDayLabel(dateStr) {
-  const date = new Date(dateStr + 'T00:00:00');
+  const date = toLocalDate(dateStr);
   const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   return days[date.getDay()];
-}
-
-function calculateStreak(monthData) {
-  let streak = 0;
-  for (let i = monthData.length - 1; i >= 0; i--) {
-    if (monthData[i].hasData) {
-      streak++;
-    } else if (streak > 0) {
-      break;
-    }
-  }
-  return streak;
 }
 
 async function renderFoodBreakdown(meals) {
@@ -349,18 +349,21 @@ async function getMostFrequentFoods(today, days) {
   const foodCounts = {};
 
   for (let i = 0; i < days; i++) {
-    const date = addDays(today, -i);
+    const date = addCalendarDays(today, -i);
     const meals = await getByIndex('meals', 'date', date) || [];
     meals.forEach(meal => {
       (meal.items || []).forEach(item => {
-        const name = item.foodId;
-        foodCounts[name] = (foodCounts[name] || 0) + 1;
+        const foodId = item.foodId;
+        foodCounts[foodId] = (foodCounts[foodId] || 0) + 1;
       });
     });
   }
 
-  return Object.entries(foodCounts)
+  const counts = Object.entries(foodCounts)
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([name, count]) => ({ name, count }));
+    .slice(0, 5);
+  return Promise.all(counts.map(async ([foodId, count]) => {
+    const food = await getById('foods', foodId);
+    return { name: food?.name || 'Unknown food', count };
+  }));
 }

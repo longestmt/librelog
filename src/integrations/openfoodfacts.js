@@ -19,6 +19,10 @@ function normalizeProduct(product) {
 
   try {
     const nutriments = product.nutriments || {};
+    const kcal = optionalNumber(nutriments['energy-kcal_100g'])
+      ?? (optionalNumber(nutriments.energy_100g) == null
+        ? null
+        : Math.round(optionalNumber(nutriments.energy_100g) / 4.184));
 
     return {
       id: `off-${product.code || product.id || Math.random().toString(36).slice(2)}`,
@@ -29,27 +33,18 @@ function normalizeProduct(product) {
         unit: 'g'
       },
       nutrients: {
-        energy: {
-          kcal: (nutriments['energy-kcal_100g'] ?? null) !== null
-            ? nutriments['energy-kcal_100g']
-            : Math.round((nutriments['energy_100g'] ?? 0) / 4.184)
-        },
+        energy: { kcal },
         macros: {
-          protein: {
-            g: nutriments.proteins_100g ?? 0
-          },
-          carbs: {
-            g: nutriments.carbohydrates_100g ?? 0
-          },
-          fat: {
-            g: nutriments.fat_100g ?? 0
-          }
+          protein: { g: optionalNumber(nutriments.proteins_100g) },
+          carbs: { g: optionalNumber(nutriments.carbohydrates_100g) },
+          fat: { g: optionalNumber(nutriments.fat_100g) }
         },
-        fiber: {
-          g: nutriments.fiber_100g ?? 0
-        },
+        fiber: { g: optionalNumber(nutriments.fiber_100g) },
         sodium: {
-          mg: nutriments.sodium_100g != null ? nutriments.sodium_100g * 10 : 0
+          // Open Food Facts reports sodium_100g in grams; LibreLog stores mg.
+          mg: optionalNumber(nutriments.sodium_100g) == null
+            ? null
+            : optionalNumber(nutriments.sodium_100g) * 1000
         }
       },
       barcode: {
@@ -65,6 +60,11 @@ function normalizeProduct(product) {
     console.error('Error normalizing OFF product:', error);
     return null;
   }
+}
+
+function optionalNumber(value) {
+  const number = typeof value === 'number' ? value : Number.parseFloat(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 /**

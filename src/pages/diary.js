@@ -1,7 +1,7 @@
 import { getById, getByIndex, getAll, put, softDelete, getSetting, setSetting } from '../data/db.js';
 import { getGoals } from '../engine/goal-tracking.js';
-import { calculateDayTotalsSimple } from '../engine/nutrition.js';
-import { todayStr, formatDate } from '../utils/format.js';
+import { calculateDayTotalsSimple, scaleNutrients } from '../engine/nutrition.js';
+import { todayStr, formatDate, addCalendarDays } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
@@ -12,14 +12,10 @@ function generateId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-function addDays(dateStr, days) {
-  const date = new Date(dateStr + 'T00:00:00');
-  date.setDate(date.getDate() + days);
-  return date.toISOString().split('T')[0];
-}
-
 export function renderDiaryPage(container, queryString) {
-  let currentDate = todayStr();
+  const params = new URLSearchParams(queryString);
+  const dateParam = params.get('date');
+  let currentDate = isCalendarDate(dateParam) ? dateParam : todayStr();
 
   async function render() {
     const meals = await getByIndex('meals', 'date', currentDate) || [];
@@ -27,7 +23,7 @@ export function renderDiaryPage(container, queryString) {
     const dailyNote = await getSetting(`note_${currentDate}`) || '';
 
     const totals = calculateDayTotalsSimple(meals);
-    const caloriesRemaining = Math.max(0, goals.calorieTarget - totals.kcal);
+    const caloriesRemaining = goals.calorieTarget - totals.kcal;
 
     const nutritionRingSVG = createNutritionRing(totals.kcal, goals.calorieTarget);
 
@@ -53,7 +49,8 @@ export function renderDiaryPage(container, queryString) {
     const recentFoods = await getRecentFoods(10);
 
     container.innerHTML = `
-      <div class="diary-page" role="main" aria-label="Daily food diary">
+      <div class="diary-page">
+        <h1 class="sr-only">Daily food diary</h1>
         <!-- Date Navigation Header -->
         <div class="date-header" role="navigation" aria-label="Date navigation">
           <button class="date-nav-btn" id="prev-day" aria-label="Previous day">
@@ -126,12 +123,13 @@ export function renderDiaryPage(container, queryString) {
               <span class="micro-value">${totals.sodium}mg / ${goals.sodiumMg || 2300}mg</span>
             </div>
           </div>
+          ${totals.incomplete?.length ? `<p class="field-hint">Some logged foods do not include ${totals.incomplete.join(', ')}; totals omit those missing values.</p>` : ''}
         </details>
 
         <!-- Remaining Calories -->
         <div class="remaining-calories">
-          <span class="remaining-label">Remaining:</span>
-          <span class="remaining-value">${caloriesRemaining} kcal</span>
+          <span class="remaining-label">${caloriesRemaining >= 0 ? 'Remaining:' : 'Above target:'}</span>
+          <span class="remaining-value">${Math.abs(caloriesRemaining)} kcal</span>
         </div>
 
         <!-- Recent Meals Carousel -->
@@ -142,7 +140,7 @@ export function renderDiaryPage(container, queryString) {
             ${recentFoods.map(food => {
               const kcal = food.nutrients?.energy?.kcal || 0;
               return `
-                <button class="carousel-chip" data-food-id="${food.id}" aria-label="Re-log ${escapeHTML(food.name)}">
+                <button class="carousel-chip" data-food-id="${escapeHTML(String(food.id))}" aria-label="Re-log ${escapeHTML(food.name)}">
                   <span class="chip-name">${escapeHTML(food.name)}</span>
                   <span class="chip-kcal">${Math.round(kcal)} kcal</span>
                 </button>
@@ -168,6 +166,7 @@ export function renderDiaryPage(container, queryString) {
             id="daily-note-input"
             placeholder="How are you feeling today? Any notes about your meals..."
             rows="2"
+            maxlength="2000"
             aria-label="Daily notes for ${formatDate(currentDate)}"
           >${escapeHTML(dailyNote)}</textarea>
         </div>
@@ -197,22 +196,19 @@ export function renderDiaryPage(container, queryString) {
 
     // Event listeners
     document.getElementById('prev-day').addEventListener('click', () => {
-      currentDate = addDays(currentDate, -1);
-      render();
+      window.location.hash = `#/diary?date=${addCalendarDays(currentDate, -1)}`;
     });
 
     document.getElementById('next-day').addEventListener('click', () => {
-      currentDate = addDays(currentDate, 1);
-      render();
+      window.location.hash = `#/diary?date=${addCalendarDays(currentDate, 1)}`;
     });
 
     document.getElementById('today-btn').addEventListener('click', () => {
-      currentDate = todayStr();
-      render();
+      window.location.hash = `#/diary?date=${todayStr()}`;
     });
 
     document.getElementById('fab-add-food').addEventListener('click', () => {
-      openMealTypePicker();
+      openMealTypePicker(currentDate);
     });
 
     // Daily notes auto-save with debounce
@@ -231,7 +227,7 @@ export function renderDiaryPage(container, queryString) {
         const food = await getById('foods', foodId);
         if (food) {
           // Navigate to search with pre-selected meal type
-          window.location.hash = `#/search?meal=${getMealTypeForTime()}&foodId=${foodId}`;
+          window.location.hash = `#/search?meal=${getMealTypeForTime()}&foodId=${encodeURIComponent(foodId)}&date=${currentDate}`;
         }
       });
     });
@@ -247,7 +243,7 @@ export function renderDiaryPage(container, queryString) {
       modal.innerHTML = `
         <div class="modal-header"><h2>Save Meal Template</h2><button class="modal-close" id="modal-close" aria-label="Close">✕</button></div>
         <label class="control-group"><span class="control-label">Template Name</span>
-          <input type="text" id="template-name" class="form-input" placeholder="e.g., My typical Monday" aria-label="Template name"></label>
+          <input type="text" id="template-name" class="form-input" maxlength="120" placeholder="e.g., My typical Monday" aria-label="Template name"></label>
         <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Cancel</button><button class="btn btn-primary" id="save-btn">Save</button></div>
       `;
       openModal(modal);
@@ -270,7 +266,7 @@ export function renderDiaryPage(container, queryString) {
     document.querySelectorAll('.meal-add-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const mealType = e.currentTarget.dataset.mealType;
-        window.location.hash = `#/search?meal=${mealType.toLowerCase()}`;
+        window.location.hash = `#/search?meal=${mealType.toLowerCase()}&date=${currentDate}`;
       });
     });
 
@@ -364,17 +360,18 @@ function renderMealSection(mealType, mealsOfType, foodsMap) {
       <h3 class="meal-section-title">${mealType}</h3>
       <div class="meal-section-content">
         ${mealsOfType.map((meal, mealIdx) => `
-          <div class="meal-group" data-meal-id="${meal.id}">
+          <div class="meal-group" data-meal-id="${escapeHTML(String(meal.id))}">
             ${(meal.items || []).map((item, foodIdx) => {
               const food = foodsMap.get(item.foodId);
               const kcal = item.nutrients?.kcal || 0;
               const name = food?.name || item.foodId || 'Unknown food';
               const unit = item.unit || food?.servingSize?.unit || 'g';
+              const isEstimate = food?.source?.type?.startsWith('ai-');
               return `
-                <div class="food-item" data-meal-id="${meal.id}" data-food-index="${foodIdx}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${item.quantity} ${unit}, ${Math.round(kcal)} calories. Click to edit.">
+                <div class="food-item" data-meal-id="${escapeHTML(String(meal.id))}" data-food-index="${foodIdx}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${item.quantity} ${escapeHTML(String(unit))}, ${Math.round(kcal)} calories. Click to edit.">
                   <div class="food-info">
-                    <div class="food-name">${escapeHTML(name)}</div>
-                    <div class="food-portion">${item.quantity} ${unit}</div>
+                    <div class="food-name">${escapeHTML(name)}${isEstimate ? ' <span class="source-badge ai">AI estimate</span>' : ''}</div>
+                    <div class="food-portion">${item.quantity} ${escapeHTML(String(unit))}</div>
                   </div>
                   <div class="food-calories">${Math.round(kcal)} kcal</div>
                 </div>
@@ -409,7 +406,7 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
     fat: food.nutrients?.macros?.fat?.g || 0,
   };
 
-  let quantity = item.quantity || 100;
+  let quantity = item.quantity ?? food.servingSize?.quantity ?? 100;
   let unit = item.unit || food.servingSize?.unit || 'g';
 
   const availableUnits = getUnitsForFood(food);
@@ -463,7 +460,7 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
         <span class="control-label">Unit</span>
         <select class="unit-select" id="unit-select" aria-label="Unit of measurement">
           ${availableUnits.map(u => `
-            <option value="${u.value}" ${u.value === unit ? 'selected' : ''}>${u.label}</option>
+            <option value="${escapeHTML(String(u.value))}" ${u.value === unit ? 'selected' : ''}>${escapeHTML(String(u.label))}</option>
           `).join('')}
         </select>
       </label>
@@ -473,7 +470,7 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
 
     <label class="control-group">
       <span class="control-label">Notes (optional)</span>
-      <input type="text" class="notes-input" id="notes-input" value="${escapeHTML(item.notes || '')}">
+      <input type="text" class="notes-input" id="notes-input" maxlength="500" value="${escapeHTML(item.notes || '')}">
     </label>
 
     <div class="modal-actions">
@@ -513,23 +510,24 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
   document.getElementById('modal-close').addEventListener('click', closeModal);
 
   document.getElementById('save-btn').addEventListener('click', async () => {
-    const multiplier = getNutritionMultiplier(quantity, unit, food);
     item.quantity = quantity;
     item.unit = unit;
     item.notes = notesInput.value;
-    item.nutrients = {
-      kcal: Math.round(baseNutrition.calories * multiplier),
-      protein: Math.round(baseNutrition.protein * multiplier),
-      carbs: Math.round(baseNutrition.carbs * multiplier),
-      fat: Math.round(baseNutrition.fat * multiplier),
-    };
+    item.nutrients = scaleNutrients(food, quantity, unit);
     await put('meals', meal);
     showToast('Food updated');
     closeModal();
     if (onComplete) onComplete();
   });
 
-  document.getElementById('delete-btn').addEventListener('click', async () => {
+  let deleteArmed = false;
+  document.getElementById('delete-btn').addEventListener('click', async (event) => {
+    if (!deleteArmed) {
+      deleteArmed = true;
+      event.currentTarget.textContent = 'Confirm delete';
+      event.currentTarget.setAttribute('aria-label', 'Confirm removal of this food');
+      return;
+    }
     meal.items.splice(foodIndex, 1);
     if (meal.items.length === 0) {
       await softDelete('meals', meal.id);
@@ -544,7 +542,7 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
   updatePreview();
 }
 
-function openMealTypePicker() {
+function openMealTypePicker(targetDate) {
   const modal = document.createElement('div');
   modal.className = 'modal-content';
   modal.innerHTML = `
@@ -570,7 +568,7 @@ function openMealTypePicker() {
     btn.addEventListener('click', () => {
       const meal = btn.dataset.meal;
       closeModal();
-      window.location.hash = `#/search?meal=${meal}`;
+      window.location.hash = `#/search?meal=${meal}&date=${targetDate}`;
     });
   });
 }
@@ -583,8 +581,17 @@ function getMealTypeForTime() {
   return 'snacks';
 }
 
+function isCalendarDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year
+    && date.getMonth() === month - 1
+    && date.getDate() === day;
+}
+
 async function openCopyDayModal(targetDate, onComplete) {
-  const yesterday = addDays(targetDate, -1);
+  const yesterday = addCalendarDays(targetDate, -1);
   const modal = document.createElement('div');
   modal.className = 'modal-content';
   modal.innerHTML = `

@@ -9,7 +9,7 @@
  * @returns {string}
  */
 export function formatDate(dateStr) {
-    const date = new Date(dateStr);
+    const date = toLocalDate(dateStr);
     return date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
@@ -19,8 +19,39 @@ export function formatDate(dateStr) {
  * @returns {string}
  */
 export function formatDateFull(dateStr) {
-    const date = new Date(dateStr);
+    const date = toLocalDate(dateStr);
     return date.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+/**
+ * Parse a calendar date without treating YYYY-MM-DD as UTC.
+ * JavaScript's Date parser interprets bare ISO dates at UTC midnight, which
+ * displays the previous day in time zones west of UTC.
+ * @param {string|Date} value
+ * @returns {Date}
+ */
+export function toLocalDate(value) {
+    if (value instanceof Date) return new Date(value.getTime());
+    if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        const [year, month, day] = value.split('-').map(Number);
+        return new Date(year, month - 1, day);
+    }
+    return new Date(value);
+}
+
+/**
+ * Add calendar days without crossing through UTC conversion.
+ * @param {string} dateStr
+ * @param {number} days
+ * @returns {string}
+ */
+export function addCalendarDays(dateStr, days) {
+    const date = toLocalDate(dateStr);
+    date.setDate(date.getDate() + days);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
 }
 
 /**

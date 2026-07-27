@@ -6,6 +6,22 @@
 
 const DB_NAME = 'librelog';
 const DB_VERSION = 1;
+export const DATA_SCHEMA_VERSION = DB_VERSION;
+export const BACKUP_SCHEMA_VERSION = 1;
+const DATA_STORES = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
+const SENSITIVE_SETTING_KEYS = new Set([
+    'ai_api_key',
+    'usda_api_key',
+    'webdavUrl',
+    'webdavUsername',
+    'webdavPassword',
+    'webdav_url',
+    'webdav_username',
+    'webdav_password',
+    'webdav_connected',
+    'githubPAT',
+    'githubGistId',
+]);
 
 let dbInstance = null;
 
@@ -263,14 +279,75 @@ export async function setSetting(key, value) {
  */
 export async function exportAllData() {
     const db = await openDB();
-    const allStores = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
-    const data = { version: DB_VERSION, exportedAt: now(), stores: {} };
-    for (const name of allStores) {
+    const data = {
+        version: BACKUP_SCHEMA_VERSION,
+        dataVersion: DATA_SCHEMA_VERSION,
+        exportedAt: now(),
+        secretsExcluded: true,
+        stores: {},
+    };
+    for (const name of DATA_STORES) {
         if (!db.objectStoreNames.contains(name)) continue;
         const store = await getStore(name);
-        data.stores[name] = await promisifyRequest(store.getAll());
+        const records = await promisifyRequest(store.getAll());
+        data.stores[name] = name === 'settings'
+            ? records.filter(record => !SENSITIVE_SETTING_KEYS.has(record.key))
+            : records;
     }
     return data;
+}
+
+/**
+ * Validate the outer shape and key fields of an exported backup before any
+ * transaction is opened. Unknown stores are ignored for forward compatibility.
+ * @param {Object} data
+ * @returns {Array<string>} stores that are safe to import
+ */
+export function validateBackupData(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('Backup must be a JSON object');
+    }
+    if (!data.stores || typeof data.stores !== 'object' || Array.isArray(data.stores)) {
+        throw new Error('Backup is missing its data stores');
+    }
+    if (data.version != null && (!Number.isInteger(data.version) || data.version < 1)) {
+        throw new Error('Backup has an invalid schema version');
+    }
+    if (data.version != null && data.version > BACKUP_SCHEMA_VERSION) {
+        throw new Error(`Backup schema version ${data.version} is not supported`);
+    }
+    if (data.dataVersion != null && (!Number.isInteger(data.dataVersion) || data.dataVersion < 1)) {
+        throw new Error('Backup has an invalid data schema version');
+    }
+    if (data.dataVersion != null && data.dataVersion > DATA_SCHEMA_VERSION) {
+        throw new Error(`Data schema version ${data.dataVersion} is not supported`);
+    }
+
+    const available = DATA_STORES.filter(name => Object.hasOwn(data.stores, name));
+    if (available.length === 0) throw new Error('Backup contains no recognized data stores');
+
+    let totalRecords = 0;
+    for (const name of available) {
+        const records = data.stores[name];
+        if (!Array.isArray(records)) throw new Error(`Backup store "${name}" must be an array`);
+        totalRecords += records.length;
+        if (totalRecords > 250_000) {
+            throw new Error('Backup contains too many records');
+        }
+        for (const record of records) {
+            if (!record || typeof record !== 'object' || Array.isArray(record)) {
+                throw new Error(`Backup store "${name}" contains an invalid record`);
+            }
+            if (name === 'settings') {
+                if (typeof record.key !== 'string' || !record.key) {
+                    throw new Error('Backup contains a setting without a valid key');
+                }
+            } else if (typeof record.id !== 'string' || !record.id) {
+                throw new Error(`Backup store "${name}" contains a record without a valid id`);
+            }
+        }
+    }
+    return available;
 }
 
 /**
@@ -280,14 +357,50 @@ export async function exportAllData() {
  * @returns {Promise<void>}
  */
 export async function importAllData(data, merge = false) {
-    const stores = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
-    for (const name of stores) {
-        if (!data.stores[name]) continue;
-        if (!merge) {
-            await hardDeleteAll(name);
+    const stores = validateBackupData(data);
+    const db = await openDB();
+
+    // Credentials never leave the device in exports and must survive a replace
+    // restore. Read them before the all-store transaction begins.
+    const preservedSettings = new Map();
+    if (!merge && stores.includes('settings')) {
+        for (const key of SENSITIVE_SETTING_KEYS) {
+            const value = await getSetting(key, undefined);
+            if (value !== undefined && value !== null && value !== '') {
+                preservedSettings.set(key, value);
+            }
         }
-        await putMany(name, data.stores[name]);
     }
+
+    await new Promise((resolve, reject) => {
+        const tx = db.transaction(stores, 'readwrite');
+
+        try {
+            for (const name of stores) {
+                const store = tx.objectStore(name);
+                if (!merge) store.clear();
+                for (const record of data.stores[name]) {
+                    if (name === 'settings' && SENSITIVE_SETTING_KEYS.has(record.key)) continue;
+                    store.put(structuredClone(record));
+                }
+            }
+
+            if (!merge && stores.includes('settings')) {
+                const settingsStore = tx.objectStore('settings');
+                for (const [key, value] of preservedSettings) {
+                    settingsStore.put({ key, value, updatedAt: now() });
+                }
+            }
+        } catch (error) {
+            tx.abort();
+            reject(error);
+            return;
+        }
+
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Import transaction failed'));
+        tx.onabort = () => reject(tx.error || new Error('Import transaction was aborted'));
+    });
 }
 
 /**
@@ -295,8 +408,7 @@ export async function importAllData(data, merge = false) {
  * @returns {Promise<void>}
  */
 export async function clearAllData() {
-    const stores = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
-    for (const name of stores) {
+    for (const name of DATA_STORES) {
         await hardDeleteAll(name);
     }
 }
