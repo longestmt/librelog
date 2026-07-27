@@ -7,3 +7,6 @@ dist/
 PRD.md
 README-SPECIFICATION.md
 TECHNICAL-SPEC-INDEX.md
+START-HERE.txt
+test-results/
+playwright-report/

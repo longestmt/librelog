@@ -9,12 +9,22 @@ import { showToast } from '../components/toast.js';
  * @param {HTMLElement} container
  * @param {string} queryString
  */
-export function renderWeightPage(container, queryString) {
+export async function renderWeightPage(container, queryString) {
+  let submitInProgress = false;
+
   async function render() {
     const allEntries = await getAll('measurements');
     // Sort by date ascending for chart/stats, then reverse for history
     const sorted = allEntries
-      .filter(e => e.weight != null)
+      .filter(e => Number.isFinite(Number(e.weight)) && Number(e.weight) > 0)
+      .map(e => ({
+        ...e,
+        weight: Number(e.weight),
+        bodyFat: e.bodyFat != null && e.bodyFat !== '' && Number.isFinite(Number(e.bodyFat))
+          ? Number(e.bodyFat)
+          : null,
+        unit: e.unit === 'lb' ? 'lb' : 'kg',
+      }))
       .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
 
     const chartEntries = sorted.slice(-30);
@@ -66,7 +76,7 @@ export function renderWeightPage(container, queryString) {
     const deltaClass = delta > 0 ? 'weight-gain' : delta < 0 ? 'weight-loss' : '';
 
     container.innerHTML = `
-      <div class="weight-page" role="main" aria-label="Weight tracker">
+      <div class="weight-page">
 
         <!-- Header -->
         <div class="weight-header" role="banner">
@@ -149,9 +159,9 @@ export function renderWeightPage(container, queryString) {
                   const highlight = isMin ? 'weight-bar--min' : isMax ? 'weight-bar--max' : '';
                   const dateLabel = (entry.date || '').slice(5); // MM-DD
                   return `
-                    <div class="weight-bar-col" title="${entry.date}: ${entry.weight} ${entry.unit || 'kg'}">
+                    <div class="weight-bar-col" title="${escapeHTML(entry.date || '')}: ${entry.weight} ${escapeHTML(entry.unit || 'kg')}">
                       <span class="weight-bar-value ${highlight}">${entry.weight}</span>
-                      <div class="weight-bar ${highlight}" style="height: ${Math.max(heightPct, 2)}%;" aria-label="${entry.date}: ${entry.weight} ${entry.unit || 'kg'}"></div>
+                      <div class="weight-bar ${highlight}" style="height: ${Math.max(heightPct, 2)}%;" aria-label="${escapeHTML(entry.date || '')}: ${entry.weight} ${escapeHTML(entry.unit || 'kg')}"></div>
                       <span class="weight-bar-date">${escapeHTML(dateLabel)}</span>
                     </div>
                   `;
@@ -205,13 +215,13 @@ export function renderWeightPage(container, queryString) {
           ` : `
             <div class="weight-history-list" role="list">
               ${historySorted.map(entry => `
-                <div class="weight-history-row" role="listitem" data-id="${entry.id}">
+                <div class="weight-history-row" role="listitem" data-id="${escapeHTML(String(entry.id))}">
                   <div class="weight-history-info">
                     <span class="weight-history-date">${escapeHTML(entry.date || '')}</span>
                     <span class="weight-history-value">${entry.weight} ${escapeHTML(entry.unit || 'kg')}</span>
                     ${entry.bodyFat != null ? `<span class="weight-history-bf">${entry.bodyFat}% BF</span>` : ''}
                   </div>
-                  <button class="btn btn-ghost btn-icon weight-delete-btn" data-id="${entry.id}" aria-label="Delete entry from ${escapeHTML(entry.date || '')}" tabindex="0">
+                  <button class="btn btn-ghost btn-icon weight-delete-btn" data-id="${escapeHTML(String(entry.id))}" aria-label="Delete entry from ${escapeHTML(entry.date || '')}" tabindex="0">
                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                   </button>
                 </div>
@@ -236,6 +246,7 @@ export function renderWeightPage(container, queryString) {
     // Quick-add form submit
     document.getElementById('weight-quick-form').addEventListener('submit', async (e) => {
       e.preventDefault();
+      if (submitInProgress) return;
 
       const date = document.getElementById('weight-date').value;
       const weight = parseFloat(document.getElementById('weight-value').value);
@@ -248,15 +259,30 @@ export function renderWeightPage(container, queryString) {
         return;
       }
 
-      await put('measurements', {
-        date,
-        weight,
-        unit,
-        bodyFat,
-      });
+      submitInProgress = true;
+      const submitButton = e.currentTarget.querySelector('[type="submit"]');
+      submitButton.disabled = true;
+      submitButton.textContent = 'Logging…';
+      try {
+        await put('measurements', {
+          date,
+          weight,
+          unit,
+          bodyFat,
+        });
 
-      showToast('Weight logged');
-      render();
+        showToast('Weight logged');
+        await render();
+      } catch (error) {
+        console.error('Weight log failed:', error);
+        showToast('Could not log weight', 'error');
+      } finally {
+        submitInProgress = false;
+        if (submitButton.isConnected) {
+          submitButton.disabled = false;
+          submitButton.textContent = 'Log';
+        }
+      }
     });
 
     // Delete buttons
@@ -323,5 +349,5 @@ export function renderWeightPage(container, queryString) {
     });
   }
 
-  render();
+  await render();
 }

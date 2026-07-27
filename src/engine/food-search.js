@@ -98,6 +98,7 @@ function calculateRelevance(food, query) {
  * @param {Object} [options.sources] - Which sources to include { local, usda, off }
  * @param {number} [options.offPage=1] - OFF page number for pagination
  * @param {number} [options.usdaPage=1] - USDA page number for pagination
+ * @param {AbortSignal} [options.signal] - Stops remote requests
  * @returns {Promise<Array>} Combined results sorted by relevance
  */
 async function searchFoods(query, options = {}) {
@@ -107,7 +108,8 @@ async function searchFoods(query, options = {}) {
     apiPageSize = 20,
     sources = { local: true, usda: true, off: true },
     offPage = 1,
-    usdaPage = 1
+    usdaPage = 1,
+    signal = null,
   } = options;
 
   if (!query || query.trim().length === 0) {
@@ -163,7 +165,8 @@ async function searchFoods(query, options = {}) {
         apiResults = await openfoodfacts.searchFoods(
           queryTrim,
           offPage,
-          apiPageSize
+          apiPageSize,
+          { signal },
         );
 
         if (apiResults && apiResults.length > 0) {
@@ -213,7 +216,7 @@ async function searchFoods(query, options = {}) {
           let usdaResults = await getCached('usda', usdaCacheKey);
 
           if (!usdaResults) {
-            usdaResults = await usda.searchFoods(queryTrim, usdaPage, apiPageSize);
+            usdaResults = await usda.searchFoods(queryTrim, usdaPage, apiPageSize, { signal });
             if (usdaResults && usdaResults.length > 0) {
               await setCache('usda', usdaCacheKey, usdaResults, 30 * 86400);
             }
@@ -328,16 +331,15 @@ async function getRecentFoods(limit = 10) {
  */
 async function getFavoriteFoods(limit = 10) {
   try {
-    const meals = await getAll(MEALS_STORE_NAME);
-
-    if (!meals || meals.length === 0) {
-      return [];
-    }
+    const [meals, foods] = await Promise.all([
+      getAll(MEALS_STORE_NAME),
+      getAll(LOCAL_STORE_NAME),
+    ]);
 
     // Count occurrences of each foodId
     const foodIdFrequency = new Map();
 
-    for (const meal of meals) {
+    for (const meal of meals || []) {
       if (meal.isDeleted || !meal.items || meal.items.length === 0) {
         continue;
       }
@@ -352,32 +354,17 @@ async function getFavoriteFoods(limit = 10) {
       }
     }
 
-    // Fetch food objects for each unique foodId
-    const foods = await getAll(LOCAL_STORE_NAME);
-    const foodsMap = new Map();
-
-    if (foods) {
-      for (const food of foods) {
-        if (!food.isDeleted && food.id) {
-          foodsMap.set(food.id, food);
-        }
-      }
-    }
-
-    // Build results with frequency count
-    const results = [];
-
-    for (const [foodId, frequency] of foodIdFrequency.entries()) {
-      const food = foodsMap.get(foodId);
-      if (food) {
-        food._frequency = frequency;
-        results.push(food);
-      }
-    }
-
-    // Sort by frequency (most frequent first) and limit
-    return results
-      .sort((a, b) => (b._frequency || 0) - (a._frequency || 0))
+    return (foods || [])
+      .filter(food => !food.isDeleted
+        && food.id
+        && (food.favorite || foodIdFrequency.has(food.id)))
+      .map(food => ({
+        ...food,
+        _frequency: foodIdFrequency.get(food.id) || 0,
+      }))
+      .sort((a, b) => Number(b.favorite) - Number(a.favorite)
+        || (b._frequency || 0) - (a._frequency || 0)
+        || String(a.name).localeCompare(String(b.name)))
       .slice(0, limit)
       .map(food => {
         delete food._frequency;

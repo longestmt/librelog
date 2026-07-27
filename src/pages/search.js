@@ -6,11 +6,17 @@
 import { getById, put } from '../data/db.js';
 import { searchFoods, getRecentFoods, getFavoriteFoods } from '../engine/food-search.js';
 import { lookupBarcode } from '../integrations/openfoodfacts.js';
-import { todayStr } from '../utils/format.js';
+import { todayStr, formatDate } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
+import {
+  hasPrivacyConsent,
+  requestPrivacyConsent,
+} from '../components/privacy-consent.js';
 import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
+import { scaleNutrients } from '../engine/nutrition.js';
+import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 
 const MEAL_TYPES = ['Breakfast', 'Lunch', 'Dinner', 'Snacks'];
 const MODES = [
@@ -32,11 +38,13 @@ async function loadImageProcessor() { if (imageProcessorMod) return imageProcess
 async function loadVoiceParser() { if (voiceParserMod) return voiceParserMod; try { voiceParserMod = await import('../integrations/voiceParser.js'); return voiceParserMod; } catch { return null; } }
 async function loadClarification() { if (clarificationMod) return clarificationMod; try { clarificationMod = await import('../integrations/clarificationEngine.js'); return clarificationMod; } catch { return null; } }
 
-export function renderSearchPage(container, queryString) {
+export async function renderSearchPage(container, queryString) {
   const params = new URLSearchParams(queryString);
   const mealTypeParam = params.get('meal') || 'lunch';
   let mealType = mealTypeParam.charAt(0).toUpperCase() + mealTypeParam.slice(1);
   let mode = params.get('mode') || 'search';
+  const dateParam = params.get('date');
+  const targetDate = isCalendarDate(dateParam) ? dateParam : todayStr();
 
   let searchQuery = '';
   let searchResults = [];
@@ -58,8 +66,25 @@ export function renderSearchPage(container, queryString) {
   let isRecording = false;
   let amplitudeInterval = null;
   let aiProvider = null;
+  let aiLogInProgress = false;
+  let aiLogBatchKey = createIdempotencyKey('ai');
+  let searchSequence = 0;
+  let preselectedHandled = false;
+  let aiAbortController = null;
+  let searchAbortController = null;
+  let disposed = false;
+  let privacySourcesInitialized = false;
 
   async function render() {
+    if (!privacySourcesInitialized) {
+      const [offConsent, usdaConsent] = await Promise.all([
+        hasPrivacyConsent('openfoodfacts'),
+        hasPrivacyConsent('usda'),
+      ]);
+      searchSources.off = offConsent;
+      searchSources.usda = usdaConsent;
+      privacySourcesInitialized = true;
+    }
     // Determine which modes to show based on AI config
     const ai = await loadAI();
     const aiConfigured = ai ? await ai.isAIConfigured() : false;
@@ -75,7 +100,8 @@ export function renderSearchPage(container, queryString) {
     if (!visibleModes.some(m => m.key === mode)) mode = 'search';
 
     container.innerHTML = `
-      <div class="search-page" role="main" aria-label="Add food">
+      <div class="search-page">
+        <h1 class="sr-only">Add food</h1>
         <!-- Header: mode tabs + meal type badge in one row -->
         <div class="search-top-bar">
           <div class="search-mode-tabs" role="tablist" aria-label="Add food method">
@@ -86,7 +112,7 @@ export function renderSearchPage(container, queryString) {
               </button>
             `).join('')}
           </div>
-          <button class="meal-type-badge" id="meal-type-toggle" aria-label="Logging to ${mealType}. Tap to change.">${mealType}</button>
+          <button class="meal-type-badge" id="meal-type-toggle" aria-label="Logging to ${mealType} on ${formatDate(targetDate)}. Tap to change.">${mealType} · ${formatDate(targetDate)}</button>
         </div>
 
         <!-- Mode content -->
@@ -99,8 +125,8 @@ export function renderSearchPage(container, queryString) {
     document.getElementById('meal-type-toggle')?.addEventListener('click', () => {
       const idx = MEAL_TYPES.indexOf(mealType);
       mealType = MEAL_TYPES[(idx + 1) % MEAL_TYPES.length];
-      document.getElementById('meal-type-toggle').textContent = mealType;
-      document.getElementById('meal-type-toggle').setAttribute('aria-label', `Logging to ${mealType}. Tap to change.`);
+      document.getElementById('meal-type-toggle').textContent = `${mealType} · ${formatDate(targetDate)}`;
+      document.getElementById('meal-type-toggle').setAttribute('aria-label', `Logging to ${mealType} on ${formatDate(targetDate)}. Tap to change.`);
     });
 
     // Mode tabs
@@ -167,7 +193,12 @@ export function renderSearchPage(container, queryString) {
     const searchInput = document.getElementById('food-search-input');
     searchInput.focus();
     bindFoodResultEvents([...recentFoods, ...frequentFoods]);
-    document.getElementById('add-custom-food-btn')?.addEventListener('click', openCustomFoodForm);
+    document.getElementById('add-custom-food-btn')?.addEventListener('click', () => openCustomFoodForm(mealType, targetDate));
+    if (!preselectedHandled && params.get('foodId')) {
+      preselectedHandled = true;
+      const preselectedFood = await getById('foods', params.get('foodId'));
+      if (preselectedFood) openPortionModal(preselectedFood, mealType, targetDate);
+    }
 
     // Filter toggle
     const filterBtn = document.getElementById('filter-toggle-btn');
@@ -179,8 +210,12 @@ export function renderSearchPage(container, queryString) {
 
     // Source filter chips
     document.querySelectorAll('.source-filter-chip').forEach(chip => {
-      chip.addEventListener('click', () => {
+      chip.addEventListener('click', async () => {
         const source = chip.dataset.source;
+        if (source !== 'local' && !searchSources[source]) {
+          const consent = await requestFoodSourceConsent(source);
+          if (!consent) return;
+        }
         searchSources[source] = !searchSources[source];
         if (!searchSources.local && !searchSources.usda && !searchSources.off) {
           searchSources[source] = true;
@@ -197,7 +232,11 @@ export function renderSearchPage(container, queryString) {
     searchInput.addEventListener('input', (e) => {
       searchQuery = e.target.value.trim();
       clearTimeout(searchTimeout);
-      if (!searchQuery) { renderSearchMode(el); return; }
+      if (!searchQuery) {
+        searchSequence++;
+        renderSearchMode(el);
+        return;
+      }
       offPage = 1;
       usdaPage = 1;
       // Auto-detect barcode
@@ -211,17 +250,39 @@ export function renderSearchPage(container, queryString) {
   async function performTextSearch(loadMore = false) {
     const area = document.getElementById('search-results-area');
     if (!area) return;
+    const requestedQuery = searchQuery;
+    const sequence = ++searchSequence;
+    searchAbortController?.abort();
+    searchAbortController = new AbortController();
+    const { signal } = searchAbortController;
     if (!loadMore) {
       area.innerHTML = '<div class="search-loading">Searching...</div>';
     }
     try {
-      const newResults = await searchFoods(searchQuery, {
+      if (!loadMore && searchSources.local) {
+        const localResults = await searchFoods(requestedQuery, {
+          localOnly: true,
+          limit: 50,
+          sources: { local: true, usda: false, off: false },
+        });
+        if (sequence !== searchSequence || requestedQuery !== searchQuery) return;
+        if (localResults.length > 0) {
+          searchResults = localResults;
+          renderSearchResults(area, searchResults, {
+            loadingRemote: searchSources.usda || searchSources.off,
+          });
+        }
+      }
+
+      const newResults = await searchFoods(requestedQuery, {
         localOnly: false,
         limit: 50,
         sources: searchSources,
         offPage,
-        usdaPage
+        usdaPage,
+        signal,
       });
+      if (sequence !== searchSequence || requestedQuery !== searchQuery) return;
       if (loadMore) {
         searchResults = [...searchResults, ...newResults];
       } else {
@@ -229,28 +290,42 @@ export function renderSearchPage(container, queryString) {
       }
       if (!searchResults?.length) {
         area.innerHTML = `<div class="search-empty"><p>No foods found for "${escapeHTML(searchQuery)}"</p></div><div class="search-actions"><button class="btn btn-outline" id="add-custom-food-btn">Add Custom Food</button></div>`;
-        document.getElementById('add-custom-food-btn')?.addEventListener('click', openCustomFoodForm);
+        document.getElementById('add-custom-food-btn')?.addEventListener('click', () => openCustomFoodForm(mealType, targetDate));
         return;
       }
-      const hasRemoteSources = searchSources.usda || searchSources.off;
-      const loadMoreBtn = hasRemoteSources ? '<button class="btn btn-outline" id="load-more-btn">Load More</button>' : '';
-      area.innerHTML = `<section class="search-section"><h3 class="section-title">Results</h3><div class="food-results">${searchResults.map(f => renderFoodResult(f)).join('')}</div></section><div class="search-actions">${loadMoreBtn}<button class="btn btn-outline" id="add-custom-food-btn">Add Custom Food</button></div>`;
-      bindFoodResultEvents(searchResults);
-      document.getElementById('add-custom-food-btn')?.addEventListener('click', openCustomFoodForm);
-      document.getElementById('load-more-btn')?.addEventListener('click', () => {
-        if (searchSources.off) offPage++;
-        if (searchSources.usda) usdaPage++;
-        performTextSearch(true);
-      });
+      renderSearchResults(area, searchResults);
     } catch (err) {
       console.error('Search error:', err);
       area.innerHTML = '<div class="search-error"><p>Search failed. Please try again.</p></div>';
     }
   }
 
+  function renderSearchResults(area, foods, { loadingRemote = false } = {}) {
+    const hasRemoteSources = searchSources.usda || searchSources.off;
+    const status = loadingRemote
+      ? '<p class="search-loading" role="status">Showing local matches while food databases load…</p>'
+      : '';
+    const loadMoreBtn = hasRemoteSources && !loadingRemote
+      ? '<button class="btn btn-outline" id="load-more-btn">Load More</button>'
+      : '';
+    area.innerHTML = `${status}<section class="search-section"><h3 class="section-title">Results</h3><div class="food-results">${foods.map(f => renderFoodResult(f)).join('')}</div></section><div class="search-actions">${loadMoreBtn}<button class="btn btn-outline" id="add-custom-food-btn">Add Custom Food</button></div>`;
+    bindFoodResultEvents(foods);
+    document.getElementById('add-custom-food-btn')?.addEventListener('click', () => openCustomFoodForm(mealType, targetDate));
+    document.getElementById('load-more-btn')?.addEventListener('click', () => {
+      if (searchSources.off) offPage++;
+      if (searchSources.usda) usdaPage++;
+      performTextSearch(true);
+    });
+  }
+
   async function performBarcodeLookup(code) {
     const area = document.getElementById('search-results-area');
     if (!area) return;
+    const consent = await requestFoodSourceConsent('off');
+    if (!consent) {
+      area.innerHTML = '<div class="search-empty"><p>Remote barcode lookup is off. Local foods remain available.</p></div>';
+      return;
+    }
     area.innerHTML = '<div class="search-loading">Looking up barcode...</div>';
     try {
       const food = await lookupBarcode(code);
@@ -335,6 +410,11 @@ export function renderSearchPage(container, queryString) {
   async function handleBarcodeResult(code) {
     const resultDiv = document.getElementById('scan-result');
     if (!resultDiv) return;
+    const consent = await requestFoodSourceConsent('off');
+    if (!consent) {
+      resultDiv.innerHTML = '<div class="search-empty"><p>Remote barcode lookup is off.</p></div>';
+      return;
+    }
     resultDiv.innerHTML = '<div class="search-loading">Looking up barcode...</div>';
     try {
       const food = await lookupBarcode(code);
@@ -360,7 +440,7 @@ export function renderSearchPage(container, queryString) {
             <button class="ai-photo-remove" id="ai-remove-photo" aria-label="Remove photo">&#10005;</button>
           </div>
         ` : ''}
-        <textarea class="ai-text-area" id="ai-text-input" rows="3" placeholder="Describe what you ate, attach a photo, or both..." aria-label="Describe your meal">${escapeHTML(aiTextValue)}</textarea>
+        <textarea class="ai-text-area" id="ai-text-input" rows="3" maxlength="2000" placeholder="Describe what you ate, attach a photo, or both..." aria-label="Describe your meal">${escapeHTML(aiTextValue)}</textarea>
         <div class="ai-input-actions">
           <button class="btn btn-secondary btn-small" id="ai-photo-btn" aria-label="Attach photo">
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
@@ -428,6 +508,14 @@ export function renderSearchPage(container, queryString) {
   async function handlePhotoAttach(e) {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showToast('Choose an image file');
+      return;
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      showToast('Choose an image smaller than 15 MB');
+      return;
+    }
     aiAttachedPhoto = await fileToDataUrl(file);
     renderModeContent();
   }
@@ -461,28 +549,44 @@ export function renderSearchPage(container, queryString) {
   }
 
   async function processAIInput() {
+    if (aiProcessing) return;
     const text = document.getElementById('ai-text-input')?.value.trim() || '';
     if (!text && !aiAttachedPhoto) { showToast('Add a photo or describe your meal'); return; }
-    const ai = await loadAI();
-    if (!ai || !(await ai.isAIConfigured())) { showToast('Set up an AI provider in Settings first'); return; }
     aiProcessing = true;
     aiResults = null;
+    aiLogBatchKey = createIdempotencyKey('ai');
     renderModeContent();
+    const ai = await loadAI();
+    if (!ai || !(await ai.isAIConfigured())) {
+      aiProcessing = false;
+      renderModeContent();
+      showToast('Set up an AI provider in Settings first');
+      return;
+    }
+    aiAbortController?.abort();
+    aiAbortController = new AbortController();
+    const { signal } = aiAbortController;
     try {
       if (aiAttachedPhoto) {
         // Photo mode (with optional text context)
         const proc = await loadImageProcessor();
-        const result = await proc.analyzeImage(aiAttachedPhoto);
+        const result = await proc.analyzeImage(aiAttachedPhoto, text, { signal });
+        if (signal.aborted || disposed) return;
         aiResults = result.success ? result : { foods: [], error: result.error };
       } else {
         // Text-only mode
         const vp = await loadVoiceParser();
-        const parsed = await vp.parseTranscription(text);
+        const parsed = await vp.parseTranscription(text, { signal });
+        if (signal.aborted || disposed) return;
         aiResults = parsed.success ? parsed : { foods: [], error: parsed.error };
       }
-      if (aiResults?.foods?.length) await checkClarification();
-    } catch { aiResults = { foods: [], error: 'AI analysis failed' }; }
+      if (aiResults?.foods?.length) await checkClarification(signal);
+    } catch {
+      if (!signal.aborted) aiResults = { foods: [], error: 'AI analysis failed' };
+    }
+    if (signal.aborted || disposed) return;
     aiProcessing = false;
+    aiAbortController = null;
     aiTextValue = '';
     aiAttachedPhoto = null;
     renderModeContent();
@@ -496,7 +600,7 @@ export function renderSearchPage(container, queryString) {
   }
 
   // ===== CLARIFICATION =====
-  async function checkClarification() {
+  async function checkClarification(signal) {
     const engine = await loadClarification();
     if (!engine) {
       clarificationData = null;
@@ -507,7 +611,7 @@ export function renderSearchPage(container, queryString) {
       return;
     }
     try {
-      clarificationData = await engine.generateClarifications(aiResults.foods);
+      clarificationData = await engine.generateClarifications(aiResults.foods, [], { signal });
       if (!clarificationData?.questions?.length) clarificationData = null;
     } catch {
       clarificationData = null;
@@ -603,12 +707,25 @@ export function renderSearchPage(container, queryString) {
             const f = food.nutrients?.macros?.fat?.g || 0;
             const qty = food.servingSize?.quantity || 100;
             const unit = food.servingSize?.unit || 'g';
-            return `<div class="ai-food-item"><label class="ai-food-row">
-              <input type="checkbox" class="ai-food-check" data-index="${i}" checked>
-              <div class="ai-food-info"><div class="ai-food-name">${escapeHTML(food.name)}</div><div class="ai-food-portion">${qty} ${unit}</div></div>
+            const assumptions = food._aiMeta?.assumptions || [];
+            return `<div class="ai-food-item">
+              <div class="ai-food-row">
+              <input type="checkbox" class="ai-food-check" data-index="${i}" checked aria-label="Log ${escapeHTML(food.name)}">
+              <div class="ai-food-info">
+                <label><span class="sr-only">Food name</span><input class="form-input ai-food-edit" data-index="${i}" data-field="name" value="${escapeHTML(food.name)}"></label>
+                <div class="form-row">
+                  <label><span class="sr-only">Quantity</span><input type="number" min="0.01" max="10000" step="0.1" class="form-input ai-food-edit" data-index="${i}" data-field="quantity" value="${qty}"></label>
+                  <label><span class="sr-only">Unit</span><input class="form-input ai-food-edit" data-index="${i}" data-field="unit" value="${escapeHTML(unit)}"></label>
+                </div>
+              </div>
               <div class="ai-food-nutrition"><span class="ai-food-kcal">${Math.round(kcal)} kcal</span><span class="ai-food-macros">${Math.round(p)}P ${Math.round(c)}C ${Math.round(f)}F</span></div>
               <span class="ai-confidence ai-confidence-${cls}">${pct}%</span>
-            </label></div>`;
+              </div>
+              <div class="form-row ai-nutrition-edit">
+                ${[['calories', kcal], ['protein', p], ['carbs', c], ['fat', f]].map(([field, value]) => `<label><span class="control-label">${field === 'calories' ? 'kcal' : field}</span><input type="number" min="0" step="0.1" class="form-input ai-food-edit" data-index="${i}" data-field="${field}" value="${value}"></label>`).join('')}
+              </div>
+              ${assumptions.length ? `<details class="ai-assumptions"><summary>Estimate assumptions</summary><ul>${assumptions.map(item => `<li>${escapeHTML(item)}</li>`).join('')}</ul></details>` : ''}
+            </div>`;
           }).join('')}
         </div>
         <div class="ai-results-actions">
@@ -628,38 +745,76 @@ export function renderSearchPage(container, queryString) {
         if (btn) btn.textContent = `Log Selected (${n})`;
       });
     });
+    document.querySelectorAll('.ai-food-edit').forEach(input => {
+      input.addEventListener('change', () => {
+        const food = aiResults.foods[Number(input.dataset.index)];
+        if (!food) return;
+        const field = input.dataset.field;
+        const numericFields = new Set(['quantity', 'calories', 'protein', 'carbs', 'fat']);
+        const value = numericFields.has(field) ? Number(input.value) : input.value.trim();
+        if (numericFields.has(field) && (!Number.isFinite(value) || value < 0)) {
+          showToast('Enter a valid non-negative number');
+          renderModeContent();
+          return;
+        }
+        if (field === 'name') food.name = value || 'Food estimate';
+        if (field === 'quantity') food.servingSize.quantity = Math.max(0.01, value);
+        if (field === 'unit') food.servingSize.unit = value || 'g';
+        if (field === 'calories') food.nutrients.energy.kcal = value;
+        if (field === 'protein') food.nutrients.macros.protein.g = value;
+        if (field === 'carbs') food.nutrients.macros.carbs.g = value;
+        if (field === 'fat') food.nutrients.macros.fat.g = value;
+        food._aiMeta = { ...(food._aiMeta || {}), edited: true };
+        renderModeContent();
+      });
+    });
     document.getElementById('ai-confirm-btn')?.addEventListener('click', confirmAIFoods);
   }
 
   async function confirmAIFoods() {
-    if (!aiResults?.foods) return;
+    if (!aiResults?.foods || aiLogInProgress) return;
     const checked = Array.from(document.querySelectorAll('.ai-food-check:checked')).map(cb => parseInt(cb.dataset.index));
     if (checked.length === 0) { showToast('Select at least one food'); return; }
+    aiLogInProgress = true;
+    const confirmButton = document.getElementById('ai-confirm-btn');
+    if (confirmButton) {
+      confirmButton.disabled = true;
+      confirmButton.textContent = 'Logging…';
+    }
     let logged = 0;
-    for (const idx of checked) {
-      const food = aiResults.foods[idx];
-      if (!food) continue;
-      if (!food.id) food.id = `ai-${Date.now()}-${idx}`;
-      await put('foods', food);
-      const qty = food.servingSize?.quantity || 100;
-      const unit = food.servingSize?.unit || 'g';
-      const mult = getNutritionMultiplier(qty, unit, food);
-      await put('meals', {
-        id: generateId(), date: todayStr(), type: mealType.toLowerCase(),
-        items: [{ foodId: food.id, quantity: qty, unit, notes: `AI estimate`, nutrients: {
-          kcal: (food.nutrients?.energy?.kcal || 0) * mult,
-          protein: (food.nutrients?.macros?.protein?.g || 0) * mult,
-          carbs: (food.nutrients?.macros?.carbs?.g || 0) * mult,
-          fat: (food.nutrients?.macros?.fat?.g || 0) * mult,
-          fiber: (food.nutrients?.fiber?.g || 0) * mult,
-          sodium: (food.nutrients?.sodium?.mg || 0) * mult,
-        }}],
-        createdAt: new Date().toISOString(),
-      });
-      logged++;
+    try {
+      for (const idx of checked) {
+        const food = aiResults.foods[idx];
+        if (!food) continue;
+        if (!food.id) food.id = `ai-${Date.now()}-${idx}`;
+        await put('foods', food);
+        const qty = food.servingSize?.quantity ?? 100;
+        const unit = food.servingSize?.unit || 'g';
+        await createMeal({
+          date: targetDate, type: mealType.toLowerCase(),
+          items: [{
+            foodId: food.id,
+            quantity: qty,
+            unit,
+            notes: 'AI estimate — review assumptions in the saved food',
+            nutrients: scaleNutrients(food, qty, unit),
+          }],
+          createdAt: new Date().toISOString(),
+        }, { idempotencyKey: `${aiLogBatchKey}:${idx}` });
+        logged++;
+      }
+    } catch (error) {
+      console.error('AI log error:', error);
+      showToast('Could not finish logging the selected foods');
+      aiLogInProgress = false;
+      if (confirmButton) {
+        confirmButton.disabled = false;
+        confirmButton.textContent = `Log Selected (${checked.length})`;
+      }
+      return;
     }
     showToast(`Logged ${logged} food${logged !== 1 ? 's' : ''}`);
-    setTimeout(() => { window.location.hash = '#/diary'; }, 500);
+    setTimeout(() => { window.location.hash = `#/diary?date=${targetDate}`; }, 500);
   }
 
   // ===== SHARED HELPERS =====
@@ -668,16 +823,43 @@ export function renderSearchPage(container, queryString) {
       const handler = async () => {
         const foodId = el.dataset.foodId;
         const food = foods.find(f => f.id === foodId) || await getById('foods', foodId);
-        if (food) openPortionModal(food, mealType);
+        if (food) openPortionModal(food, mealType, targetDate);
       };
       el.addEventListener('click', handler);
       el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handler(); } });
     });
   }
 
-  render();
+  await render();
   // Cleanup on navigate away
-  return () => { stopScanner(); stopVoice(); };
+  return () => {
+    disposed = true;
+    aiAbortController?.abort();
+    aiAbortController = null;
+    searchAbortController?.abort();
+    searchAbortController = null;
+    searchSequence++;
+    clearTimeout(searchTimeout);
+    stopScanner();
+    stopVoice();
+  };
+}
+
+function requestFoodSourceConsent(source) {
+  if (source === 'usda') {
+    return requestPrivacyConsent({
+      key: 'usda',
+      title: 'Use USDA FoodData Central?',
+      message: 'LibreLog sends food search terms and food identifiers to USDA FoodData Central. LibreLog does not send your diary history.',
+      confirmLabel: 'Use USDA Search',
+    });
+  }
+  return requestPrivacyConsent({
+    key: 'openfoodfacts',
+    title: 'Use Open Food Facts?',
+    message: 'LibreLog sends food search terms and barcodes to Open Food Facts. LibreLog does not send your diary history.',
+    confirmLabel: 'Use Open Food Facts',
+  });
 }
 
 // ===== STANDALONE FUNCTIONS =====
@@ -689,24 +871,41 @@ function renderFoodResult(food) {
   const macroSummary = `${Math.round(protein)}P ${Math.round(carbs)}C ${Math.round(fat)}F`;
   const servingLabel = food.servingSize ? `${food.servingSize.quantity} ${food.servingSize.unit}` : '100g';
   const sourceType = food.source?.type || '';
-  const sourceClass = sourceType === 'openFoodFacts' ? 'off' : sourceType;
-  const sourceLabel = sourceType === 'openFoodFacts' ? 'OFF' : sourceType.toUpperCase();
-  const sourceBadge = sourceType ? `<span class="source-badge ${sourceClass}">${sourceLabel}</span>` : '';
+  const sourceClass = {
+    openFoodFacts: 'off',
+    usda: 'usda',
+    local: 'local',
+    custom: 'custom',
+    seed: 'seed',
+    myfitnesspal: 'myfitnesspal',
+    'ai-photo': 'ai',
+    'ai-voice': 'ai',
+    'ai-text': 'ai',
+  }[sourceType] || 'other';
+  const sourceLabel = sourceType === 'openFoodFacts' ? 'OFF' : sourceType.toUpperCase().slice(0, 24);
+  const sourceBadge = sourceType ? `<span class="source-badge ${sourceClass}">${escapeHTML(sourceLabel)}</span>` : '';
+  const safeId = escapeHTML(String(food.id || ''));
+  const safeServingLabel = escapeHTML(String(servingLabel));
   return `
-    <div class="food-result-item" data-food-id="${food.id}" role="button" tabindex="0" aria-label="${escapeHTML(food.name)}, ${Math.round(kcal)} calories per ${servingLabel}">
+    <div class="food-result-item" data-food-id="${safeId}" role="button" tabindex="0" aria-label="${escapeHTML(food.name)}, ${Math.round(kcal)} calories per ${safeServingLabel}">
       <div class="food-result-info">
         <div class="food-result-name">${escapeHTML(food.name)}</div>
         ${food.brand ? `<div class="food-result-brand">${escapeHTML(food.brand)}</div>` : ''}
-        <div class="food-result-meta"><span class="kcal-badge">${Math.round(kcal)} kcal/${servingLabel}</span><span class="macro-summary">${macroSummary}</span>${sourceBadge}</div>
+        <div class="food-result-meta"><span class="kcal-badge">${Math.round(kcal)} kcal/${safeServingLabel}</span><span class="macro-summary">${macroSummary}</span>${sourceBadge}</div>
       </div>
       <div class="food-result-action" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"></polyline></svg></div>
     </div>
   `;
 }
 
-function openPortionModal(food, mealType) {
+function openPortionModal(food, mealType, targetDate = todayStr()) {
   const baseNutrition = { calories: food.nutrients?.energy?.kcal || 0, protein: food.nutrients?.macros?.protein?.g || 0, carbs: food.nutrients?.macros?.carbs?.g || 0, fat: food.nutrients?.macros?.fat?.g || 0 };
-  let quantity = 100, unit = food.servingSize?.unit || 'g', selectedMealType = mealType;
+  let quantity = Number(food.usualServing?.quantity) > 0
+    ? Number(food.usualServing.quantity)
+    : (Number(food.servingSize?.quantity) > 0 ? Number(food.servingSize.quantity) : 100);
+  let unit = food.usualServing?.unit || food.servingSize?.unit || 'g', selectedMealType = mealType;
+  let logInProgress = false;
+  const idempotencyKey = createIdempotencyKey('food');
   const availableUnits = getUnitsForFood(food);
 
   function updatePreview() {
@@ -721,11 +920,13 @@ function openPortionModal(food, mealType) {
     <div class="modal-header"><div><h2>${escapeHTML(food.name)}</h2>${food.brand ? `<p class="modal-subtitle">${escapeHTML(food.brand)}</p>` : ''}</div><button class="modal-close" id="modal-close" aria-label="Close">✕</button></div>
     <div class="portion-controls">
       <label class="control-group"><span class="control-label">Quantity</span><div class="quantity-input-group"><button class="qty-btn qty-minus" id="qty-minus" aria-label="Decrease">−</button><input type="number" class="qty-input" id="qty-input" value="${quantity}" min="0.1" step="0.1" aria-label="Quantity"><button class="qty-btn qty-plus" id="qty-plus" aria-label="Increase">+</button></div></label>
-      <label class="control-group"><span class="control-label">Unit</span><select class="unit-select" id="unit-select" aria-label="Unit">${availableUnits.map(u => `<option value="${u.value}" ${u.value === unit ? 'selected' : ''}>${u.label}</option>`).join('')}</select></label>
+      <label class="control-group"><span class="control-label">Unit</span><select class="unit-select" id="unit-select" aria-label="Unit">${availableUnits.map(u => `<option value="${escapeHTML(String(u.value))}" ${u.value === unit ? 'selected' : ''}>${escapeHTML(String(u.label))}</option>`).join('')}</select></label>
       <label class="control-group"><span class="control-label">Meal</span><select class="meal-type-select" id="meal-type-select" aria-label="Meal type"><option value="breakfast" ${selectedMealType === 'Breakfast' ? 'selected' : ''}>Breakfast</option><option value="lunch" ${selectedMealType === 'Lunch' ? 'selected' : ''}>Lunch</option><option value="dinner" ${selectedMealType === 'Dinner' ? 'selected' : ''}>Dinner</option><option value="snacks" ${selectedMealType === 'Snacks' ? 'selected' : ''}>Snacks</option></select></label>
     </div>
     <div id="nutrition-preview"></div>
-    <label class="control-group"><span class="control-label">Notes (optional)</span><input type="text" class="notes-input" id="notes-input" placeholder="e.g., with milk"></label>
+    <label class="control-group"><span class="control-label">Notes (optional)</span><input type="text" class="notes-input" id="notes-input" maxlength="500" placeholder="e.g., with milk"></label>
+    <label class="control-group"><span><input type="checkbox" id="favorite-food" ${food.favorite ? 'checked' : ''}> Add this food to Favorites</span></label>
+    <label class="control-group"><span><input type="checkbox" id="save-usual-serving" ${food.usualServing ? 'checked' : ''}> Save this quantity and unit as my usual serving</span></label>
     <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Cancel</button><button class="btn btn-primary" id="log-btn">Log Food</button></div>
   `;
   openModal(modal);
@@ -737,40 +938,62 @@ function openPortionModal(food, mealType) {
   document.getElementById('meal-type-select').addEventListener('change', (e) => { selectedMealType = e.target.value; });
   document.getElementById('modal-close').addEventListener('click', closeModal);
   document.getElementById('cancel-btn').addEventListener('click', closeModal);
-  document.getElementById('log-btn').addEventListener('click', () => logFood(food, quantity, unit, selectedMealType, document.getElementById('notes-input').value));
+  document.getElementById('log-btn').addEventListener('click', async (event) => {
+    if (logInProgress) return;
+    logInProgress = true;
+    event.currentTarget.disabled = true;
+    event.currentTarget.textContent = 'Logging…';
+    food.favorite = document.getElementById('favorite-food').checked;
+    if (document.getElementById('save-usual-serving').checked) {
+      food.usualServing = { quantity, unit };
+    } else {
+      delete food.usualServing;
+    }
+    const success = await logFood(
+      food,
+      quantity,
+      unit,
+      selectedMealType,
+      document.getElementById('notes-input').value,
+      targetDate,
+      idempotencyKey,
+    );
+    if (!success) {
+      logInProgress = false;
+      event.currentTarget.disabled = false;
+      event.currentTarget.textContent = 'Log Food';
+    }
+  });
   updatePreview();
 }
 
-async function logFood(food, quantity, unit, mealType, notes) {
+async function logFood(food, quantity, unit, mealType, notes, targetDate = todayStr(), idempotencyKey) {
   try {
     if (!food.id) food.id = generateId();
     const existing = await getById('foods', food.id);
-    if (!existing) await put('foods', food);
-    const mult = getNutritionMultiplier(quantity, unit, food);
-    await put('meals', {
-      id: generateId(), date: todayStr(), type: mealType.toLowerCase(),
-      items: [{ foodId: food.id, quantity, unit, notes, nutrients: {
-        kcal: (food.nutrients?.energy?.kcal || 0) * mult,
-        protein: (food.nutrients?.macros?.protein?.g || 0) * mult,
-        carbs: (food.nutrients?.macros?.carbs?.g || 0) * mult,
-        fat: (food.nutrients?.macros?.fat?.g || 0) * mult,
-        fiber: (food.nutrients?.fiber?.g || 0) * mult,
-        sodium: (food.nutrients?.sodium?.mg || 0) * mult,
-      }}],
+    await put('foods', { ...(existing || {}), ...food });
+    await createMeal({
+      date: targetDate, type: mealType.toLowerCase(),
+      items: [{ foodId: food.id, quantity, unit, notes, nutrients: scaleNutrients(food, quantity, unit) }],
       createdAt: new Date().toISOString(),
-    });
+    }, { idempotencyKey });
     showToast(`${food.name} logged to ${mealType}`);
     closeModal();
-    setTimeout(() => { window.location.hash = '#/diary'; }, 500);
-  } catch (err) { console.error('Log error:', err); showToast('Failed to log food'); }
+    setTimeout(() => { window.location.hash = `#/diary?date=${targetDate}`; }, 500);
+    return true;
+  } catch (err) {
+    console.error('Log error:', err);
+    showToast('Failed to log food');
+    return false;
+  }
 }
 
-function openCustomFoodForm() {
+function openCustomFoodForm(mealType = 'Lunch', targetDate = todayStr()) {
   const modal = document.createElement('div');
   modal.className = 'modal-content custom-food-form';
   modal.innerHTML = `
     <div class="modal-header"><h2>Add Custom Food</h2><button class="modal-close" id="modal-close">✕</button></div>
-    <div class="form-group"><label><span class="control-label">Food Name</span><input type="text" id="custom-name" placeholder="e.g., Homemade pasta" class="form-input"></label></div>
+    <div class="form-group"><label><span class="control-label">Food Name</span><input type="text" id="custom-name" maxlength="120" placeholder="e.g., Homemade pasta" class="form-input"></label></div>
     <div class="form-row"><label class="form-group"><span class="control-label">Calories per 100g</span><input type="number" id="custom-kcal" placeholder="0" class="form-input" min="0"></label><label class="form-group"><span class="control-label">Protein (g)</span><input type="number" id="custom-protein" placeholder="0" class="form-input" min="0" step="0.1"></label></div>
     <div class="form-row"><label class="form-group"><span class="control-label">Carbs (g)</span><input type="number" id="custom-carbs" placeholder="0" class="form-input" min="0" step="0.1"></label><label class="form-group"><span class="control-label">Fat (g)</span><input type="number" id="custom-fat" placeholder="0" class="form-input" min="0" step="0.1"></label></div>
     <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Cancel</button><button class="btn btn-primary" id="save-btn">Add Food</button></div>
@@ -785,9 +1008,9 @@ function openCustomFoodForm() {
     const carbs = parseFloat(document.getElementById('custom-carbs').value) || 0;
     const fat = parseFloat(document.getElementById('custom-fat').value) || 0;
     if (!name || kcal <= 0) { showToast('Please fill in food name and calories'); return; }
-    const customFood = { id: generateId(), name, nutrients: { energy: { kcal }, macros: { protein: { g: protein }, carbs: { g: carbs }, fat: { g: fat } }, fiber: { g: 0 }, sodium: { mg: 0 } }, servingSize: { quantity: 100, unit: 'g', aliases: [] }, source: { type: 'custom' }, createdAt: new Date().toISOString() };
+    const customFood = { id: generateId(), name, nutrients: { energy: { kcal }, macros: { protein: { g: protein }, carbs: { g: carbs }, fat: { g: fat } }, fiber: { g: null }, sodium: { mg: null } }, servingSize: { quantity: 100, unit: 'g', aliases: [] }, source: { type: 'custom' }, createdAt: new Date().toISOString() };
     closeModal();
-    setTimeout(() => openPortionModal(customFood, 'Lunch'), 200);
+    setTimeout(() => openPortionModal(customFood, mealType, targetDate), 200);
   });
 }
 
@@ -797,4 +1020,13 @@ function fileToDataUrl(file) {
 
 function generateId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+function isCalendarDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year
+    && date.getMonth() === month - 1
+    && date.getDate() === day;
 }

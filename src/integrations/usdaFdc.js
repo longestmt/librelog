@@ -3,7 +3,8 @@
  * Handles food searches and FDC ID lookups
  */
 
-import { getSetting } from '../data/db.js';
+import { getCredential } from '../data/credentials.js';
+import { logIntegrationFailure, requestJSON } from './request.js';
 
 const USDA_BASE_URL = 'https://api.nal.usda.gov/fdc/v1';
 const REQUEST_TIMEOUT_MS = 8000;
@@ -25,11 +26,11 @@ const NUTRIENT_IDS = {
  * @private
  * @param {Array} foodNutrients - Array of nutrient objects
  * @param {number} nutrientId - USDA nutrient number
- * @returns {number} Nutrient value or 0
+ * @returns {number|null} Nutrient value, or null when USDA did not provide it
  */
 function getNutrientValue(foodNutrients, nutrientId) {
   if (!Array.isArray(foodNutrients)) {
-    return 0;
+    return null;
   }
 
   const nutrient = foodNutrients.find(
@@ -37,10 +38,12 @@ function getNutrientValue(foodNutrients, nutrientId) {
   );
 
   if (!nutrient) {
-    return 0;
+    return null;
   }
 
-  return nutrient.value ?? nutrient.amount ?? 0;
+  const value = nutrient.value ?? nutrient.amount;
+  const number = typeof value === 'number' ? value : Number.parseFloat(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 /**
@@ -68,8 +71,8 @@ function normalizeFood(food) {
       nutrients: {
         energy: {
           kcal: getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY)
-            || getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_GENERAL)
-            || getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_SPECIFIC)
+            ?? getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_GENERAL)
+            ?? getNutrientValue(nutrients, NUTRIENT_IDS.ENERGY_ATWATER_SPECIFIC)
         },
         macros: {
           protein: {
@@ -108,19 +111,16 @@ function normalizeFood(food) {
  * @param {number} [pageSize=20] - Results per page
  * @returns {Promise<Array>} Array of normalized food objects
  */
-async function searchFoods(query, page = 1, pageSize = 20) {
+async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {}) {
   if (!query || query.trim().length === 0) {
     return [];
   }
 
-  const apiKey = await getSetting('usda_api_key');
+  const apiKey = await getCredential('usdaApiKey');
   if (!apiKey) {
     console.warn('USDA API key not configured');
     return [];
   }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
     const url = new URL(`${USDA_BASE_URL}/foods/search`);
@@ -130,19 +130,18 @@ async function searchFoods(query, page = 1, pageSize = 20) {
     url.searchParams.set('pageSize', pageSize.toString());
     url.searchParams.set('dataType', 'Foundation,SR Legacy');
 
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
-      }
+    const { data } = await requestJSON({
+      provider: 'USDA FoodData Central',
+      url: url.toString(),
+      init: {
+        headers: {
+          'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
+        },
+      },
+      signal,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      maxRetries: 1,
     });
-
-    if (!response.ok) {
-      console.warn(`USDA search returned status ${response.status}`);
-      return [];
-    }
-
-    const data = await response.json();
 
     if (!data.foods || !Array.isArray(data.foods)) {
       return [];
@@ -152,14 +151,8 @@ async function searchFoods(query, page = 1, pageSize = 20) {
       .map(normalizeFood)
       .filter(food => food !== null);
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('USDA search timeout');
-    } else {
-      console.error('Error searching USDA:', error);
-    }
+    logIntegrationFailure(error);
     return [];
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -168,48 +161,38 @@ async function searchFoods(query, page = 1, pageSize = 20) {
  * @param {string|number} fdcId - FDC ID
  * @returns {Promise<Object|null>} Normalized food object or null if not found
  */
-async function lookupFdcId(fdcId) {
+async function lookupFdcId(fdcId, { signal = null } = {}) {
   if (!fdcId) {
     return null;
   }
 
-  const apiKey = await getSetting('usda_api_key');
+  const apiKey = await getCredential('usdaApiKey');
   if (!apiKey) {
     console.warn('USDA API key not configured');
     return null;
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
   try {
     const url = new URL(`${USDA_BASE_URL}/food/${fdcId}`);
     url.searchParams.set('api_key', apiKey);
 
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
-      }
+    const { data } = await requestJSON({
+      provider: 'USDA FoodData Central',
+      url: url.toString(),
+      init: {
+        headers: {
+          'User-Agent': 'LibreLog/1.0 (librelog@muhprivacy.lol)'
+        },
+      },
+      signal,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+      maxRetries: 1,
     });
-
-    if (!response.ok) {
-      console.warn(`USDA FDC lookup returned status ${response.status}`);
-      return null;
-    }
-
-    const data = await response.json();
 
     return normalizeFood(data);
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.warn('USDA FDC lookup timeout');
-    } else {
-      console.error('Error looking up USDA FDC ID:', error);
-    }
+    logIntegrationFailure(error);
     return null;
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 

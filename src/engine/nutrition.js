@@ -3,6 +3,28 @@
  * Handles meal totals, daily totals, and nutrient scaling
  */
 
+import { getNutritionMultiplier } from '../utils/units.js';
+
+const NUTRIENT_KEYS = ['kcal', 'protein', 'carbs', 'fat', 'fiber', 'sodium'];
+
+function emptyTotals() {
+  return {
+    kcal: 0,
+    protein: 0,
+    carbs: 0,
+    fat: 0,
+    fiber: 0,
+    sodium: 0,
+    incomplete: []
+  };
+}
+
+function scaledValue(value, scale, precision) {
+  if (!Number.isFinite(value)) return null;
+  const factor = 10 ** precision;
+  return Math.round(value * scale * factor) / factor;
+}
+
 /**
  * Scale nutrient values based on quantity relative to serving size
  * Assumes same unit as food's serving size (grams)
@@ -13,39 +35,23 @@
  */
 function scaleNutrients(food, quantity, unit = 'g') {
   if (!food || !food.nutrients || !food.servingSize) {
-    return {
-      kcal: 0,
-      protein: 0,
-      carbs: 0,
-      fat: 0,
-      fiber: 0,
-      sodium: 0
-    };
+    return Object.fromEntries(NUTRIENT_KEYS.map(key => [key, null]));
   }
 
   try {
-    // Calculate scale factor relative to serving size
-    // Currently assumes unit matches food's serving size unit (grams)
-    const scale = quantity / food.servingSize.quantity;
+    const scale = getNutritionMultiplier(quantity, unit, food);
 
     return {
-      kcal: Math.round((food.nutrients.energy?.kcal || 0) * scale * 10) / 10,
-      protein: Math.round((food.nutrients.macros?.protein?.g || 0) * scale * 100) / 100,
-      carbs: Math.round((food.nutrients.macros?.carbs?.g || 0) * scale * 100) / 100,
-      fat: Math.round((food.nutrients.macros?.fat?.g || 0) * scale * 100) / 100,
-      fiber: Math.round((food.nutrients.fiber?.g || 0) * scale * 100) / 100,
-      sodium: Math.round((food.nutrients.sodium?.mg || 0) * scale * 10) / 10
+      kcal: scaledValue(food.nutrients.energy?.kcal, scale, 1),
+      protein: scaledValue(food.nutrients.macros?.protein?.g, scale, 2),
+      carbs: scaledValue(food.nutrients.macros?.carbs?.g, scale, 2),
+      fat: scaledValue(food.nutrients.macros?.fat?.g, scale, 2),
+      fiber: scaledValue(food.nutrients.fiber?.g, scale, 2),
+      sodium: scaledValue(food.nutrients.sodium?.mg, scale, 1)
     };
   } catch (error) {
     console.error('Error scaling nutrients:', error);
-    return {
-      kcal: 0,
-      protein: 0,
-      carbs: 0,
-      fat: 0,
-      fiber: 0,
-      sodium: 0
-    };
+    return Object.fromEntries(NUTRIENT_KEYS.map(key => [key, null]));
   }
 }
 
@@ -57,14 +63,7 @@ function scaleNutrients(food, quantity, unit = 'g') {
  * @returns {Object} Aggregated totals
  */
 function calculateMealTotals(items, foodsMap) {
-  const totals = {
-    kcal: 0,
-    protein: 0,
-    carbs: 0,
-    fat: 0,
-    fiber: 0,
-    sodium: 0
-  };
+  const totals = emptyTotals();
 
   if (!items || items.length === 0 || !foodsMap) {
     return totals;
@@ -85,12 +84,10 @@ function calculateMealTotals(items, foodsMap) {
         item.unit || 'g'
       );
 
-      totals.kcal += scaled.kcal;
-      totals.protein += scaled.protein;
-      totals.carbs += scaled.carbs;
-      totals.fat += scaled.fat;
-      totals.fiber += scaled.fiber;
-      totals.sodium += scaled.sodium;
+      for (const key of NUTRIENT_KEYS) {
+        if (Number.isFinite(scaled[key])) totals[key] += scaled[key];
+        else if (!totals.incomplete.includes(key)) totals.incomplete.push(key);
+      }
     }
 
     // Round final totals
@@ -100,7 +97,8 @@ function calculateMealTotals(items, foodsMap) {
       carbs: Math.round(totals.carbs * 100) / 100,
       fat: Math.round(totals.fat * 100) / 100,
       fiber: Math.round(totals.fiber * 100) / 100,
-      sodium: Math.round(totals.sodium * 10) / 10
+      sodium: Math.round(totals.sodium * 10) / 10,
+      incomplete: totals.incomplete
     };
   } catch (error) {
     console.error('Error calculating meal totals:', error);
@@ -115,14 +113,7 @@ function calculateMealTotals(items, foodsMap) {
  * @returns {Object} Daily aggregate totals
  */
 function calculateDayTotals(meals, foodsMap) {
-  const dayTotals = {
-    kcal: 0,
-    protein: 0,
-    carbs: 0,
-    fat: 0,
-    fiber: 0,
-    sodium: 0
-  };
+  const dayTotals = emptyTotals();
 
   if (!meals || meals.length === 0 || !foodsMap) {
     return dayTotals;
@@ -136,12 +127,10 @@ function calculateDayTotals(meals, foodsMap) {
 
       const mealTotals = calculateMealTotals(meal.items, foodsMap);
 
-      dayTotals.kcal += mealTotals.kcal;
-      dayTotals.protein += mealTotals.protein;
-      dayTotals.carbs += mealTotals.carbs;
-      dayTotals.fat += mealTotals.fat;
-      dayTotals.fiber += mealTotals.fiber;
-      dayTotals.sodium += mealTotals.sodium;
+      for (const key of NUTRIENT_KEYS) dayTotals[key] += mealTotals[key];
+      for (const key of mealTotals.incomplete || []) {
+        if (!dayTotals.incomplete.includes(key)) dayTotals.incomplete.push(key);
+      }
     }
 
     // Round final totals
@@ -151,7 +140,8 @@ function calculateDayTotals(meals, foodsMap) {
       carbs: Math.round(dayTotals.carbs * 100) / 100,
       fat: Math.round(dayTotals.fat * 100) / 100,
       fiber: Math.round(dayTotals.fiber * 100) / 100,
-      sodium: Math.round(dayTotals.sodium * 10) / 10
+      sodium: Math.round(dayTotals.sodium * 10) / 10,
+      incomplete: dayTotals.incomplete
     };
   } catch (error) {
     console.error('Error calculating day totals:', error);
@@ -220,17 +210,15 @@ function getMacroPercentages(dayTotals) {
  * @returns {Object} Daily aggregate totals
  */
 function calculateDayTotalsSimple(meals) {
-  const totals = { kcal: 0, protein: 0, carbs: 0, fat: 0, fiber: 0, sodium: 0 };
+  const totals = emptyTotals();
   if (!meals || meals.length === 0) return totals;
   for (const meal of meals) {
     for (const item of (meal.items || [])) {
       if (item.nutrients) {
-        totals.kcal += item.nutrients.kcal || 0;
-        totals.protein += item.nutrients.protein || 0;
-        totals.carbs += item.nutrients.carbs || 0;
-        totals.fat += item.nutrients.fat || 0;
-        totals.fiber += item.nutrients.fiber || 0;
-        totals.sodium += item.nutrients.sodium || 0;
+        for (const key of NUTRIENT_KEYS) {
+          if (Number.isFinite(item.nutrients[key])) totals[key] += item.nutrients[key];
+          else if (!totals.incomplete.includes(key)) totals.incomplete.push(key);
+        }
       }
     }
   }

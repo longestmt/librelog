@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#24282e"/>
+      <stop offset="100%" stop-color="#14171b"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0%" stop-color="#e2dac6"/>
+      <stop offset="100%" stop-color="#b8ad92"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect x="16" y="16" width="480" height="480" rx="100" ry="100" fill="url(#bg)"/>
+
+  <!-- Open ring (3/4 circle plate) - opens at top-right -->
+  <circle cx="256" cy="264" r="148" fill="none" stroke="url(#ring)" stroke-width="32" stroke-linecap="round" stroke-dasharray="930" stroke-dashoffset="232"/>
+
+  <!-- Fork silhouette - bold, centered, clean -->
+  <g fill="#d4ccb4">
+    <!-- Tine left -->
+    <rect x="218" y="168" width="20" height="100" rx="10"/>
+    <!-- Tine center -->
+    <rect x="246" y="168" width="20" height="100" rx="10"/>
+    <!-- Tine right -->
+    <rect x="274" y="168" width="20" height="100" rx="10"/>
+    <!-- Shoulder bar -->
+    <rect x="218" y="254" width="76" height="20" rx="10"/>
+    <!-- Handle -->
+    <rect x="246" y="260" width="20" height="116" rx="10"/>
+  </g>
+</svg>

@@ -5,9 +5,159 @@
  */
 
 const DB_NAME = 'librelog';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
+export const DATA_SCHEMA_VERSION = DB_VERSION;
+export const BACKUP_SCHEMA_VERSION = 1;
+const DATA_STORES = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
+const MIGRATION_BACKUP_KEY = 'librelog_migration_backups';
+const MAX_MIGRATION_BACKUPS = 3;
+const SENSITIVE_SETTING_KEYS = new Set([
+    'ai_api_key',
+    'usda_api_key',
+    'webdavUrl',
+    'webdavUsername',
+    'webdavPassword',
+    'webdav_url',
+    'webdav_username',
+    'webdav_password',
+    'webdav_connected',
+    'githubPAT',
+    'githubGistId',
+    'credentialEncryptionEnabled',
+    'credentialEncryptionVerifier',
+]);
 
 let dbInstance = null;
+
+function readMigrationBackups() {
+    if (typeof localStorage === 'undefined') return [];
+    const raw = localStorage.getItem(MIGRATION_BACKUP_KEY);
+    if (!raw) return [];
+    const backups = JSON.parse(raw);
+    return Array.isArray(backups) ? backups : [];
+}
+
+function writeMigrationBackup(backup) {
+    if (typeof localStorage === 'undefined') {
+        throw new Error('Migration backup storage is not available');
+    }
+    const backups = [backup, ...readMigrationBackups()]
+        .slice(0, MAX_MIGRATION_BACKUPS);
+    localStorage.setItem(MIGRATION_BACKUP_KEY, JSON.stringify(backups));
+}
+
+function filterExportRecords(storeName, records) {
+    return storeName === 'settings'
+        ? records.filter(record => !SENSITIVE_SETTING_KEYS.has(record.key))
+        : records;
+}
+
+function createStoresAndIndexes(db, transaction) {
+    let foods;
+    if (!db.objectStoreNames.contains('foods')) {
+        foods = db.createObjectStore('foods', { keyPath: 'id' });
+    } else {
+        foods = transaction.objectStore('foods');
+    }
+    if (!foods.indexNames.contains('name')) foods.createIndex('name', 'name', { unique: false });
+    if (!foods.indexNames.contains('barcode')) foods.createIndex('barcode', 'barcode', { unique: false });
+    if (!foods.indexNames.contains('source')) foods.createIndex('source', 'source', { unique: false });
+
+    let meals;
+    if (!db.objectStoreNames.contains('meals')) {
+        meals = db.createObjectStore('meals', { keyPath: 'id' });
+    } else {
+        meals = transaction.objectStore('meals');
+    }
+    if (!meals.indexNames.contains('date')) meals.createIndex('date', 'date', { unique: false });
+    if (!meals.indexNames.contains('mealType')) meals.createIndex('mealType', 'mealType', { unique: false });
+    if (!meals.indexNames.contains('idempotencyKey')) {
+        meals.createIndex('idempotencyKey', 'idempotencyKey', { unique: false });
+    }
+
+    let recipes;
+    if (!db.objectStoreNames.contains('recipes')) {
+        recipes = db.createObjectStore('recipes', { keyPath: 'id' });
+    } else {
+        recipes = transaction.objectStore('recipes');
+    }
+    if (!recipes.indexNames.contains('name')) recipes.createIndex('name', 'name', { unique: false });
+    if (!recipes.indexNames.contains('category')) recipes.createIndex('category', 'category', { unique: false });
+
+    let measurements;
+    if (!db.objectStoreNames.contains('measurements')) {
+        measurements = db.createObjectStore('measurements', { keyPath: 'id' });
+    } else {
+        measurements = transaction.objectStore('measurements');
+    }
+    if (!measurements.indexNames.contains('date')) {
+        measurements.createIndex('date', 'date', { unique: false });
+    }
+
+    if (!db.objectStoreNames.contains('settings')) {
+        db.createObjectStore('settings', { keyPath: 'key' });
+    }
+
+    let apiCache;
+    if (!db.objectStoreNames.contains('apiCache')) {
+        apiCache = db.createObjectStore('apiCache', { keyPath: 'id' });
+    } else {
+        apiCache = transaction.objectStore('apiCache');
+    }
+    if (!apiCache.indexNames.contains('source')) apiCache.createIndex('source', 'source', { unique: false });
+    if (!apiCache.indexNames.contains('query')) apiCache.createIndex('query', 'query', { unique: false });
+    if (!apiCache.indexNames.contains('expiresAt')) {
+        apiCache.createIndex('expiresAt', 'expiresAt', { unique: false });
+    }
+}
+
+function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
+    const stores = DATA_STORES.filter(name => db.objectStoreNames.contains(name));
+    const exportedStores = {};
+    let pending = stores.length;
+
+    const fail = () => {
+        try {
+            transaction.abort();
+        } catch {
+            // The request error also stops the version-change transaction.
+        }
+    };
+
+    if (pending === 0) {
+        onComplete();
+        return;
+    }
+
+    for (const name of stores) {
+        const request = transaction.objectStore(name).getAll();
+        request.onerror = fail;
+        request.onsuccess = () => {
+            exportedStores[name] = filterExportRecords(name, request.result);
+            pending -= 1;
+            if (pending !== 0) return;
+
+            try {
+                const timestamp = now();
+                writeMigrationBackup({
+                    timestamp,
+                    fromVersion: oldVersion,
+                    toVersion: DB_VERSION,
+                    data: {
+                        version: BACKUP_SCHEMA_VERSION,
+                        dataVersion: oldVersion,
+                        exportedAt: timestamp,
+                        secretsExcluded: true,
+                        stores: exportedStores,
+                    },
+                });
+                onComplete();
+            } catch {
+                fail();
+            }
+        };
+    }
+}
 
 /**
  * Generate a UUID v4 string
@@ -40,47 +190,14 @@ function openDB() {
 
         req.onupgradeneeded = (e) => {
             const db = e.target.result;
-
-            // Foods store
-            if (!db.objectStoreNames.contains('foods')) {
-                const store = db.createObjectStore('foods', { keyPath: 'id' });
-                store.createIndex('name', 'name', { unique: false });
-                store.createIndex('barcode', 'barcode', { unique: false });
-                store.createIndex('source', 'source', { unique: false });
+            const transaction = e.target.transaction;
+            if (e.oldVersion === 0) {
+                createStoresAndIndexes(db, transaction);
+                return;
             }
-
-            // Meals store
-            if (!db.objectStoreNames.contains('meals')) {
-                const store = db.createObjectStore('meals', { keyPath: 'id' });
-                store.createIndex('date', 'date', { unique: false });
-                store.createIndex('mealType', 'mealType', { unique: false });
-            }
-
-            // Recipes store
-            if (!db.objectStoreNames.contains('recipes')) {
-                const store = db.createObjectStore('recipes', { keyPath: 'id' });
-                store.createIndex('name', 'name', { unique: false });
-                store.createIndex('category', 'category', { unique: false });
-            }
-
-            // Measurements store (body weight, etc.)
-            if (!db.objectStoreNames.contains('measurements')) {
-                const store = db.createObjectStore('measurements', { keyPath: 'id' });
-                store.createIndex('date', 'date', { unique: false });
-            }
-
-            // Settings (key-value)
-            if (!db.objectStoreNames.contains('settings')) {
-                db.createObjectStore('settings', { keyPath: 'key' });
-            }
-
-            // API Cache (for Open Food Facts, USDA, etc.)
-            if (!db.objectStoreNames.contains('apiCache')) {
-                const store = db.createObjectStore('apiCache', { keyPath: 'id' });
-                store.createIndex('source', 'source', { unique: false });
-                store.createIndex('query', 'query', { unique: false });
-                store.createIndex('expiresAt', 'expiresAt', { unique: false });
-            }
+            captureMigrationBackup(db, transaction, e.oldVersion, () => {
+                createStoresAndIndexes(db, transaction);
+            });
         };
 
         req.onsuccess = (e) => {
@@ -263,14 +380,73 @@ export async function setSetting(key, value) {
  */
 export async function exportAllData() {
     const db = await openDB();
-    const allStores = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
-    const data = { version: DB_VERSION, exportedAt: now(), stores: {} };
-    for (const name of allStores) {
+    const data = {
+        version: BACKUP_SCHEMA_VERSION,
+        dataVersion: DATA_SCHEMA_VERSION,
+        exportedAt: now(),
+        secretsExcluded: true,
+        stores: {},
+    };
+    for (const name of DATA_STORES) {
         if (!db.objectStoreNames.contains(name)) continue;
         const store = await getStore(name);
-        data.stores[name] = await promisifyRequest(store.getAll());
+        const records = await promisifyRequest(store.getAll());
+        data.stores[name] = filterExportRecords(name, records);
     }
     return data;
+}
+
+/**
+ * Validate the outer shape and key fields of an exported backup before any
+ * transaction is opened. Unknown stores are ignored for forward compatibility.
+ * @param {Object} data
+ * @returns {Array<string>} stores that are safe to import
+ */
+export function validateBackupData(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('Backup must be a JSON object');
+    }
+    if (!data.stores || typeof data.stores !== 'object' || Array.isArray(data.stores)) {
+        throw new Error('Backup is missing its data stores');
+    }
+    if (data.version != null && (!Number.isInteger(data.version) || data.version < 1)) {
+        throw new Error('Backup has an invalid schema version');
+    }
+    if (data.version != null && data.version > BACKUP_SCHEMA_VERSION) {
+        throw new Error(`Backup schema version ${data.version} is not supported`);
+    }
+    if (data.dataVersion != null && (!Number.isInteger(data.dataVersion) || data.dataVersion < 1)) {
+        throw new Error('Backup has an invalid data schema version');
+    }
+    if (data.dataVersion != null && data.dataVersion > DATA_SCHEMA_VERSION) {
+        throw new Error(`Data schema version ${data.dataVersion} is not supported`);
+    }
+
+    const available = DATA_STORES.filter(name => Object.hasOwn(data.stores, name));
+    if (available.length === 0) throw new Error('Backup contains no recognized data stores');
+
+    let totalRecords = 0;
+    for (const name of available) {
+        const records = data.stores[name];
+        if (!Array.isArray(records)) throw new Error(`Backup store "${name}" must be an array`);
+        totalRecords += records.length;
+        if (totalRecords > 250_000) {
+            throw new Error('Backup contains too many records');
+        }
+        for (const record of records) {
+            if (!record || typeof record !== 'object' || Array.isArray(record)) {
+                throw new Error(`Backup store "${name}" contains an invalid record`);
+            }
+            if (name === 'settings') {
+                if (typeof record.key !== 'string' || !record.key) {
+                    throw new Error('Backup contains a setting without a valid key');
+                }
+            } else if (typeof record.id !== 'string' || !record.id) {
+                throw new Error(`Backup store "${name}" contains a record without a valid id`);
+            }
+        }
+    }
+    return available;
 }
 
 /**
@@ -280,14 +456,50 @@ export async function exportAllData() {
  * @returns {Promise<void>}
  */
 export async function importAllData(data, merge = false) {
-    const stores = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
-    for (const name of stores) {
-        if (!data.stores[name]) continue;
-        if (!merge) {
-            await hardDeleteAll(name);
+    const stores = validateBackupData(data);
+    const db = await openDB();
+
+    // Credentials never leave the device in exports and must survive a replace
+    // restore. Read them before the all-store transaction begins.
+    const preservedSettings = new Map();
+    if (!merge && stores.includes('settings')) {
+        for (const key of SENSITIVE_SETTING_KEYS) {
+            const value = await getSetting(key, undefined);
+            if (value !== undefined && value !== null && value !== '') {
+                preservedSettings.set(key, value);
+            }
         }
-        await putMany(name, data.stores[name]);
     }
+
+    await new Promise((resolve, reject) => {
+        const tx = db.transaction(stores, 'readwrite');
+
+        try {
+            for (const name of stores) {
+                const store = tx.objectStore(name);
+                if (!merge) store.clear();
+                for (const record of data.stores[name]) {
+                    if (name === 'settings' && SENSITIVE_SETTING_KEYS.has(record.key)) continue;
+                    store.put(structuredClone(record));
+                }
+            }
+
+            if (!merge && stores.includes('settings')) {
+                const settingsStore = tx.objectStore('settings');
+                for (const [key, value] of preservedSettings) {
+                    settingsStore.put({ key, value, updatedAt: now() });
+                }
+            }
+        } catch (error) {
+            tx.abort();
+            reject(error);
+            return;
+        }
+
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Import transaction failed'));
+        tx.onabort = () => reject(tx.error || new Error('Import transaction was aborted'));
+    });
 }
 
 /**
@@ -295,9 +507,34 @@ export async function importAllData(data, merge = false) {
  * @returns {Promise<void>}
  */
 export async function clearAllData() {
-    const stores = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
-    for (const name of stores) {
+    for (const name of DATA_STORES) {
         await hardDeleteAll(name);
+    }
+    clearMigrationBackups();
+}
+
+export function getMigrationBackups() {
+    try {
+        return readMigrationBackups().map(backup => ({
+            timestamp: backup.timestamp,
+            fromVersion: backup.fromVersion,
+            toVersion: backup.toVersion,
+        }));
+    } catch {
+        return [];
+    }
+}
+
+export function getMigrationBackupData(timestamp) {
+    const backup = readMigrationBackups()
+        .find(item => item.timestamp === timestamp);
+    if (!backup?.data) throw new Error('Migration checkpoint was not found');
+    return structuredClone(backup.data);
+}
+
+export function clearMigrationBackups() {
+    if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem(MIGRATION_BACKUP_KEY);
     }
 }
 

@@ -3,7 +3,10 @@
  * Handles JSON backups, CSV diary exports, and MyFitnessPal CSV import
  */
 
-import { exportAllData, importAllData, put, getAll } from './db.js';
+import { exportAllData, importAllData, put, getAll, setSetting } from './db.js';
+import { decryptBackup, encryptBackup, isEncryptedBackup } from './encryption.js';
+import { createDeterministicKey, createMeal } from './meal-commands.js';
+import { todayStr } from '../utils/format.js';
 
 /**
  * Download JSON data as a file
@@ -32,8 +35,19 @@ export function downloadJSON(data, filename) {
  */
 export async function exportData() {
     const data = await exportAllData();
-    const date = new Date().toISOString().split('T')[0];
+    const date = todayStr();
     downloadJSON(data, `librelog-backup-${date}.json`);
+    await setSetting('lastPortableBackupTime', Date.now());
+    return data;
+}
+
+export async function exportEncryptedData(passphrase) {
+    const data = await exportAllData();
+    const encrypted = await encryptBackup(data, passphrase);
+    const date = todayStr();
+    downloadJSON(encrypted, `librelog-backup-${date}.encrypted.json`);
+    await setSetting('lastPortableBackupTime', Date.now());
+    return encrypted;
 }
 
 /**
@@ -43,6 +57,14 @@ export async function exportData() {
  */
 export function readFileAsJSON(file) {
     return new Promise((resolve, reject) => {
+        if (!(file instanceof Blob)) {
+            reject(new Error('Import requires a JSON file'));
+            return;
+        }
+        if (file.size > 25 * 1024 * 1024) {
+            reject(new Error('Backup is larger than the 25 MB import limit'));
+            return;
+        }
         const reader = new FileReader();
         reader.onload = () => {
             try { resolve(JSON.parse(reader.result)); }
@@ -59,8 +81,16 @@ export function readFileAsJSON(file) {
  * @param {boolean} merge - if false, clears existing data first
  * @returns {Promise<void>}
  */
-export async function importData(file, merge = false) {
-    const data = await readFileAsJSON(file);
+export async function importData(file, merge = false, { passphrase = null } = {}) {
+    let data = await readFileAsJSON(file);
+    if (isEncryptedBackup(data)) {
+        if (!passphrase) {
+            const error = new Error('This backup requires its passphrase');
+            error.code = 'BACKUP_PASSPHRASE_REQUIRED';
+            throw error;
+        }
+        data = await decryptBackup(data, passphrase);
+    }
     if (!data.stores) throw new Error('Invalid LibreLog backup file');
     await importAllData(data, merge);
 }
@@ -113,12 +143,17 @@ export async function importMyFitnessPalCSV(file) {
     const mealRaw = colMap.meal >= 0 ? cols[colMap.meal]?.trim().toLowerCase() : '';
     const mealType = normalizeMealType(mealRaw);
 
-    const kcal = parseFloat(cols[colMap.calories]) || 0;
-    const protein = colMap.protein >= 0 ? parseFloat(cols[colMap.protein]) || 0 : 0;
-    const carbs = colMap.carbs >= 0 ? parseFloat(cols[colMap.carbs]) || 0 : 0;
-    const fat = colMap.fat >= 0 ? parseFloat(cols[colMap.fat]) || 0 : 0;
-    const fiber = colMap.fiber >= 0 ? parseFloat(cols[colMap.fiber]) || 0 : 0;
-    const sodium = colMap.sodium >= 0 ? parseFloat(cols[colMap.sodium]) || 0 : 0;
+    const kcal = parseOptionalNumber(cols, colMap.calories);
+    const protein = parseOptionalNumber(cols, colMap.protein);
+    const carbs = parseOptionalNumber(cols, colMap.carbs);
+    const fat = parseOptionalNumber(cols, colMap.fat);
+    const fiber = parseOptionalNumber(cols, colMap.fiber);
+    const sodium = parseOptionalNumber(cols, colMap.sodium);
+
+    if (kcal === null && protein === null && carbs === null && fat === null) {
+      skipped++;
+      continue;
+    }
 
     // Create or find food entry
     const foodId = `mfp-${name.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 50)}`;
@@ -138,9 +173,8 @@ export async function importMyFitnessPalCSV(file) {
     });
 
     // Create meal entry
-    const mealId = `mfp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    await put('meals', {
-      id: mealId,
+    const idempotencyKey = createDeterministicKey('mfp', `${i}|${lines[i]}`);
+    const result = await createMeal({
       date,
       type: mealType,
       items: [{
@@ -150,10 +184,10 @@ export async function importMyFitnessPalCSV(file) {
         notes: 'Imported from MyFitnessPal',
         nutrients: { kcal, protein, carbs, fat, fiber, sodium },
       }],
-      createdAt: new Date().toISOString(),
-    });
+    }, { idempotencyKey });
 
-    imported++;
+    if (result.created) imported++;
+    else skipped++;
   }
 
   return { imported, skipped };
@@ -201,19 +235,46 @@ function findCol(header, candidates) {
   return -1;
 }
 
+function parseOptionalNumber(columns, index) {
+  if (index < 0) return null;
+  const raw = columns[index];
+  if (raw == null || String(raw).trim() === '') return null;
+  const value = Number.parseFloat(raw);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 function normalizeDate(raw) {
   // Try ISO format first
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return isValidDateParts(raw) ? raw : null;
   // MM/DD/YYYY
   const mdy = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (mdy) return `${mdy[3]}-${mdy[1].padStart(2, '0')}-${mdy[2].padStart(2, '0')}`;
+  if (mdy) {
+    const normalized = `${mdy[3]}-${mdy[1].padStart(2, '0')}-${mdy[2].padStart(2, '0')}`;
+    return isValidDateParts(normalized) ? normalized : null;
+  }
   // DD/MM/YYYY
   const dmy = raw.match(/^(\d{1,2})[-.](\d{1,2})[-.](\d{4})$/);
-  if (dmy) return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+  if (dmy) {
+    const normalized = `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+    return isValidDateParts(normalized) ? normalized : null;
+  }
   // Try Date.parse as last resort
   const parsed = new Date(raw);
-  if (!isNaN(parsed)) return parsed.toISOString().split('T')[0];
+  if (!isNaN(parsed)) {
+    const year = parsed.getFullYear();
+    const month = String(parsed.getMonth() + 1).padStart(2, '0');
+    const day = String(parsed.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
   return null;
+}
+
+function isValidDateParts(dateStr) {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  return date.getFullYear() === year
+    && date.getMonth() === month - 1
+    && date.getDate() === day;
 }
 
 function normalizeMealType(raw) {

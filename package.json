@@ -7,11 +7,20 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "npm run test:unit",
+    "test:unit": "node --test",
+    "test:e2e": "npm run build && playwright test --project=chromium",
+    "test:e2e:all": "npm run build && playwright test",
+    "check": "npm run test:unit && npm run test:e2e",
+    "check:all": "npm run test:unit && npm run test:e2e:all"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "@capacitor/cli": "^8.1.0",
+    "@playwright/test": "^1.62.0",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
+    "fake-indexeddb": "^6.2.5",
     "vite": "^6.1.0",
     "vite-plugin-pwa": "^0.21.1"
   },
@@ -20,6 +29,9 @@
     "@capacitor/android": "^8.1.0",
     "@capacitor/core": "^8.1.0",
     "@capacitor/haptics": "^8.0.1",
-    "@ericblade/quagga2": "^1.12.1"
+    "@ericblade/quagga2": "1.12.0"
+  },
+  "overrides": {
+    "filelist": "2.0.2"
   }
 }

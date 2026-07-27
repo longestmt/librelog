@@ -96,12 +96,13 @@
   --nav-height: 64px;
   --sidebar-width: 240px;
   --max-content: 640px;
+  --desktop-page-half-gap: 232px;
 
   color-scheme: dark;
 }
 
 /* ---------- Lauds — light theme ---------- */
-[data-theme="lauds"] {
+:root[data-theme="lauds"] {
   --bg-deep: #e8e5df;
   --bg-base: #f0efeb;
   --bg-surface: #f5f4f1;
@@ -137,7 +138,7 @@
 }
 
 /* ---------- Vigil — true black ---------- */
-[data-theme="vigil"] {
+:root[data-theme="vigil"] {
   --bg-deep: #000000;
   --bg-base: #000000;
   --bg-surface: #0a0a0a;

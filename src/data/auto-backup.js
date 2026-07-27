@@ -12,6 +12,7 @@ const MAX_BACKUPS = 7;
 const BACKUP_STORAGE_KEY = 'librelog_backups';
 
 let backupTimer = null;
+let visibilityHandler = null;
 
 /**
  * Initialize the auto-backup scheduler.
@@ -33,11 +34,13 @@ export async function initAutoBackup() {
   backupTimer = setInterval(performBackup, BACKUP_INTERVAL_MS);
 
   // Also backup when the app is about to be hidden/closed
-  document.addEventListener('visibilitychange', () => {
+  if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
+  visibilityHandler = () => {
     if (document.visibilityState === 'hidden') {
       performBackup();
     }
-  });
+  };
+  document.addEventListener('visibilitychange', visibilityHandler);
 }
 
 /**
@@ -47,6 +50,10 @@ export function stopAutoBackup() {
   if (backupTimer) {
     clearInterval(backupTimer);
     backupTimer = null;
+  }
+  if (visibilityHandler) {
+    document.removeEventListener('visibilitychange', visibilityHandler);
+    visibilityHandler = null;
   }
 }
 
@@ -232,5 +239,24 @@ export function getBackupData(timestamp) {
     return backup?.data || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Remove browser and native auto-backup copies when the user chooses
+ * "Clear All Data".
+ */
+export async function clearAutoBackups() {
+  localStorage.removeItem(BACKUP_STORAGE_KEY);
+  try {
+    const fsModulePath = '@capacitor/filesystem';
+    const { Filesystem, Directory } = await import(/* @vite-ignore */ fsModulePath);
+    await Filesystem.rmdir({
+      path: 'librelog-backups',
+      directory: Directory.Data,
+      recursive: true,
+    });
+  } catch {
+    // Expected in browsers and when no native backup directory exists.
   }
 }
