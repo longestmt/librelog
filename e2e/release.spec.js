@@ -119,15 +119,19 @@ test('credential-free backup restores into a clean browser profile', async ({ pa
 });
 
 test('an encrypted backup requires its passphrase and restores in a clean profile', async ({ page, browser }, testInfo) => {
-  test.setTimeout(120_000);
   const { targetDate } = await logEggOnPreviousDay(page);
   await page.goto('/#/settings', { waitUntil: 'commit' });
 
+  const backupPassphrase = 'release backup passphrase';
   const downloadPromise = page.waitForEvent('download');
   await page.getByRole('button', { name: 'Export Encrypted Data' }).click();
   const exportDialog = page.getByRole('dialog', { name: 'Export Encrypted Data' });
-  await exportDialog.getByLabel('Passphrase', { exact: true }).fill('release backup passphrase');
-  await exportDialog.getByLabel('Confirm Passphrase').fill('release backup passphrase');
+  const passphraseInput = exportDialog.getByLabel('Passphrase', { exact: true });
+  const confirmationInput = exportDialog.getByLabel('Confirm Passphrase');
+  await passphraseInput.fill(backupPassphrase);
+  await confirmationInput.fill(backupPassphrase);
+  await expect(passphraseInput).toHaveValue(backupPassphrase);
+  await expect(confirmationInput).toHaveValue(backupPassphrase);
   await exportDialog.getByRole('button', { name: 'Export Encrypted Data' }).click();
   const download = await downloadPromise;
   const backupPath = testInfo.outputPath('librelog-backup.encrypted.json');
@@ -147,7 +151,7 @@ test('an encrypted backup requires its passphrase and restores in a clean profil
   await chooser.setFiles(backupPath);
 
   const importDialog = cleanPage.getByRole('dialog', { name: 'Unlock Encrypted Backup' });
-  await importDialog.getByLabel('Passphrase', { exact: true }).fill('release backup passphrase');
+  await importDialog.getByLabel('Passphrase', { exact: true }).fill(backupPassphrase);
   await importDialog.getByRole('button', { name: 'Unlock and Import' }).click();
   await expect(cleanPage.getByRole('status')).toContainText('Encrypted data imported');
 

@@ -797,12 +797,12 @@ export async function renderSettingsPage(container, queryString) {
       <p class="confirm-message">${escapeHTML(message)}</p>
       <label class="setting-input">
         <span class="setting-label">Passphrase</span>
-        <input type="password" id="backup-passphrase" minlength="8" autocomplete="new-password">
+        <input type="password" id="backup-passphrase" name="backup-passphrase" minlength="8" autocomplete="new-password">
       </label>
       ${confirmPassphrase ? `
         <label class="setting-input">
           <span class="setting-label">Confirm Passphrase</span>
-          <input type="password" id="backup-passphrase-confirm" minlength="8" autocomplete="new-password">
+          <input type="password" id="backup-passphrase-confirm" name="backup-passphrase-confirm" minlength="8" autocomplete="new-password">
         </label>
       ` : ''}
       <div class="modal-actions">
