@@ -55,11 +55,16 @@ export function getUnitsForFood(food) {
     }
   }
 
-  // Add standard mass units
-  for (const key of ['g', 'oz']) {
-    if (!seen.has(key)) {
-      units.push({ value: key, label: UNIT_DEFINITIONS[key].label });
-      seen.add(key);
+  // Only offer mass units when the native serving can be converted to grams.
+  // Count-based servings such as "large" or "slice" must provide an explicit
+  // grams-per-unit conversion; otherwise switching to grams would interpret a
+  // weight as a count and produce dangerously inflated nutrition values.
+  if (canConvertNativeServingToGrams(food)) {
+    for (const key of ['g', 'oz']) {
+      if (!seen.has(key)) {
+        units.push({ value: key, label: UNIT_DEFINITIONS[key].label });
+        seen.add(key);
+      }
     }
   }
 
@@ -78,6 +83,30 @@ export function getUnitsForFood(food) {
   }
 
   return units;
+}
+
+function getExplicitGramsPerNativeUnit(food) {
+  const servingSize = food?.servingSize;
+  if (!servingSize) return null;
+
+  if (Number.isFinite(servingSize.gramsPerUnit) && servingSize.gramsPerUnit > 0) {
+    return servingSize.gramsPerUnit;
+  }
+
+  const nativeAlias = servingSize.aliases?.find(alias =>
+    alias.unit === servingSize.unit &&
+    Number.isFinite(alias.gramsPerUnit) &&
+    alias.gramsPerUnit > 0
+  );
+  return nativeAlias?.gramsPerUnit ?? null;
+}
+
+function canConvertNativeServingToGrams(food) {
+  const nativeUnit = food?.servingSize?.unit || 'g';
+  const nativeDefinition = UNIT_DEFINITIONS[nativeUnit];
+  return (
+    nativeDefinition?.toGrams !== null && nativeDefinition?.toGrams !== undefined
+  ) || getExplicitGramsPerNativeUnit(food) !== null;
 }
 
 /**
@@ -118,9 +147,10 @@ export function convertToGrams(quantity, fromUnit, food) {
     if (nativeDef && nativeDef.toGrams !== null) {
       return quantity * nativeDef.toGrams;
     }
-    // For count-based native units (e.g., "1 large egg = 50g"), check aliases
-    // If no alias provides grams, treat the serving quantity as the base
-    return quantity * (food.servingSize.quantity || 1);
+    // Count-based native units require an explicit weight conversion.
+    const gramsPerUnit = getExplicitGramsPerNativeUnit(food);
+    if (gramsPerUnit !== null) return quantity * gramsPerUnit;
+    throw new RangeError(`No gram conversion is defined for ${fromUnit}`);
   }
 
   // Use standard conversion table
@@ -129,8 +159,7 @@ export function convertToGrams(quantity, fromUnit, food) {
     return quantity * def.toGrams;
   }
 
-  // Fallback: treat as grams
-  return quantity;
+  throw new RangeError(`No gram conversion is defined for ${fromUnit}`);
 }
 
 /**

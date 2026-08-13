@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { addCalendarDays, formatDate, toLocalDate } from '../src/utils/format.js';
-import { getNutritionMultiplier } from '../src/utils/units.js';
+import { getNutritionMultiplier, getUnitsForFood } from '../src/utils/units.js';
 import { scaleNutrients, calculateDayTotalsSimple } from '../src/engine/nutrition.js';
 import { normalizeProduct } from '../src/integrations/openfoodfacts.js';
 import { normalizeFood } from '../src/integrations/usdaFdc.js';
+import { DEFAULT_FOODS } from '../src/data/seed-foods.js';
 
 const egg = {
   servingSize: { quantity: 1, unit: 'large' },
@@ -33,6 +34,33 @@ test('adds calendar days across month and DST boundaries', () => {
 test('one count-based serving has a multiplier of one', () => {
   assert.equal(getNutritionMultiplier(1, 'large', egg), 1);
   assert.equal(scaleNutrients(egg, 1, 'large').kcal, 70);
+});
+
+test('count-based foods hide mass units without an explicit conversion', () => {
+  assert.deepEqual(getUnitsForFood(egg), [{ value: 'large', label: 'large' }]);
+  assert.throws(
+    () => getNutritionMultiplier(50, 'g', egg),
+    /No gram conversion is defined/
+  );
+});
+
+test('count-based foods allow mass units with an explicit conversion', () => {
+  const eggWithWeight = {
+    ...egg,
+    servingSize: { ...egg.servingSize, gramsPerUnit: 50 },
+  };
+
+  assert.deepEqual(
+    getUnitsForFood(eggWithWeight).map(unit => unit.value),
+    ['large', 'g', 'oz']
+  );
+  assert.equal(getNutritionMultiplier(50, 'g', eggWithWeight), 1);
+});
+
+test('seeded count foods carry the weight conversion behind their nutrition', () => {
+  const seededEgg = DEFAULT_FOODS.find(food => food.name === 'Egg, large');
+  assert.equal(getNutritionMultiplier(50, 'g', seededEgg), 1);
+  assert.equal(scaleNutrients(seededEgg, 50, 'g').kcal, 70);
 });
 
 test('unit conversion scales mass servings', () => {

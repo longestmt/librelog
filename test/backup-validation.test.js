@@ -5,7 +5,17 @@ import { DATA_SCHEMA_VERSION, validateBackupData } from '../src/data/db.js';
 const validBackup = {
   version: 1,
   stores: {
-    foods: [{ id: 'food-1', name: 'Fixture' }],
+    foods: [{
+      id: 'food-1',
+      name: 'Fixture',
+      servingSize: { quantity: 100, unit: 'g' },
+      nutrients: {
+        energy: { kcal: 100 },
+        macros: { protein: { g: 1 }, carbs: { g: 2 }, fat: { g: 3 } },
+        fiber: { g: null },
+        sodium: { mg: null },
+      },
+    }],
     settings: [{ key: 'theme', value: 'compline' }],
   },
 };
@@ -28,6 +38,27 @@ test('rejects malformed records before replacement can clear data', () => {
   assert.throws(
     () => validateBackupData({ version: 1, stores: { settings: [{ value: true }] } }),
     /valid key/i,
+  );
+  assert.throws(
+    () => validateBackupData({
+      version: 1,
+      stores: { meals: [{ id: 'meal-1', date: 'not-a-date', type: 'invalid', items: 'broken' }] },
+    }),
+    /valid date/i,
+  );
+  assert.throws(
+    () => validateBackupData({
+      version: 1,
+      stores: {
+        meals: [{
+          id: 'meal-1',
+          date: '2026-08-13',
+          type: 'lunch',
+          items: [{ foodId: 'food-1', quantity: -1, unit: 'g' }],
+        }],
+      },
+    }),
+    /positive number/i,
   );
 });
 

@@ -39,6 +39,20 @@ async function logEggOnPreviousDay(page, meal = 'Lunch') {
   return { targetDate, historicalLabel };
 }
 
+test('a weighted seeded egg uses its explicit count conversion', async ({ page }) => {
+  await preparePage(page);
+  await page.getByRole('button', { name: 'Add food to Lunch' }).click();
+  await page.getByRole('searchbox', { name: 'Search for foods' }).fill('egg');
+  await page.getByRole('button', { name: /Egg, large.*70 calories/i }).first().click();
+
+  const dialog = page.getByRole('dialog', { name: 'Egg, large' });
+  await dialog.getByRole('combobox', { name: 'Unit', exact: true }).selectOption('g');
+  await dialog.getByRole('spinbutton', { name: 'Quantity' }).fill('50');
+  await dialog.getByRole('spinbutton', { name: 'Quantity' }).press('Tab');
+  await expect(dialog).toContainText('70 kcal');
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+});
+
 test('historical meal can be logged, edited, and deleted without changing its date', async ({ page }) => {
   await logEggOnPreviousDay(page);
 
@@ -111,7 +125,10 @@ test('credential-free backup restores into a clean browser profile', async ({ pa
   await cleanPage.getByRole('button', { name: 'Import Data' }).click();
   const chooser = await chooserPromise;
   await chooser.setFiles(backupPath);
-  await expect(cleanPage.getByRole('status')).toContainText('Data imported successfully');
+  const reviewDialog = cleanPage.getByRole('dialog', { name: 'Review Import' });
+  await expect(reviewDialog).toContainText('Merge (recommended)');
+  await reviewDialog.getByRole('button', { name: 'Merge (Recommended)' }).click();
+  await expect(cleanPage.getByRole('status')).toContainText('Import merged');
 
   await cleanPage.goto(`/#/diary?date=${targetDate}`, { waitUntil: 'commit' });
   await expect(cleanPage.getByRole('button', { name: /Egg, large, 1 large, 70 calories/i })).toBeVisible();
@@ -152,8 +169,10 @@ test('an encrypted backup requires its passphrase and restores in a clean profil
 
   const importDialog = cleanPage.getByRole('dialog', { name: 'Unlock Encrypted Backup' });
   await importDialog.getByLabel('Passphrase', { exact: true }).fill(backupPassphrase);
-  await importDialog.getByRole('button', { name: 'Unlock and Import' }).click();
-  await expect(cleanPage.getByRole('status')).toContainText('Encrypted data imported');
+  await importDialog.getByRole('button', { name: 'Unlock and Review' }).click();
+  const reviewDialog = cleanPage.getByRole('dialog', { name: 'Review Import' });
+  await reviewDialog.getByRole('button', { name: 'Full Replacement' }).click();
+  await expect(cleanPage.getByRole('status')).toContainText('Import replaced');
 
   await cleanPage.goto(`/#/diary?date=${targetDate}`, { waitUntil: 'commit' });
   await expect(cleanPage.getByRole('button', { name: /Egg, large, 1 large, 70 calories/i })).toBeVisible();

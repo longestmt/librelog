@@ -42,8 +42,8 @@ You can encrypt portable and WebDAV backups with a passphrase.
 ### Data & Privacy
 - **Offline-first** — Works without internet via service worker
 - **Local-first storage** — Core data stays in IndexedDB unless you use an explicit remote feature
-- **Auto-backup** — Every 6 hours to filesystem or localStorage
-- **JSON export/import** — Full data portability
+- **Auto-backup** — Verified snapshots every 6 hours to native filesystem or browser storage
+- **JSON export/import** — Private exports plus merge-first, previewed imports
 - **Encrypted backup** — Optional passphrase encryption for portable and WebDAV files
 - **MyFitnessPal import** — CSV migration from MFP
 - **WebDAV backup/restore** — Optional self-hosted backup (Nextcloud, etc.)
@@ -96,6 +96,9 @@ npm run check:all
 
 # Preview production build
 npm run preview
+
+# Build web assets and synchronize the iOS and Android projects
+npm run native:sync
 ```
 
 ## AI Setup (Optional)

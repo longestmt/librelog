@@ -35,8 +35,9 @@ This control is not a hardware-backed secret store. LibreLog cannot recover a
 lost passphrase.
 
 JSON exports, browser auto-backups, and WebDAV backups exclude credential
-settings. Replacement imports preserve credentials already on the device and
-ignore credentials included in an imported file.
+settings, soft-deleted records, API cache entries, and cached search terms.
+Replacement imports preserve credentials already on the device and ignore
+credentials included in an imported file.
 
 Users should protect their operating-system account and browser profile, use
 provider-side spending limits, and revoke a key if the device or profile is
@@ -46,8 +47,11 @@ compromised.
 
 - Untrusted strings are escaped before insertion into HTML; toast messages use
   `textContent`.
-- JSON backups are shape-checked before import and replacement runs in one
-  multi-store IndexedDB transaction.
+- JSON backups are validated for store, date, meal, serving, nutrition, recipe,
+  and measurement structure before import. Merge preserves existing local
+  records; replacement runs in one multi-store IndexedDB transaction.
+- Automatic backups are read back and verified before LibreLog records a
+  successful backup time. Full replacement requires a verified safety backup.
 - IndexedDB schema version 2 adds the meal idempotency index.
 - LibreLog makes a credential-free checkpoint before the version 2 migration.
 - Settings can restore the migration checkpoint.

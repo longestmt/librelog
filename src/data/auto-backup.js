@@ -6,6 +6,7 @@
 
 import { exportAllData } from './db.js';
 import { getSetting, setSetting } from './db.js';
+import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
 
 const BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const MAX_BACKUPS = 7;
@@ -19,6 +20,10 @@ let visibilityHandler = null;
  * Checks integrity on startup, then schedules periodic backups.
  */
 export async function initAutoBackup() {
+  // Inspect the current database against the previous recovery point before a
+  // new snapshot can replace evidence of data loss.
+  await checkIntegrity();
+
   // Check if a backup is overdue
   const lastBackup = await getSetting('lastBackupTime');
   const now = Date.now();
@@ -26,9 +31,6 @@ export async function initAutoBackup() {
   if (!lastBackup || (now - lastBackup) >= BACKUP_INTERVAL_MS) {
     await performBackup();
   }
-
-  // Verify IndexedDB integrity
-  await checkIntegrity();
 
   // Schedule recurring backups
   backupTimer = setInterval(performBackup, BACKUP_INTERVAL_MS);
@@ -73,29 +75,27 @@ export async function performBackup() {
     if (await saveToFilesystem(snapshot)) {
       await setSetting('lastBackupTime', Date.now());
       await setSetting('lastBackupMethod', 'filesystem');
-      return;
+      return true;
     }
 
     // Fall back to localStorage snapshots
-    saveToLocalStorage(snapshot);
+    if (!saveToLocalStorage(snapshot)) return false;
     await setSetting('lastBackupTime', Date.now());
     await setSetting('lastBackupMethod', 'localStorage');
+    return true;
   } catch (err) {
     console.error('Auto-backup failed:', err);
+    return false;
   }
 }
 
 /**
  * Try to save backup using Capacitor Filesystem API
  * @param {Object} snapshot - Backup snapshot
- * @returns {boolean} Whether save succeeded
+ * @returns {Promise<boolean>} Whether save and verification succeeded
  */
 async function saveToFilesystem(snapshot) {
   try {
-    // Dynamic import with variable to prevent Rollup from resolving at build time
-    const fsModulePath = '@capacitor/filesystem';
-    const { Filesystem, Directory } = await import(/* @vite-ignore */ fsModulePath);
-
     const filename = `librelog-backup-${snapshot.timestamp}.json`;
     const jsonStr = JSON.stringify(snapshot.data);
 
@@ -103,8 +103,18 @@ async function saveToFilesystem(snapshot) {
       path: `librelog-backups/${filename}`,
       data: jsonStr,
       directory: Directory.Data,
+      encoding: Encoding.UTF8,
       recursive: true,
     });
+
+    const verification = await Filesystem.readFile({
+      path: `librelog-backups/${filename}`,
+      directory: Directory.Data,
+      encoding: Encoding.UTF8,
+    });
+    if (verification.data !== jsonStr) {
+      throw new Error('Native backup verification failed');
+    }
 
     // Clean up old backups beyond MAX_BACKUPS
     try {
@@ -136,8 +146,9 @@ async function saveToFilesystem(snapshot) {
 }
 
 /**
- * Save backup to localStorage as a rolling buffer
+ * Save and verify a backup in localStorage as a rolling buffer.
  * @param {Object} snapshot - Backup snapshot
+ * @returns {boolean} Whether save and verification succeeded
  */
 function saveToLocalStorage(snapshot) {
   try {
@@ -159,7 +170,12 @@ function saveToLocalStorage(snapshot) {
       backups = backups.slice(-MAX_BACKUPS);
     }
 
-    localStorage.setItem(BACKUP_STORAGE_KEY, JSON.stringify(backups));
+    const serialized = JSON.stringify(backups);
+    localStorage.setItem(BACKUP_STORAGE_KEY, serialized);
+    if (localStorage.getItem(BACKUP_STORAGE_KEY) !== serialized) {
+      throw new Error('Browser backup verification failed');
+    }
+    return true;
   } catch (err) {
     // localStorage may be full — try keeping fewer backups
     console.warn('localStorage backup failed, trying with fewer backups:', err);
@@ -169,9 +185,15 @@ function saveToLocalStorage(snapshot) {
         date: snapshot.date,
         data: snapshot.data,
       }];
-      localStorage.setItem(BACKUP_STORAGE_KEY, JSON.stringify(minimal));
+      const serialized = JSON.stringify(minimal);
+      localStorage.setItem(BACKUP_STORAGE_KEY, serialized);
+      if (localStorage.getItem(BACKUP_STORAGE_KEY) !== serialized) {
+        throw new Error('Browser backup verification failed');
+      }
+      return true;
     } catch (e) {
       console.error('Cannot save backup to localStorage:', e);
+      return false;
     }
   }
 }
@@ -187,8 +209,12 @@ async function checkIntegrity() {
     const totalRecords = storeNames.reduce((sum, name) => sum + (data.stores[name]?.length || 0), 0);
 
     const lastKnownCount = await getSetting('lastRecordCount');
+    const latestBackup = getLatestBrowserBackup();
+    const currentMeals = data.stores.meals?.length || 0;
+    const backedUpMeals = latestBackup?.data?.stores?.meals?.length || 0;
 
-    if (lastKnownCount !== null && totalRecords === 0 && lastKnownCount > 10) {
+    if ((lastKnownCount !== null && totalRecords === 0 && lastKnownCount > 10)
+      || (currentMeals === 0 && backedUpMeals > 0)) {
       // Possible data loss — offer restore
       console.warn('Possible IndexedDB data loss detected. Last known:', lastKnownCount, 'Current:', totalRecords);
       offerRestore();
@@ -197,6 +223,17 @@ async function checkIntegrity() {
     await setSetting('lastRecordCount', totalRecords);
   } catch (err) {
     console.error('Integrity check failed:', err);
+  }
+}
+
+function getLatestBrowserBackup() {
+  try {
+    const stored = localStorage.getItem(BACKUP_STORAGE_KEY);
+    if (!stored) return null;
+    const backups = JSON.parse(stored);
+    return Array.isArray(backups) ? backups.at(-1) || null : null;
+  } catch {
+    return null;
   }
 }
 
@@ -249,8 +286,6 @@ export function getBackupData(timestamp) {
 export async function clearAutoBackups() {
   localStorage.removeItem(BACKUP_STORAGE_KEY);
   try {
-    const fsModulePath = '@capacitor/filesystem';
-    const { Filesystem, Directory } = await import(/* @vite-ignore */ fsModulePath);
     await Filesystem.rmdir({
       path: 'librelog-backups',
       directory: Directory.Data,

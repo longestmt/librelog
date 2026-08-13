@@ -10,8 +10,9 @@ import { getGoals, setGoals } from '../engine/goal-tracking.js';
 import {
   exportData,
   exportEncryptedData,
-  importData,
   importMyFitnessPalCSV,
+  prepareImportData,
+  summarizeImportData,
 } from '../data/io.js';
 import {
   getWebDavConfig,
@@ -23,7 +24,7 @@ import {
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { escapeHTML } from '../utils/sanitize.js';
-import { clearAutoBackups, stopAutoBackup } from '../data/auto-backup.js';
+import { clearAutoBackups, performBackup, stopAutoBackup } from '../data/auto-backup.js';
 import {
   getCredential,
   enableCredentialEncryption,
@@ -558,19 +559,17 @@ export async function renderSettingsPage(container, queryString) {
       if (!file) return;
 
       try {
-        await importData(file);
-        showToast('Data imported successfully');
-        render();
+        const data = await prepareImportData(file);
+        openImportPreview(data, file.name);
       } catch (err) {
         if (err.code === 'BACKUP_PASSPHRASE_REQUIRED') {
           openPassphraseAction({
             title: 'Unlock Encrypted Backup',
             message: 'Enter the passphrase for this backup.',
-            confirmLabel: 'Unlock and Import',
+            confirmLabel: 'Unlock and Review',
             action: async passphrase => {
-              await importData(file, false, { passphrase });
-              showToast('Encrypted data imported');
-              render();
+              const data = await prepareImportData(file, { passphrase });
+              setTimeout(() => openImportPreview(data, file.name), 200);
             },
           });
           return;
@@ -580,6 +579,74 @@ export async function renderSettingsPage(container, queryString) {
       }
     });
     input.click();
+  }
+
+  function openImportPreview(data, filename) {
+    const summary = summarizeImportData(data);
+    const labels = {
+      foods: 'foods',
+      meals: 'meals',
+      recipes: 'recipes',
+      measurements: 'measurements',
+      settings: 'settings',
+    };
+    const countItems = Object.entries(summary.counts)
+      .map(([store, count]) => `<li><strong>${count}</strong> ${labels[store] || store}</li>`)
+      .join('');
+    const exported = summary.exportedAt
+      ? new Date(summary.exportedAt).toLocaleString()
+      : 'Date not provided';
+
+    const modal = document.createElement('div');
+    modal.className = 'modal-content confirm-modal';
+    modal.innerHTML = `
+      <div class="modal-header"><h2>Review Import</h2></div>
+      <p class="confirm-message"><strong>${escapeHTML(filename || 'LibreLog backup')}</strong><br>${escapeHTML(exported)}</p>
+      <ul class="import-summary">${countItems}</ul>
+      <p class="setting-hint"><strong>Merge (recommended)</strong> adds records that are not already on this device. Existing local records win if IDs match.</p>
+      <p class="setting-hint"><strong>Full replacement</strong> replaces local meals, foods, recipes, measurements, and non-secret settings. LibreLog must verify a safety backup first.</p>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="cancel-btn">Cancel</button>
+        <button class="btn btn-danger" id="replace-import-btn">Full Replacement</button>
+        <button class="btn btn-primary" id="merge-import-btn">Merge (Recommended)</button>
+      </div>
+    `;
+    openModal(modal);
+
+    const mergeButton = document.getElementById('merge-import-btn');
+    const replaceButton = document.getElementById('replace-import-btn');
+    document.getElementById('cancel-btn').addEventListener('click', closeModal);
+
+    async function runImport(merge, button) {
+      mergeButton.disabled = true;
+      replaceButton.disabled = true;
+      button.textContent = merge ? 'Merging…' : 'Making Safety Backup…';
+      try {
+        if (!merge) {
+          const backupSucceeded = await performBackup();
+          if (!backupSucceeded) {
+            throw new Error('Full replacement stopped because a safety backup could not be verified');
+          }
+          button.textContent = 'Replacing…';
+        }
+        await importAllData(data, merge);
+        closeModal();
+        showToast(merge
+          ? `Import merged ${summary.totalRecords} records; existing local records were kept`
+          : `Import replaced local data with ${summary.totalRecords} records`);
+        render();
+      } catch (err) {
+        console.error('Import failed:', err);
+        showToast(err.message || 'Import failed. Local data was not changed.');
+        mergeButton.disabled = false;
+        replaceButton.disabled = false;
+        mergeButton.textContent = 'Merge (Recommended)';
+        replaceButton.textContent = 'Full Replacement';
+      }
+    }
+
+    mergeButton.addEventListener('click', event => runImport(true, event.currentTarget));
+    replaceButton.addEventListener('click', event => runImport(false, event.currentTarget));
   }
 
   function handleClear() {

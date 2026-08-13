@@ -3,7 +3,14 @@
  * Handles JSON backups, CSV diary exports, and MyFitnessPal CSV import
  */
 
-import { exportAllData, importAllData, put, getAll, setSetting } from './db.js';
+import {
+  exportAllData,
+  importAllData,
+  put,
+  getAll,
+  setSetting,
+  validateBackupData,
+} from './db.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './encryption.js';
 import { createDeterministicKey, createMeal } from './meal-commands.js';
 import { todayStr } from '../utils/format.js';
@@ -78,10 +85,9 @@ export function readFileAsJSON(file) {
 /**
  * Import data from a JSON backup file
  * @param {File} file
- * @param {boolean} merge - if false, clears existing data first
- * @returns {Promise<void>}
+ * @returns {Promise<Object>} validated, decrypted backup data
  */
-export async function importData(file, merge = false, { passphrase = null } = {}) {
+export async function prepareImportData(file, { passphrase = null } = {}) {
     let data = await readFileAsJSON(file);
     if (isEncryptedBackup(data)) {
         if (!passphrase) {
@@ -91,8 +97,32 @@ export async function importData(file, merge = false, { passphrase = null } = {}
         }
         data = await decryptBackup(data, passphrase);
     }
-    if (!data.stores) throw new Error('Invalid LibreLog backup file');
+    validateBackupData(data);
+    return data;
+}
+
+export function summarizeImportData(data) {
+    const stores = validateBackupData(data);
+    const counts = Object.fromEntries(stores.map(name => [name, data.stores[name].length]));
+    return {
+        exportedAt: data.exportedAt || null,
+        counts,
+        totalRecords: Object.values(counts).reduce((sum, count) => sum + count, 0),
+    };
+}
+
+/**
+ * Import data from a JSON backup file. Merge is deliberately the default and
+ * preserves local records when an imported record has the same key.
+ * @param {File} file
+ * @param {boolean} merge - if false, clears imported stores first
+ * @returns {Promise<Object>} import summary
+ */
+export async function importData(file, merge = true, { passphrase = null } = {}) {
+    const data = await prepareImportData(file, { passphrase });
+    const summary = summarizeImportData(data);
     await importAllData(data, merge);
+    return summary;
 }
 
 /**

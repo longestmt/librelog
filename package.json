@@ -13,11 +13,12 @@
     "test:e2e": "npm run build && playwright test --project=chromium",
     "test:e2e:all": "npm run build && playwright test",
     "check": "npm run test:unit && npm run test:e2e",
-    "check:all": "npm run test:unit && npm run test:e2e:all"
+    "check:all": "npm run test:unit && npm run test:e2e:all",
+    "native:sync": "npm run build && cap sync"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",
-    "@capacitor/cli": "^8.1.0",
+    "@capacitor/cli": "8.4.2",
     "@playwright/test": "^1.62.0",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
     "fake-indexeddb": "^6.2.5",
@@ -26,12 +27,17 @@
   },
   "license": "AGPL-3.0-or-later",
   "dependencies": {
-    "@capacitor/android": "^8.1.0",
-    "@capacitor/core": "^8.1.0",
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor/filesystem": "^8.1.2",
     "@capacitor/haptics": "^8.0.1",
+    "@capacitor/ios": "^8.5.0",
     "@ericblade/quagga2": "1.12.0"
   },
   "overrides": {
-    "filelist": "2.0.2"
+    "brace-expansion": "5.0.9",
+    "fast-uri": "3.1.5",
+    "filelist": "2.0.2",
+    "nanoid": "3.3.18"
   }
 }

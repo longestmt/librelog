@@ -9,6 +9,7 @@ const DB_VERSION = 2;
 export const DATA_SCHEMA_VERSION = DB_VERSION;
 export const BACKUP_SCHEMA_VERSION = 1;
 const DATA_STORES = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
+const PORTABLE_DATA_STORES = DATA_STORES.filter(name => name !== 'apiCache');
 const MIGRATION_BACKUP_KEY = 'librelog_migration_backups';
 const MAX_MIGRATION_BACKUPS = 3;
 const SENSITIVE_SETTING_KEYS = new Set([
@@ -46,10 +47,15 @@ function writeMigrationBackup(backup) {
     localStorage.setItem(MIGRATION_BACKUP_KEY, JSON.stringify(backups));
 }
 
-function filterExportRecords(storeName, records) {
+function filterSensitiveSettings(storeName, records) {
     return storeName === 'settings'
         ? records.filter(record => !SENSITIVE_SETTING_KEYS.has(record.key))
         : records;
+}
+
+function filterPortableExportRecords(storeName, records) {
+    return filterSensitiveSettings(storeName, records)
+        .filter(record => record.deleted !== true);
 }
 
 function createStoresAndIndexes(db, transaction) {
@@ -133,7 +139,7 @@ function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
         const request = transaction.objectStore(name).getAll();
         request.onerror = fail;
         request.onsuccess = () => {
-            exportedStores[name] = filterExportRecords(name, request.result);
+            exportedStores[name] = filterSensitiveSettings(name, request.result);
             pending -= 1;
             if (pending !== 0) return;
 
@@ -387,13 +393,134 @@ export async function exportAllData() {
         secretsExcluded: true,
         stores: {},
     };
-    for (const name of DATA_STORES) {
-        if (!db.objectStoreNames.contains(name)) continue;
-        const store = await getStore(name);
-        const records = await promisifyRequest(store.getAll());
-        data.stores[name] = filterExportRecords(name, records);
-    }
+    const stores = PORTABLE_DATA_STORES.filter(name => db.objectStoreNames.contains(name));
+    const transaction = db.transaction(stores, 'readonly');
+    const reads = stores.map(async name => {
+        const records = await promisifyRequest(transaction.objectStore(name).getAll());
+        return [name, filterPortableExportRecords(name, records)];
+    });
+    for (const [name, records] of await Promise.all(reads)) data.stores[name] = records;
     return data;
+}
+
+function isCalendarDate(value) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
+    const [year, month, day] = value.split('-').map(Number);
+    const date = new Date(year, month - 1, day);
+    return date.getFullYear() === year
+        && date.getMonth() === month - 1
+        && date.getDate() === day;
+}
+
+function validatePositiveNumber(value, label) {
+    if (!Number.isFinite(Number(value)) || Number(value) <= 0) {
+        throw new Error(`Backup ${label} must be a positive number`);
+    }
+}
+
+function validateOptionalNutritionValue(value, label) {
+    if (value != null && !Number.isFinite(Number(value))) {
+        throw new Error(`Backup ${label} must be a number or null`);
+    }
+}
+
+function validateServingSize(servingSize, label) {
+    if (!servingSize || typeof servingSize !== 'object' || Array.isArray(servingSize)) {
+        throw new Error(`Backup ${label} requires a serving size`);
+    }
+    validatePositiveNumber(servingSize.quantity, `${label} serving quantity`);
+    if (typeof servingSize.unit !== 'string' || !servingSize.unit.trim()) {
+        throw new Error(`Backup ${label} requires a serving unit`);
+    }
+    if (servingSize.aliases != null && !Array.isArray(servingSize.aliases)) {
+        throw new Error(`Backup ${label} serving aliases must be an array`);
+    }
+    if (servingSize.gramsPerUnit != null) {
+        validatePositiveNumber(servingSize.gramsPerUnit, `${label} grams per unit`);
+    }
+    for (const alias of servingSize.aliases || []) {
+        if (!alias || typeof alias !== 'object' || typeof alias.unit !== 'string' || !alias.unit.trim()) {
+            throw new Error(`Backup ${label} contains an invalid serving alias`);
+        }
+        validatePositiveNumber(alias.gramsPerUnit, `${label} alias grams per unit`);
+    }
+}
+
+function validateNutrients(nutrients, label) {
+    if (!nutrients || typeof nutrients !== 'object' || Array.isArray(nutrients)) {
+        throw new Error(`Backup ${label} requires nutrition data`);
+    }
+    if ('kcal' in nutrients || 'protein' in nutrients || 'carbs' in nutrients || 'fat' in nutrients) {
+        validateOptionalNutritionValue(nutrients.kcal, `${label} calories`);
+        validateOptionalNutritionValue(nutrients.protein, `${label} protein`);
+        validateOptionalNutritionValue(nutrients.carbs, `${label} carbohydrates`);
+        validateOptionalNutritionValue(nutrients.fat, `${label} fat`);
+        validateOptionalNutritionValue(nutrients.fiber, `${label} fiber`);
+        validateOptionalNutritionValue(nutrients.sodium, `${label} sodium`);
+    } else {
+        validateOptionalNutritionValue(nutrients.energy?.kcal, `${label} calories`);
+        validateOptionalNutritionValue(nutrients.macros?.protein?.g, `${label} protein`);
+        validateOptionalNutritionValue(nutrients.macros?.carbs?.g, `${label} carbohydrates`);
+        validateOptionalNutritionValue(nutrients.macros?.fat?.g, `${label} fat`);
+        validateOptionalNutritionValue(nutrients.fiber?.g, `${label} fiber`);
+        validateOptionalNutritionValue(nutrients.sodium?.mg, `${label} sodium`);
+    }
+}
+
+function validateMealItem(item, label) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        throw new Error(`Backup ${label} contains an invalid item`);
+    }
+    if (typeof item.foodId !== 'string' || !item.foodId) {
+        throw new Error(`Backup ${label} item requires a food ID`);
+    }
+    validatePositiveNumber(item.quantity, `${label} item quantity`);
+    if (typeof item.unit !== 'string' || !item.unit.trim()) {
+        throw new Error(`Backup ${label} item requires a unit`);
+    }
+    if (item.nutrients != null) validateNutrients(item.nutrients, `${label} item`);
+}
+
+function validateStoreRecord(name, record) {
+    if (name === 'settings') {
+        if (typeof record.key !== 'string' || !record.key) {
+            throw new Error('Backup contains a setting without a valid key');
+        }
+        return;
+    }
+    if (typeof record.id !== 'string' || !record.id) {
+        throw new Error(`Backup store "${name}" contains a record without a valid id`);
+    }
+
+    if (name === 'foods') {
+        if (typeof record.name !== 'string' || !record.name.trim()) {
+            throw new Error('Backup food requires a name');
+        }
+        validateServingSize(record.servingSize, 'food');
+        validateNutrients(record.nutrients, 'food');
+    } else if (name === 'meals') {
+        if (!isCalendarDate(record.date)) throw new Error('Backup meal requires a valid date');
+        if (!['breakfast', 'lunch', 'dinner', 'snacks'].includes(record.type)) {
+            throw new Error('Backup meal requires a valid meal type');
+        }
+        if (!Array.isArray(record.items) || (record.items.length === 0 && record.deleted !== true)) {
+            throw new Error('Backup meal requires an item array');
+        }
+        record.items.forEach(item => validateMealItem(item, 'meal'));
+    } else if (name === 'recipes') {
+        if (typeof record.name !== 'string' || !record.name.trim()) {
+            throw new Error('Backup recipe requires a name');
+        }
+        if (!Array.isArray(record.items)) throw new Error('Backup recipe requires an item array');
+        record.items.forEach(item => validateMealItem(item, 'recipe'));
+        if (record.servings != null) validatePositiveNumber(record.servings, 'recipe servings');
+    } else if (name === 'measurements') {
+        if (!isCalendarDate(record.date)) throw new Error('Backup measurement requires a valid date');
+        validatePositiveNumber(record.weight, 'measurement weight');
+        if (record.unit != null && !['kg', 'lb'].includes(record.unit)) {
+            throw new Error('Backup measurement requires a valid unit');
+        }
+    }
 }
 
 /**
@@ -422,7 +549,9 @@ export function validateBackupData(data) {
         throw new Error(`Data schema version ${data.dataVersion} is not supported`);
     }
 
-    const available = DATA_STORES.filter(name => Object.hasOwn(data.stores, name));
+    // API cache was included in older backups. It contains private search terms
+    // and is deliberately ignored during portable import.
+    const available = PORTABLE_DATA_STORES.filter(name => Object.hasOwn(data.stores, name));
     if (available.length === 0) throw new Error('Backup contains no recognized data stores');
 
     let totalRecords = 0;
@@ -437,13 +566,7 @@ export function validateBackupData(data) {
             if (!record || typeof record !== 'object' || Array.isArray(record)) {
                 throw new Error(`Backup store "${name}" contains an invalid record`);
             }
-            if (name === 'settings') {
-                if (typeof record.key !== 'string' || !record.key) {
-                    throw new Error('Backup contains a setting without a valid key');
-                }
-            } else if (typeof record.id !== 'string' || !record.id) {
-                throw new Error(`Backup store "${name}" contains a record without a valid id`);
-            }
+            validateStoreRecord(name, record);
         }
     }
     return available;
@@ -471,8 +594,12 @@ export async function importAllData(data, merge = false) {
         }
     }
 
+    const transactionStores = !merge && db.objectStoreNames.contains('apiCache')
+        ? [...stores, 'apiCache']
+        : stores;
+
     await new Promise((resolve, reject) => {
-        const tx = db.transaction(stores, 'readwrite');
+        const tx = db.transaction(transactionStores, 'readwrite');
 
         try {
             for (const name of stores) {
@@ -480,8 +607,24 @@ export async function importAllData(data, merge = false) {
                 if (!merge) store.clear();
                 for (const record of data.stores[name]) {
                     if (name === 'settings' && SENSITIVE_SETTING_KEYS.has(record.key)) continue;
-                    store.put(structuredClone(record));
+                    if (record.deleted === true) continue;
+                    const copy = structuredClone(record);
+                    if (!merge) {
+                        store.put(copy);
+                        continue;
+                    }
+
+                    // Merge is intentionally local-first: existing records win.
+                    const key = name === 'settings' ? record.key : record.id;
+                    const request = store.get(key);
+                    request.onsuccess = () => {
+                        if (request.result === undefined) store.put(copy);
+                    };
                 }
+            }
+
+            if (!merge && transactionStores.includes('apiCache')) {
+                tx.objectStore('apiCache').clear();
             }
 
             if (!merge && stores.includes('settings')) {

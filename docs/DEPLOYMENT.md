@@ -28,19 +28,13 @@ cd librelog
 # Install dependencies
 npm install
 
-# Install Capacitor
-npm install @capacitor/cli @capacitor/core
-npx cap init librelog com.libre.librelog
-
-# Add native platforms
-npx cap add ios
-npx cap add android
-
-# Install native plugins
-npm install @capacitor/camera @capacitor/geolocation
-npm install @capacitor-mlkit/barcode-scanning
-npm install @capacitor-firebase/analytics
+# Build web assets and synchronize the checked-in native projects
+npm run native:sync
 ```
+
+The repository includes the Capacitor iOS and Android projects. Filesystem
+backups and haptics are the only packaged native plugins. LibreLog does not
+package analytics. Camera-based barcode scanning uses the web camera API.
 
 ### 1.3 Development Server
 

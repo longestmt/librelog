@@ -11,7 +11,7 @@
 export const DEFAULT_FOODS = [
     {
         name: 'Egg, large',
-        servingSize: { quantity: 1, unit: 'large' },
+        servingSize: { quantity: 1, unit: 'large', gramsPerUnit: 50 },
         nutrients: {
             energy: { kcal: 70 },
             macros: { protein: { g: 6 }, carbs: { g: 0.5 }, fat: { g: 5 } },
@@ -59,7 +59,7 @@ export const DEFAULT_FOODS = [
     },
     {
         name: 'Banana, medium',
-        servingSize: { quantity: 1, unit: 'medium' },
+        servingSize: { quantity: 1, unit: 'medium', gramsPerUnit: 118 },
         nutrients: {
             energy: { kcal: 105 },
             macros: { protein: { g: 1.3 }, carbs: { g: 27 }, fat: { g: 0.3 } },
@@ -71,7 +71,7 @@ export const DEFAULT_FOODS = [
     },
     {
         name: 'Apple, medium',
-        servingSize: { quantity: 1, unit: 'medium' },
+        servingSize: { quantity: 1, unit: 'medium', gramsPerUnit: 182 },
         nutrients: {
             energy: { kcal: 95 },
             macros: { protein: { g: 0.5 }, carbs: { g: 25 }, fat: { g: 0.3 } },
@@ -275,7 +275,7 @@ export const DEFAULT_FOODS = [
     },
     {
         name: 'Orange, medium',
-        servingSize: { quantity: 1, unit: 'medium' },
+        servingSize: { quantity: 1, unit: 'medium', gramsPerUnit: 131 },
         nutrients: {
             energy: { kcal: 62 },
             macros: { protein: { g: 1.2 }, carbs: { g: 15 }, fat: { g: 0.3 } },

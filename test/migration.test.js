@@ -41,7 +41,17 @@ async function createVersionOneDatabase() {
   const db = await requestResult(request);
   await new Promise((resolve, reject) => {
     const transaction = db.transaction(['foods', 'meals', 'settings'], 'readwrite');
-    transaction.objectStore('foods').put({ id: 'legacy-food', name: 'Legacy food' });
+    transaction.objectStore('foods').put({
+      id: 'legacy-food',
+      name: 'Legacy food',
+      servingSize: { quantity: 1, unit: 'serving' },
+      nutrients: {
+        energy: { kcal: 100 },
+        macros: { protein: { g: 1 }, carbs: { g: 2 }, fat: { g: 3 } },
+        fiber: { g: null },
+        sodium: { mg: null },
+      },
+    });
     transaction.objectStore('meals').put({
       id: 'legacy-meal',
       date: '2026-07-26',

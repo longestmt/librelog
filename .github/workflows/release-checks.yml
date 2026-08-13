@@ -17,8 +17,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
-      - name: Check production dependencies
-        run: npm audit --omit=dev --audit-level=high
+      - name: Check dependencies
+        run: npm audit --audit-level=high
       - name: Run unit tests
         run: npm run test:unit
 
@@ -48,3 +48,41 @@ jobs:
           path: test-results
           if-no-files-found: ignore
           retention-days: 7
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - run: npm ci
+      - run: npm run native:sync
+      - name: Build Android debug application
+        run: ./android/gradlew -p android assembleDebug
+
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run native:sync
+      - name: Build iOS simulator application
+        run: >-
+          xcodebuild
+          -project ios/App/App.xcodeproj
+          -scheme App
+          -sdk iphonesimulator
+          -configuration Debug
+          CODE_SIGNING_ALLOWED=NO
+          build
