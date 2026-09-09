@@ -1172,9 +1172,13 @@ export async function renderSearchPage(container, queryString) {
         ` : ''}
         <textarea class="ai-text-area" id="ai-text-input" rows="3" maxlength="2000" placeholder="Describe what you ate, attach a photo, or both..." aria-label="Describe your meal">${escapeHTML(aiTextValue)}</textarea>
         <div class="ai-input-actions">
-          <button class="btn btn-secondary btn-small" id="ai-photo-btn" aria-label="Attach photo">
+          <button class="btn btn-secondary btn-small ai-take-photo-action" id="ai-take-photo-btn">
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-            Photo
+            Take photo
+          </button>
+          <button class="btn btn-secondary btn-small" id="ai-upload-photo-btn">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M20 15v4a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-4"/></svg>
+            Upload photo
           </button>
           <button class="btn btn-secondary btn-small ${isRecording ? 'recording' : ''}" id="ai-voice-btn" aria-label="${isRecording ? 'Stop recording' : voiceAvailable ? 'Record voice' : 'Voice unavailable in this browser'}" ${voiceAvailable ? '' : 'disabled'}>
               <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="${isRecording ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
@@ -1194,13 +1198,17 @@ export async function renderSearchPage(container, queryString) {
     bindFamiliarMealEvents();
 
     // Photo attachment
-    document.getElementById('ai-photo-btn')?.addEventListener('click', () => {
-      // On mobile, offer camera; on desktop, just gallery
-      if (/Mobi|Android/i.test(navigator.userAgent)) {
-        document.getElementById('ai-photo-capture')?.click();
-      } else {
-        document.getElementById('ai-photo-gallery')?.click();
-      }
+    document.getElementById('ai-take-photo-btn')?.addEventListener('click', () => {
+      const input = document.getElementById('ai-photo-capture');
+      if (!input) return;
+      input.value = '';
+      input.click();
+    });
+    document.getElementById('ai-upload-photo-btn')?.addEventListener('click', () => {
+      const input = document.getElementById('ai-photo-gallery');
+      if (!input) return;
+      input.value = '';
+      input.click();
     });
     document.getElementById('ai-photo-capture')?.addEventListener('change', e => handlePhotoAttach(e));
     document.getElementById('ai-photo-gallery')?.addEventListener('change', e => handlePhotoAttach(e));
@@ -1240,10 +1248,12 @@ export async function renderSearchPage(container, queryString) {
     if (!file) return;
     if (!file.type.startsWith('image/')) {
       showToast('Choose an image file');
+      e.target.value = '';
       return;
     }
     if (file.size > 15 * 1024 * 1024) {
       showToast('Choose an image smaller than 15 MB');
+      e.target.value = '';
       return;
     }
     aiAttachedPhoto = await fileToDataUrl(file);

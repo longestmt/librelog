@@ -1844,6 +1844,70 @@ textarea.input {
     font-size: var(--text-sm);
 }
 
+.ai-assumptions {
+    margin-top: var(--sp-3);
+    padding-top: var(--sp-1);
+    border-top: 1px solid var(--border);
+    color: var(--text-muted);
+}
+
+.ai-food-item > .ai-assumptions {
+    padding-right: var(--sp-3);
+    padding-left: var(--sp-3);
+}
+
+.ai-assumptions summary {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    list-style: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: var(--text-xs);
+    font-weight: var(--weight-semibold);
+}
+
+.ai-assumptions summary::-webkit-details-marker {
+    display: none;
+}
+
+.ai-assumptions summary::before {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    content: '';
+    transform: rotate(-45deg);
+    transition: transform var(--duration-fast) var(--ease-out);
+}
+
+.ai-assumptions[open] summary::before {
+    transform: rotate(45deg);
+}
+
+.ai-assumptions ul {
+    display: grid;
+    gap: var(--sp-1);
+    margin: 0;
+    padding: 0 0 var(--sp-2);
+    padding-inline-start: var(--sp-5);
+}
+
+.ai-assumptions li {
+    padding-inline-start: var(--sp-1);
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    line-height: var(--leading-normal);
+    overflow-wrap: anywhere;
+}
+
+.ai-assumptions li::marker {
+    color: var(--text-faint);
+    font-size: .7em;
+}
+
 .draft-review-totals {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -2247,6 +2311,7 @@ textarea.input {
 
 .ai-input-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: var(--sp-2);
 }
 
@@ -2263,6 +2328,30 @@ textarea.input {
 .ai-input-actions .btn.recording {
     border-color: var(--danger);
     color: var(--danger);
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .ai-input-actions .ai-take-photo-action {
+        display: none;
+    }
+}
+
+@media (max-width: 520px) {
+    .ai-input-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .ai-input-actions .btn {
+        width: 100%;
+        min-width: 0;
+        padding-right: var(--sp-2);
+        padding-left: var(--sp-2);
+    }
+
+    .ai-input-actions .btn-primary {
+        margin-left: 0;
+    }
 }
 
 .ai-recording-indicator {

@@ -44,7 +44,7 @@ import {
   unlockCredentialStore,
 } from '../data/credentials.js';
 
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '0.4.1';
 const LICENSE = 'AGPL-3.0';
 
 export async function renderSettingsPage(container, queryString) {
