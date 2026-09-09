@@ -1,6 +1,6 @@
 {
   "name": "librelog",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A libre, FLOSS meal tracking app — track calories, macros, and nutrition.",
   "private": true,
   "type": "module",

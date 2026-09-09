@@ -95,6 +95,63 @@ test('WebDAV networking requires local consent, including the first connection',
   assert.equal(fetchCount, 1);
 });
 
+test('WebDAV Basic auth preserves mixed-case usernames and UTF-8 credentials', async t => {
+  await clearAllData();
+  await setSetting('privacyConsent_webdav', true);
+  let authorization = null;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    authorization = options.headers.Authorization;
+    return new Response('', { status: 207 });
+  });
+
+  const username = 'LibreLift';
+  const password = 'pässword';
+  await setWebDavConfig('https://example.invalid/dav/', username, password);
+
+  assert.equal(
+    authorization,
+    `Basic ${Buffer.from(`${username}:${password}`, 'utf8').toString('base64')}`,
+  );
+  assert.deepEqual(await getWebDavConfig(), {
+    url: 'https://example.invalid/dav/',
+    username,
+    password,
+    active: true,
+  });
+});
+
+test('WebDAV passwords retain surrounding whitespace after validation and storage', async t => {
+  await clearAllData();
+  await setSetting('privacyConsent_webdav', true);
+  let authorization = null;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    authorization = options.headers.Authorization;
+    return new Response('', { status: 207 });
+  });
+
+  const username = 'LibreLift';
+  const password = ' app-password ';
+  await setWebDavConfig('https://example.invalid/dav/', username, password);
+
+  assert.equal(
+    authorization,
+    `Basic ${Buffer.from(`${username}:${password}`, 'utf8').toString('base64')}`,
+  );
+  assert.equal((await getWebDavConfig()).password, password);
+});
+
+test('WebDAV 401 errors prompt credential case and app-password checks', async t => {
+  await clearAllData();
+  await setSetting('privacyConsent_webdav', true);
+  t.mock.method(console, 'error', () => {});
+  t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 401 }));
+
+  await assert.rejects(
+    setWebDavConfig('https://example.invalid/dav/', 'LibreLift', 'app-password'),
+    error => /case-sensitive/i.test(error.message) && /re-enter the app password/i.test(error.message),
+  );
+});
+
 test('WebDAV tuple updates fail closed when a component write fails', async () => {
   const memory = memoryWebDavConfig({ failOn: 'setting:webdavUrl' });
   const locks = serialLockManager();

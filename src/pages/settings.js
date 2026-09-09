@@ -44,7 +44,7 @@ import {
   unlockCredentialStore,
 } from '../data/credentials.js';
 
-const APP_VERSION = '0.4.1';
+const APP_VERSION = '0.4.2';
 const LICENSE = 'AGPL-3.0';
 
 export async function renderSettingsPage(container, queryString) {
@@ -345,17 +345,19 @@ export async function renderSettingsPage(container, queryString) {
               ` : `
                 <label class="setting-input">
                   <span class="setting-label">WebDAV Server URL</span>
-                  <input type="url" id="webdav-url" placeholder="https://example.com/remote.php/webdav/" value="${escapeHTML(webdavUrl)}">
+                  <input type="url" id="webdav-url" placeholder="https://example.com/remote.php/webdav/" value="${escapeHTML(webdavUrl)}" autocomplete="url" autocapitalize="none" autocorrect="off" spellcheck="false" inputmode="url">
                 </label>
 
                 <label class="setting-input">
-                  <span class="setting-label">Username</span>
-                  <input type="text" id="webdav-username" placeholder="username" value="${escapeHTML(webdavUsername)}">
+                  <span class="setting-label">Username
+                    <span class="setting-hint">Usernames are case-sensitive.</span>
+                  </span>
+                  <input type="text" id="webdav-username" placeholder="username" value="${escapeHTML(webdavUsername)}" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false">
                 </label>
 
                 <label class="setting-input">
-                  <span class="setting-label">Password</span>
-                  <input type="password" id="webdav-password" placeholder="password" value="">
+                  <span class="setting-label">Password / app password</span>
+                  <input type="password" id="webdav-password" placeholder="password" value="" autocomplete="current-password" autocapitalize="none" autocorrect="off" spellcheck="false">
                 </label>
 
                 <label class="setting-input">

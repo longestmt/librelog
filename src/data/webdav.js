@@ -175,7 +175,9 @@ async function setWebDavConfigWithLifecycleLockHeld(url, username, password, {
 
     if (!res.ok) {
         console.error('WebDAV fetch failed:', res);
-        if (res.status === 401) throw new Error('Invalid username or app password (401 Unauthorized)');
+        if (res.status === 401) {
+            throw new Error('Invalid username or app password (401 Unauthorized). WebDAV usernames can be case-sensitive; check the capitalization and re-enter the app password.');
+        }
         if (res.status === 404) throw new Error('WebDAV endpoint not found (404). Check the URL path.');
         throw new Error(`WebDAV Server Error: ${res.status} ${res.statusText || res.status}`);
     }

@@ -49,7 +49,12 @@ export async function hasCredential(name) {
 }
 
 export async function setCredential(name, value) {
-  const normalized = typeof value === 'string' ? value.trim() : '';
+  // Passwords are exact byte sequences. Trimming a WebDAV password after a
+  // successful connection test would save a different credential for later
+  // backup and restore requests. API keys retain their existing normalization.
+  const normalized = typeof value === 'string'
+    ? (name === 'webdavPassword' ? value : value.trim())
+    : '';
   if (await isCredentialEncryptionEnabled()) {
     if (!credentialPassphrase) {
       throw new Error('Unlock credential protection before you change a credential');

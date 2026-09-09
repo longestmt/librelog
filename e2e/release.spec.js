@@ -604,9 +604,17 @@ test('a delayed destructive restore cannot be dismissed or close a newer dialog'
   });
 
   await page.goto('/#/settings', { waitUntil: 'commit' });
+  const webdavUrl = page.locator('#webdav-url');
+  const webdavUsername = page.locator('#webdav-username');
+  const webdavPassword = page.locator('#webdav-password');
+  await expect(webdavUrl).toHaveAttribute('autocapitalize', 'none');
+  await expect(webdavUsername).toHaveAttribute('autocomplete', 'username');
+  await expect(webdavUsername).toHaveAttribute('autocapitalize', 'none');
+  await expect(webdavUsername).toHaveAttribute('autocorrect', 'off');
+  await expect(webdavPassword).toHaveAttribute('autocomplete', 'current-password');
   await page.locator('#webdav-url').fill('http://127.0.0.1:4177/dav/');
-  await page.locator('#webdav-username').fill('release-test');
-  await page.locator('#webdav-password').fill('release-test-password');
+  await webdavUsername.fill('release-test');
+  await webdavPassword.fill('release-test-password');
   await page.locator('#webdav-privacy-consent').check();
   await page.getByRole('button', { name: 'Connect' }).click();
   await expect(page.getByRole('status')).toContainText('Connection successful');
