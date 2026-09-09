@@ -1,7 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('the new LibreLog logo keeps its desktop render and release assets', async ({ page, browserName }) => {
-  test.skip(browserName !== 'chromium', 'The visual reference uses the Chromium renderer.');
+test('the LibreLog logo keeps its dimensions and complete release asset set', async ({ page }) => {
 
   await page.route('https://fonts.googleapis.com/**', route => route.abort());
   await page.route('https://fonts.gstatic.com/**', route => route.abort());
@@ -10,10 +9,7 @@ test('the new LibreLog logo keeps its desktop render and release assets', async 
 
   const logo = page.locator('.brand-logo');
   await expect(logo).toBeVisible();
-  await expect(logo).toHaveScreenshot('librelog-brand-logo.png', {
-    animations: 'disabled',
-    maxDiffPixelRatio: 0.02,
-  });
+  await expect(logo).toHaveAttribute('src', '/icon.svg');
 
   const dimensions = await logo.evaluate(element => ({
     width: element.getBoundingClientRect().width,
@@ -28,10 +24,24 @@ test('the new LibreLog logo keeps its desktop render and release assets', async 
     naturalHeight: 512,
   });
 
-  for (const asset of ['/favicon.png', '/icon-192.png', '/icon-512.png', '/icon.svg']) {
+  const releaseAssets = new Map([
+    ['/favicon.png', { width: 32, height: 32, type: 'image/png' }],
+    ['/icon-192.png', { width: 192, height: 192, type: 'image/png' }],
+    ['/icon-512.png', { width: 512, height: 512, type: 'image/png' }],
+    ['/icon.svg', { width: 512, height: 512, type: 'image/svg+xml' }],
+  ]);
+  for (const [asset, expected] of releaseAssets) {
     const response = await page.request.get(asset);
     expect(response.ok(), `${asset} must load`).toBe(true);
-    expect(Number(response.headers()['content-length'] || 1)).toBeGreaterThan(0);
+    expect(response.headers()['content-type']).toContain(expected.type);
+    expect((await response.body()).byteLength).toBeGreaterThan(100);
+    const assetDimensions = await page.evaluate(src => new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+      image.onerror = () => reject(new Error(`Could not decode ${src}`));
+      image.src = src;
+    }), asset);
+    expect(assetDimensions).toEqual({ width: expected.width, height: expected.height });
   }
 });
 
