@@ -4,10 +4,18 @@
  */
 
 import { getCredential } from '../data/credentials.js';
-import { logIntegrationFailure, requestJSON } from './request.js';
+import { IntegrationError, logIntegrationFailure, requestJSON } from './request.js';
 
 const USDA_BASE_URL = 'https://api.nal.usda.gov/fdc/v1';
 const REQUEST_TIMEOUT_MS = 8000;
+
+function missingCredentialError() {
+  return new IntegrationError('USDA FoodData Central needs an API key in Settings.', {
+    provider: 'USDA FoodData Central',
+    code: 'not-configured',
+    retryable: false,
+  });
+}
 
 /** USDA nutrient ID mapping */
 const NUTRIENT_IDS = {
@@ -111,14 +119,17 @@ function normalizeFood(food) {
  * @param {number} [pageSize=20] - Results per page
  * @returns {Promise<Array>} Array of normalized food objects
  */
-async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {}) {
+async function searchFoods(query, page = 1, pageSize = 20, {
+  signal = null,
+  throwOnError = false,
+} = {}) {
   if (!query || query.trim().length === 0) {
     return [];
   }
 
   const apiKey = await getCredential('usdaApiKey');
   if (!apiKey) {
-    console.warn('USDA API key not configured');
+    if (throwOnError) throw missingCredentialError();
     return [];
   }
 
@@ -132,6 +143,7 @@ async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {
 
     const { data } = await requestJSON({
       provider: 'USDA FoodData Central',
+      consentKey: 'usda',
       url: url.toString(),
       init: {
         headers: {
@@ -152,6 +164,7 @@ async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {
       .filter(food => food !== null);
   } catch (error) {
     logIntegrationFailure(error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -161,14 +174,14 @@ async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {
  * @param {string|number} fdcId - FDC ID
  * @returns {Promise<Object|null>} Normalized food object or null if not found
  */
-async function lookupFdcId(fdcId, { signal = null } = {}) {
+async function lookupFdcId(fdcId, { signal = null, throwOnError = false } = {}) {
   if (!fdcId) {
     return null;
   }
 
   const apiKey = await getCredential('usdaApiKey');
   if (!apiKey) {
-    console.warn('USDA API key not configured');
+    if (throwOnError) throw missingCredentialError();
     return null;
   }
 
@@ -178,6 +191,7 @@ async function lookupFdcId(fdcId, { signal = null } = {}) {
 
     const { data } = await requestJSON({
       provider: 'USDA FoodData Central',
+      consentKey: 'usda',
       url: url.toString(),
       init: {
         headers: {
@@ -192,6 +206,7 @@ async function lookupFdcId(fdcId, { signal = null } = {}) {
     return normalizeFood(data);
   } catch (error) {
     logIntegrationFailure(error);
+    if (throwOnError) throw error;
     return null;
   }
 }

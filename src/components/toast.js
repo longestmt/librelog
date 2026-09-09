@@ -8,9 +8,7 @@ function ensureContainer() {
     if (container) return container;
     container = document.createElement('div');
     container.className = 'toast-container';
-    container.setAttribute('role', 'status');
-    container.setAttribute('aria-live', 'polite');
-    container.setAttribute('aria-atomic', 'true');
+    container.setAttribute('aria-label', 'Notifications');
     document.body.appendChild(container);
     return container;
 }
@@ -19,6 +17,10 @@ export function showToast(message, type = 'info', duration = 3000) {
     const c = ensureContainer();
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
+    const isError = type === 'error';
+    toast.setAttribute('role', isError ? 'alert' : 'status');
+    toast.setAttribute('aria-live', isError ? 'assertive' : 'polite');
+    toast.setAttribute('aria-atomic', 'true');
     const text = document.createElement('span');
     text.textContent = String(message ?? '');
     toast.appendChild(text);
@@ -29,13 +31,16 @@ export function showToast(message, type = 'info', duration = 3000) {
         toast.style.transform = 'translateY(-8px)';
         toast.style.transition = 'all 200ms ease-out';
         setTimeout(() => toast.remove(), 200);
-    }, duration);
+    }, isError ? Math.max(duration, 6000) : duration);
 }
 
 export function showUndoToast(message, onUndo, duration = 5000) {
     const c = ensureContainer();
     const toast = document.createElement('div');
     toast.className = 'toast toast-info';
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+    toast.setAttribute('aria-atomic', 'true');
 
     const span = document.createElement('span');
     span.style.flex = '1';
@@ -59,7 +64,9 @@ export function showUndoToast(message, onUndo, duration = 5000) {
         toast.style.transform = 'translateY(-8px)';
         toast.style.transition = 'all 200ms ease-out';
         setTimeout(() => toast.remove(), 200);
-        if (onUndo) onUndo();
+        if (onUndo) Promise.resolve(onUndo()).catch(() => {
+            showToast('Undo could not be completed', 'error');
+        });
     });
 
     toast.appendChild(span);

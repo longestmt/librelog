@@ -6,13 +6,12 @@
 import {
   exportAllData,
   importAllData,
-  put,
-  getAll,
   setSetting,
   validateBackupData,
 } from './db.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './encryption.js';
-import { createDeterministicKey, createMeal } from './meal-commands.js';
+import { withDataLifecycleLock } from './operation-locks.js';
+import { createDeterministicKey, createMealBatch } from './meal-commands.js';
 import { todayStr } from '../utils/format.js';
 
 /**
@@ -40,21 +39,25 @@ export function downloadJSON(data, filename) {
  * Filename: librelog-backup-{YYYY-MM-DD}.json
  * @returns {Promise<void>}
  */
-export async function exportData() {
-    const data = await exportAllData();
+export async function exportData({ lockManager } = {}) {
+  return withDataLifecycleLock(async lifecycleToken => {
+    const data = await exportAllData({ lifecycleToken });
     const date = todayStr();
     downloadJSON(data, `librelog-backup-${date}.json`);
     await setSetting('lastPortableBackupTime', Date.now());
     return data;
+  }, lockManager);
 }
 
-export async function exportEncryptedData(passphrase) {
-    const data = await exportAllData();
+export async function exportEncryptedData(passphrase, { lockManager } = {}) {
+  return withDataLifecycleLock(async lifecycleToken => {
+    const data = await exportAllData({ lifecycleToken });
     const encrypted = await encryptBackup(data, passphrase);
     const date = todayStr();
     downloadJSON(encrypted, `librelog-backup-${date}.encrypted.json`);
     await setSetting('lastPortableBackupTime', Date.now());
     return encrypted;
+  }, lockManager);
 }
 
 /**
@@ -118,11 +121,13 @@ export function summarizeImportData(data) {
  * @param {boolean} merge - if false, clears imported stores first
  * @returns {Promise<Object>} import summary
  */
-export async function importData(file, merge = true, { passphrase = null } = {}) {
+export async function importData(file, merge = true, { passphrase = null, lockManager } = {}) {
+  return withDataLifecycleLock(async lifecycleToken => {
     const data = await prepareImportData(file, { passphrase });
     const summary = summarizeImportData(data);
-    await importAllData(data, merge);
+    await importAllData(data, merge, { lifecycleToken });
     return summary;
+  }, lockManager);
 }
 
 /**
@@ -132,7 +137,7 @@ export async function importData(file, merge = true, { passphrase = null } = {})
  * @param {File} file - CSV file from MFP export
  * @returns {Promise<{imported: number, skipped: number}>}
  */
-export async function importMyFitnessPalCSV(file) {
+async function importMyFitnessPalCSVWithLifecycleLockHeld(file) {
   const text = await readFileAsText(file);
   const lines = text.split(/\r?\n/).filter(line => line.trim());
   if (lines.length < 2) throw new Error('CSV file appears empty');
@@ -155,8 +160,11 @@ export async function importMyFitnessPalCSV(file) {
     throw new Error('CSV must have at least Date and Food Name columns');
   }
 
-  let imported = 0;
   let skipped = 0;
+  const foods = [];
+  const meals = [];
+  const mealKeys = [];
+  const rowOccurrences = new Map();
 
   for (let i = 1; i < lines.length; i++) {
     const cols = parseCSVLine(lines[i]);
@@ -188,8 +196,7 @@ export async function importMyFitnessPalCSV(file) {
     // Create or find food entry
     const foodId = `mfp-${name.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 50)}`;
 
-    // Save food
-    await put('foods', {
+    foods.push({
       id: foodId,
       name,
       servingSize: { quantity: 100, unit: 'g', aliases: [] },
@@ -202,9 +209,7 @@ export async function importMyFitnessPalCSV(file) {
       source: { type: 'myfitnesspal' },
     });
 
-    // Create meal entry
-    const idempotencyKey = createDeterministicKey('mfp', `${i}|${lines[i]}`);
-    const result = await createMeal({
+    meals.push({
       date,
       type: mealType,
       items: [{
@@ -214,13 +219,38 @@ export async function importMyFitnessPalCSV(file) {
         notes: 'Imported from MyFitnessPal',
         nutrients: { kcal, protein, carbs, fat, fiber, sodium },
       }],
-    }, { idempotencyKey });
-
-    if (result.created) imported++;
-    else skipped++;
+    });
+    const rowSignature = JSON.stringify([
+      date,
+      mealType,
+      name.toLowerCase(),
+      kcal,
+      protein,
+      carbs,
+      fat,
+      fiber,
+      sodium,
+    ]);
+    const occurrence = (rowOccurrences.get(rowSignature) || 0) + 1;
+    rowOccurrences.set(rowSignature, occurrence);
+    mealKeys.push(createDeterministicKey('mfp-row', `${rowSignature}:${occurrence}`));
   }
 
+  if (meals.length === 0) return { imported: 0, skipped };
+  const results = await createMealBatch(meals, {
+    idempotencyKeys: mealKeys,
+    relatedFoods: foods,
+  });
+  const imported = results.filter(result => result.created).length;
+  skipped += results.length - imported;
   return { imported, skipped };
+}
+
+export async function importMyFitnessPalCSV(file, { lockManager } = {}) {
+  return withDataLifecycleLock(
+    () => importMyFitnessPalCSVWithLifecycleLockHeld(file),
+    lockManager,
+  );
 }
 
 function readFileAsText(file) {

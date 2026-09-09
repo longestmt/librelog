@@ -21,32 +21,49 @@ function normalizeProduct(product) {
 
   try {
     const nutriments = product.nutriments || {};
-    const kcal = optionalNumber(nutriments['energy-kcal_100g'])
-      ?? (optionalNumber(nutriments.energy_100g) == null
-        ? null
-        : Math.round(optionalNumber(nutriments.energy_100g) / 4.184));
+    const servingQuantity = optionalPositiveNumber(product.serving_quantity);
+    const servingLabel = typeof product.serving_size === 'string'
+      ? product.serving_size.trim()
+      : '';
+    const servingKcal = getEnergyKcal(nutriments, 'serving');
+    // OFF's *_serving fields are already normalized for exactly one serving.
+    // Require both normalized quantity and the package's human-readable label;
+    // otherwise retain the unambiguous 100 g basis.
+    const useServingBasis = servingQuantity !== null
+      && servingLabel.length > 0
+      && servingKcal !== null;
+    const suffix = useServingBasis ? 'serving' : '100g';
+    const quantityUnit = String(product.serving_quantity_unit || '').toLowerCase();
+    const servingSize = useServingBasis
+      ? {
+          quantity: 1,
+          unit: 'serving',
+          label: servingLabel,
+          packageQuantity: servingQuantity,
+          packageUnit: ['g', 'ml'].includes(quantityUnit) ? quantityUnit : null,
+          // Only expose mass conversion when OFF explicitly identifies grams.
+          ...(quantityUnit === 'g' ? { gramsPerUnit: servingQuantity } : {}),
+        }
+      : { quantity: 100, unit: 'g' };
 
     return {
       id: `off-${product.code || product.id || Math.random().toString(36).slice(2)}`,
       name: product.product_name || 'Unknown',
       brand: product.brands || '',
-      servingSize: {
-        quantity: 100,
-        unit: 'g'
-      },
+      servingSize,
       nutrients: {
-        energy: { kcal },
+        energy: { kcal: getEnergyKcal(nutriments, suffix) },
         macros: {
-          protein: { g: optionalNumber(nutriments.proteins_100g) },
-          carbs: { g: optionalNumber(nutriments.carbohydrates_100g) },
-          fat: { g: optionalNumber(nutriments.fat_100g) }
+          protein: { g: optionalNumber(nutriments[`proteins_${suffix}`]) },
+          carbs: { g: optionalNumber(nutriments[`carbohydrates_${suffix}`]) },
+          fat: { g: optionalNumber(nutriments[`fat_${suffix}`]) }
         },
-        fiber: { g: optionalNumber(nutriments.fiber_100g) },
+        fiber: { g: optionalNumber(nutriments[`fiber_${suffix}`]) },
         sodium: {
-          // Open Food Facts reports sodium_100g in grams; LibreLog stores mg.
-          mg: optionalNumber(nutriments.sodium_100g) == null
+          // Open Food Facts reports normalized sodium in grams; LibreLog stores mg.
+          mg: optionalNumber(nutriments[`sodium_${suffix}`]) == null
             ? null
-            : optionalNumber(nutriments.sodium_100g) * 1000
+            : optionalNumber(nutriments[`sodium_${suffix}`]) * 1000
         }
       },
       barcode: {
@@ -54,7 +71,8 @@ function normalizeProduct(product) {
       },
       source: {
         type: 'openFoodFacts',
-        offId: product.id || ''
+        offId: product.id || '',
+        nutritionBasis: useServingBasis ? 'serving' : '100g',
       },
       category: product.categories || ''
     };
@@ -64,9 +82,21 @@ function normalizeProduct(product) {
   }
 }
 
+function getEnergyKcal(nutriments, suffix) {
+  return optionalNumber(nutriments[`energy-kcal_${suffix}`])
+    ?? (optionalNumber(nutriments[`energy_${suffix}`]) == null
+      ? null
+      : Math.round(optionalNumber(nutriments[`energy_${suffix}`]) / 4.184));
+}
+
 function optionalNumber(value) {
   const number = typeof value === 'number' ? value : Number.parseFloat(value);
   return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function optionalPositiveNumber(value) {
+  const number = optionalNumber(value);
+  return number !== null && number > 0 ? number : null;
 }
 
 /**
@@ -76,7 +106,10 @@ function optionalNumber(value) {
  * @param {number} [pageSize=20] - Results per page
  * @returns {Promise<Array>} Array of normalized food objects
  */
-async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {}) {
+async function searchFoods(query, page = 1, pageSize = 20, {
+  signal = null,
+  throwOnError = false,
+} = {}) {
   if (!query || query.trim().length === 0) {
     return [];
   }
@@ -92,6 +125,7 @@ async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {
 
     const { data } = await requestJSON({
       provider: 'Open Food Facts',
+      consentKey: 'openfoodfacts',
       url: url.toString(),
       init: {
         headers: {
@@ -112,6 +146,7 @@ async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {
       .filter(product => product !== null);
   } catch (error) {
     logIntegrationFailure(error);
+    if (throwOnError) throw error;
     return [];
   }
 }
@@ -121,7 +156,7 @@ async function searchFoods(query, page = 1, pageSize = 20, { signal = null } = {
  * @param {string} barcode - EAN-13 barcode
  * @returns {Promise<Object|null>} Normalized food object or null if not found
  */
-async function lookupBarcode(barcode, { signal = null } = {}) {
+async function lookupBarcode(barcode, { signal = null, throwOnError = false } = {}) {
   if (!barcode || barcode.trim().length === 0) {
     return null;
   }
@@ -130,6 +165,7 @@ async function lookupBarcode(barcode, { signal = null } = {}) {
     const url = `${OFF_BASE_URL}/api/v0/product/${barcode.trim()}.json`;
     const { data } = await requestJSON({
       provider: 'Open Food Facts',
+      consentKey: 'openfoodfacts',
       url,
       init: {
         headers: {
@@ -149,6 +185,7 @@ async function lookupBarcode(barcode, { signal = null } = {}) {
     return normalizeProduct(data.product);
   } catch (error) {
     logIntegrationFailure(error);
+    if (throwOnError) throw error;
     return null;
   }
 }

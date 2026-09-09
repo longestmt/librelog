@@ -1,17 +1,107 @@
 import { getByIndex, getAll, getById } from '../data/db.js';
 import { getGoals } from '../engine/goal-tracking.js';
 import { calculateDayTotalsSimple } from '../engine/nutrition.js';
+import { createWeightChartModel, prepareWeightData } from '../engine/weight.js';
 import { todayStr, addCalendarDays, toLocalDate } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
-import { showToast } from '../components/toast.js';
 
 function formatDateShort(dateStr) {
   const date = toLocalDate(dateStr);
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+export function summarizeNutritionDays(days, currentDate = todayStr()) {
+  const normalizedDays = days.map(day => {
+    const hasData = Boolean(day.hasData);
+    const status = day.date === currentDate
+      ? 'in-progress'
+      : (hasData ? 'logged' : 'missing');
+    return { ...day, hasData, status };
+  });
+  const loggedDays = normalizedDays.filter(day => day.status === 'logged');
+  const nutrientKey = key => key === 'calories' ? 'kcal' : key;
+  const completeDays = key => loggedDays.filter(day => {
+    const value = day[key];
+    return value !== null
+      && value !== ''
+      && !day.incomplete?.includes(nutrientKey(key))
+      && Number.isFinite(Number(value));
+  });
+  const average = key => {
+    const eligibleDays = completeDays(key);
+    return eligibleDays.length
+      ? Math.round(eligibleDays.reduce((sum, day) => sum + Number(day[key]), 0) / eligibleDays.length)
+      : null;
+  };
+  const calorieDays = completeDays('calories');
+  const proteinDays = completeDays('protein');
+
+  return {
+    days: normalizedDays,
+    loggedDays,
+    averageCalories: average('calories'),
+    averageProtein: average('protein'),
+    averageCaloriesDays: calorieDays.length,
+    averageProteinDays: proteinDays.length,
+  };
+}
+
+function hasLoggedItems(meals) {
+  return meals.some(meal => Array.isArray(meal.items) && meal.items.length > 0);
+}
+
+function formatAverage(value, unit, completeDayCount, loggedDayCount) {
+  if (value !== null) return `${value} ${unit}`;
+  return loggedDayCount > 0 && completeDayCount === 0
+    ? 'Not available — values missing'
+    : 'No past logged days';
+}
+
+function renderAverageCompletenessNote(summary) {
+  const exclusions = [];
+  if (summary.averageCaloriesDays < summary.loggedDays.length) exclusions.push('calories');
+  if (summary.averageProteinDays < summary.loggedDays.length) exclusions.push('protein');
+  if (!exclusions.length) return '';
+  return `<p class="chart-note">Logged days with unknown ${escapeHTML(exclusions.join(' or '))} are excluded from that nutrient’s average.</p>`;
+}
+
+export function renderWeeklyCalorieBars(days, today, maxCalories) {
+  const safeMaximum = Number.isFinite(Number(maxCalories)) && Number(maxCalories) > 0
+    ? Number(maxCalories)
+    : 1;
+
+  return days.map(day => {
+    const caloriesUnknown = Boolean(day.hasData && day.incomplete?.includes('kcal'));
+    const calories = Number(day.calories);
+    const showBar = day.hasData && !caloriesUnknown && Number.isFinite(calories) && calories >= 0;
+    const barHeight = showBar ? Math.min(100, (calories / safeMaximum) * 100) : 0;
+    const status = [
+      caloriesUnknown ? 'Calories unknown' : '',
+      day.status === 'in-progress' ? 'In progress' : '',
+    ].filter(Boolean).join(' · ');
+
+    return `
+      <div class="bar-column ${day.date === today ? 'today' : ''} ${day.status} ${caloriesUnknown ? 'unknown' : ''}">
+        ${showBar
+          ? `<div class="bar" style="height: ${barHeight}%"></div>`
+          : '<div class="bar-gap"></div>'}
+        <div class="bar-label">${escapeHTML(day.dayLabel)}</div>
+        <div class="bar-value">${showBar ? escapeHTML(day.calories) : '—'}</div>
+        ${status ? `<div class="bar-status">${status}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
 export async function renderInsightsPage(container, queryString) {
   let currentView = 'today';
+  let contentSequence = 0;
+  let disposed = false;
+
+  const isCurrentRender = (view, sequence) => !disposed
+    && container.isConnected
+    && currentView === view
+    && contentSequence === sequence;
 
   async function render() {
     container.innerHTML = `
@@ -32,7 +122,7 @@ export async function renderInsightsPage(container, queryString) {
       </div>
     `;
 
-    const tabButtons = [...document.querySelectorAll('.tab-btn')];
+    const tabButtons = [...container.querySelectorAll('.tab-btn')];
     tabButtons.forEach((btn, index) => {
       btn.addEventListener('click', (e) => {
         currentView = e.currentTarget.dataset.view;
@@ -50,48 +140,54 @@ export async function renderInsightsPage(container, queryString) {
       });
     });
 
-    renderContent();
+    await renderContent();
   }
 
   async function renderContent() {
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-      const selected = btn.dataset.view === currentView;
+    const requestedView = currentView;
+    const sequence = ++contentSequence;
+    container.querySelectorAll('.tab-btn').forEach(btn => {
+      const selected = btn.dataset.view === requestedView;
       btn.classList.toggle('active', selected);
       btn.setAttribute('aria-selected', String(selected));
       btn.tabIndex = selected ? 0 : -1;
     });
-    document.getElementById('insights-content')?.setAttribute('aria-label', `${currentView} insights`);
+    container.querySelector('#insights-content')?.setAttribute('aria-label', `${requestedView} insights`);
 
-    switch (currentView) {
+    switch (requestedView) {
       case 'today':
-        await renderTodayView();
+        await renderTodayView(sequence);
         break;
       case 'week':
-        await renderWeekView();
+        await renderWeekView(sequence);
         break;
       case 'month':
-        await renderMonthView();
+        await renderMonthView(sequence);
         break;
     }
   }
 
-  async function renderTodayView() {
+  async function renderTodayView(sequence) {
     const today = todayStr();
     const meals = await getByIndex('meals', 'date', today) || [];
     const goals = await getGoals();
     const totals = calculateDayTotalsSimple(meals);
+    const isIncomplete = key => totals.incomplete?.includes(key);
+    const foodBreakdown = meals.length > 0 ? await renderFoodBreakdown(meals) : '';
+    if (!isCurrentRender('today', sequence)) return;
 
     const stats = [
-      { label: 'Calories', value: totals.kcal, unit: `/${goals.calorieTarget}`, color: 'calories' },
-      { label: 'Protein', value: Math.round(totals.protein), unit: `/${goals.proteinG}g`, color: 'protein' },
-      { label: 'Carbs', value: Math.round(totals.carbs), unit: `/${goals.carbG}g`, color: 'carbs' },
-      { label: 'Fat', value: Math.round(totals.fat), unit: `/${goals.fatG}g`, color: 'fat' },
+      { key: 'kcal', label: 'Calories', value: totals.kcal, target: goals.calorieTarget, targetUnit: '', color: 'calories' },
+      { key: 'protein', label: 'Protein', value: Math.round(totals.protein), target: goals.proteinG, targetUnit: 'g', color: 'protein' },
+      { key: 'carbs', label: 'Carbs', value: Math.round(totals.carbs), target: goals.carbG, targetUnit: 'g', color: 'carbs' },
+      { key: 'fat', label: 'Fat', value: Math.round(totals.fat), target: goals.fatG, targetUnit: 'g', color: 'fat' },
     ];
 
     const caloriesRemaining = goals.calorieTarget - totals.kcal;
     const caloriesPercent = Math.min(100, (totals.kcal / goals.calorieTarget) * 100);
 
-    const contentDiv = document.getElementById('insights-content');
+    const contentDiv = container.querySelector('#insights-content');
+    if (!contentDiv) return;
     contentDiv.innerHTML = `
       <div class="insights-section">
         <h2 class="section-title">Daily Summary</h2>
@@ -100,8 +196,8 @@ export async function renderInsightsPage(container, queryString) {
           ${stats.map(stat => `
             <div class="stat-card stat-card-${stat.color}">
               <div class="stat-label">${stat.label}</div>
-              <div class="stat-value">${stat.value}</div>
-              <div class="stat-unit">${stat.unit}</div>
+              <div class="stat-value">${stat.value}${isIncomplete(stat.key) ? '+' : ''}</div>
+              <div class="stat-unit">${formatStatGoal(stat.target, stat.targetUnit, isIncomplete(stat.key))}</div>
             </div>
           `).join('')}
         </div>
@@ -109,20 +205,22 @@ export async function renderInsightsPage(container, queryString) {
         <div class="calorie-progress">
           <div class="progress-header">
             <span class="progress-label">Daily Calorie Target</span>
-            <span class="progress-remaining">${caloriesRemaining >= 0 ? `${caloriesRemaining} remaining` : `${Math.abs(caloriesRemaining)} above target`}</span>
+            <span class="progress-remaining">${isIncomplete('kcal') ? 'Remaining unknown' : caloriesRemaining >= 0 ? `${caloriesRemaining} remaining` : `${Math.abs(caloriesRemaining)} above target`}</span>
           </div>
           <div class="progress-bar">
             <div class="progress-fill" style="width: ${caloriesPercent}%"></div>
           </div>
           <div class="progress-text">
-            <span>${totals.kcal}</span>
-            <span class="text-muted">of ${goals.calorieTarget} kcal</span>
+            <span>${totals.kcal}${isIncomplete('kcal') ? '+' : ''}</span>
+            <span class="text-muted">${isIncomplete('kcal') ? 'known kcal; target ' : 'of '}${goals.calorieTarget} kcal</span>
           </div>
         </div>
 
-        ${totals.sodium > (goals.sodiumMg || 2300) ? `
+        ${totals.incomplete?.length ? `<p class="nutrition-incomplete-notice" role="note"><strong>Partial nutrition:</strong> some foods do not include ${totals.incomplete.map(escapeHTML).join(', ')}. Known values are marked “+”; missing values are never counted as zero.</p>` : ''}
+
+        ${hasEnabledGoal(goals.sodiumMg) && totals.sodium > goals.sodiumMg ? `
           <div class="alert alert-warning" role="alert">
-            <strong>Sodium:</strong> Today’s logged total is above your selected limit (${totals.sodium}mg / ${goals.sodiumMg || 2300}mg).
+            <strong>Sodium:</strong> Today’s logged total is above your selected limit (${totals.sodium}mg / ${goals.sodiumMg}mg).
           </div>
         ` : ''}
 
@@ -130,7 +228,7 @@ export async function renderInsightsPage(container, queryString) {
           <div class="food-breakdown">
             <h3 class="breakdown-title">What You Ate</h3>
             <div class="breakdown-list">
-              ${await renderFoodBreakdown(meals)}
+              ${foodBreakdown}
             </div>
           </div>
         ` : ''}
@@ -138,7 +236,7 @@ export async function renderInsightsPage(container, queryString) {
     `;
   }
 
-  async function renderWeekView() {
+  async function renderWeekView(sequence) {
     const today = todayStr();
     const weekData = [];
     const goals = await getGoals();
@@ -151,16 +249,19 @@ export async function renderInsightsPage(container, queryString) {
         date,
         dayLabel: getDayLabel(date),
         calories: totals.kcal,
+        protein: totals.protein,
+        incomplete: totals.incomplete,
+        hasData: hasLoggedItems(meals),
       });
     }
 
-    const maxCalories = Math.max(...weekData.map(d => d.calories), goals.calorieTarget);
-    const loggedDays = weekData.filter(day => day.calories > 0);
-    const avgCalories = loggedDays.length
-      ? Math.round(loggedDays.reduce((sum, day) => sum + day.calories, 0) / loggedDays.length)
-      : 0;
+    const summary = summarizeNutritionDays(weekData, today);
+    const maxCalories = Math.max(...summary.days.map(d => d.calories), goals.calorieTarget);
+    const frequentFoods = await getMostFrequentFoods(today, 7);
+    if (!isCurrentRender('week', sequence)) return;
 
-    const contentDiv = document.getElementById('insights-content');
+    const contentDiv = container.querySelector('#insights-content');
+    if (!contentDiv) return;
     contentDiv.innerHTML = `
       <div class="insights-section">
         <h2 class="section-title">Weekly Summary</h2>
@@ -168,35 +269,31 @@ export async function renderInsightsPage(container, queryString) {
         <div class="week-stats">
           <div class="week-stat">
             <span class="week-stat-label">Average Logged Day</span>
-            <span class="week-stat-value">${avgCalories} kcal</span>
+            <span class="week-stat-value">${formatAverage(summary.averageCalories, 'kcal', summary.averageCaloriesDays, summary.loggedDays.length)}</span>
           </div>
           <div class="week-stat">
-            <span class="week-stat-label">Target</span>
-            <span class="week-stat-value">${goals.calorieTarget} kcal</span>
+            <span class="week-stat-label">Average Protein / Logged Day</span>
+            <span class="week-stat-value">${formatAverage(summary.averageProtein, 'g', summary.averageProteinDays, summary.loggedDays.length)}</span>
           </div>
         </div>
+        ${renderAverageCompletenessNote(summary)}
+        <p class="chart-note">Targets: ${goals.calorieTarget} kcal and ${hasEnabledGoal(goals.proteinG) ? `${goals.proteinG} g protein` : 'protein target disabled'}.</p>
 
         <div class="week-chart">
           <h3 class="chart-title">Calorie History</h3>
-          <div class="bar-chart">
-            ${weekData.map((day, idx) => {
-              const barHeight = (day.calories / maxCalories) * 100;
-              const isToday = day.date === today;
-              return `
-                <div class="bar-column ${isToday ? 'today' : ''}">
-                  <div class="bar" style="height: ${barHeight}%"></div>
-                  <div class="bar-label">${day.dayLabel}</div>
-                  <div class="bar-value">${day.calories}</div>
-                </div>
-              `;
-            }).join('')}
+          <p class="chart-note">Missing days are gaps. Today is in progress and excluded from averages; past logged days may still be partial.</p>
+          <div class="bar-chart" aria-hidden="true">
+            ${renderWeeklyCalorieBars(summary.days, today, maxCalories)}
           </div>
+          <ul class="sr-only">
+            ${summary.days.map(day => `<li>${escapeHTML(formatDateShort(day.date))}: ${day.status === 'missing' ? 'not logged' : `${day.incomplete?.includes('kcal') ? 'calories unknown' : `${day.calories} calories`}, ${day.incomplete?.includes('protein') ? 'protein unknown' : `${Math.round(day.protein)} grams protein`}${day.status === 'in-progress' ? ', day in progress' : ''}`}</li>`).join('')}
+          </ul>
         </div>
 
         <div class="frequent-foods">
           <h3 class="section-subtitle">Most Logged This Week</h3>
           <div class="frequent-list">
-            ${(await getMostFrequentFoods(today, 7)).map(item => `
+            ${frequentFoods.map(item => `
               <div class="frequent-item">
                 <span class="frequent-name">${escapeHTML(item.name)}</span>
                 <span class="frequent-count">${item.count}x</span>
@@ -208,7 +305,7 @@ export async function renderInsightsPage(container, queryString) {
     `;
   }
 
-  async function renderMonthView() {
+  async function renderMonthView(sequence) {
     const today = todayStr();
     const goals = await getGoals();
     const monthData = [];
@@ -220,26 +317,20 @@ export async function renderInsightsPage(container, queryString) {
       monthData.push({
         date,
         calories: totals.kcal,
-        hasData: meals.length > 0,
+        protein: totals.protein,
+        incomplete: totals.incomplete,
+        hasData: hasLoggedItems(meals),
       });
     }
 
-    const loggedMonthDays = monthData.filter(day => day.hasData);
-    const avgCalories = loggedMonthDays.length
-      ? Math.round(loggedMonthDays.reduce((sum, day) => sum + day.calories, 0) / loggedMonthDays.length)
-      : 0;
+    const summary = summarizeNutritionDays(monthData, today);
 
-    const measurements = (await getAll('measurements') || [])
-      .filter(m => Number.isFinite(Number(m?.weight)) && Number(m.weight) > 0 && /^\d{4}-\d{2}-\d{2}$/.test(m?.date || ''))
-      .map(m => ({
-        date: m.date,
-        weight: Number(m.weight),
-        unit: m.unit === 'lb' ? 'lb' : 'kg',
-      }))
-      .sort((a, b) => a.date.localeCompare(b.date));
+    const measurements = prepareWeightData(await getAll('measurements')).dailyEntries;
     const recentMeasurements = measurements.slice(-3);
+    if (!isCurrentRender('month', sequence)) return;
 
-    const contentDiv = document.getElementById('insights-content');
+    const contentDiv = container.querySelector('#insights-content');
+    if (!contentDiv) return;
     contentDiv.innerHTML = `
       <div class="insights-section">
         <h2 class="section-title">Monthly Summary</h2>
@@ -249,25 +340,40 @@ export async function renderInsightsPage(container, queryString) {
             <div class="stat-icon">📊</div>
             <div class="stat-info">
               <span class="stat-label">Average Logged Day</span>
-              <span class="stat-value">${avgCalories} kcal</span>
+              <span class="stat-value">${formatAverage(summary.averageCalories, 'kcal', summary.averageCaloriesDays, summary.loggedDays.length)}</span>
             </div>
           </div>
           <div class="month-stat">
-            <div class="stat-icon">📈</div>
+            <div class="stat-icon">P</div>
             <div class="stat-info">
-              <span class="stat-label">Days Logged</span>
-              <span class="stat-value">${monthData.filter(d => d.hasData).length}</span>
+              <span class="stat-label">Average Protein / Logged Day</span>
+              <span class="stat-value">${formatAverage(summary.averageProtein, 'g', summary.averageProteinDays, summary.loggedDays.length)}</span>
+            </div>
+          </div>
+          <div class="month-stat">
+            <div class="stat-icon">✓</div>
+            <div class="stat-info">
+              <span class="stat-label">Past Days Logged</span>
+              <span class="stat-value">${summary.loggedDays.length}</span>
             </div>
           </div>
         </div>
+        ${renderAverageCompletenessNote(summary)}
 
         <div class="month-heatmap">
           <h3 class="chart-title">Logging Activity</h3>
-          <div class="heatmap">
-            ${monthData.map(day => `
-              <div class="heatmap-day ${day.hasData ? 'active' : ''}" title="${day.date}"></div>
+          <div class="heatmap" role="list" aria-label="Nutrition logging activity for the last 30 days">
+            ${summary.days.map(day => `
+              <div
+                class="heatmap-day ${day.status === 'logged' ? 'active' : day.status}"
+                role="listitem"
+                aria-label="${escapeHTML(formatDateShort(day.date))}: ${day.status === 'missing' ? 'not logged' : day.status}"
+                title="${day.date}: ${day.status === 'missing' ? 'not logged' : day.status}"
+              ></div>
             `).join('')}
           </div>
+          <div class="chart-legend" aria-hidden="true"><span><i class="legend-logged"></i>Logged</span><span><i class="legend-in-progress"></i>In progress</span><span><i class="legend-missing"></i>Not logged</span></div>
+          <p class="chart-note">Today is in progress and excluded from averages; past logged days may still be partial.</p>
         </div>
 
         ${measurements.length > 0 ? `
@@ -282,7 +388,7 @@ export async function renderInsightsPage(container, queryString) {
               ${recentMeasurements.map(m => `
                 <div class="measurement-item">
                   <span class="measurement-date">${formatDateShort(m.date)}</span>
-                  <span class="measurement-weight">${m.weight} ${m.unit || 'kg'}</span>
+                  <span class="measurement-weight">${m.weight.toFixed(1)} ${m.unit || 'kg'}</span>
                 </div>
               `).join('')}
             </div>
@@ -300,6 +406,19 @@ export async function renderInsightsPage(container, queryString) {
   }
 
   await render();
+  return () => {
+    disposed = true;
+    contentSequence += 1;
+  };
+}
+
+function hasEnabledGoal(target) {
+  return Number.isFinite(Number(target)) && Number(target) > 0;
+}
+
+function formatStatGoal(target, unit, incomplete) {
+  if (!hasEnabledGoal(target)) return incomplete ? 'known · no target' : 'no target';
+  return `${incomplete ? 'known ' : ''}/${target}${unit}`;
 }
 
 function getDayLabel(dateStr) {
@@ -313,12 +432,12 @@ async function renderFoodBreakdown(meals) {
   for (const meal of meals) {
     for (const item of (meal.items || [])) {
       const food = await getById('foods', item.foodId);
-      const name = food?.name || item.foodId || 'Unknown';
-      const kcal = item.nutrients?.kcal || 0;
+      const name = item.nameSnapshot || food?.name || item.foodId || 'Unknown';
+      const kcal = item.nutrients?.kcal;
       items.push(`
         <div class="breakdown-item">
           <span>${escapeHTML(name)}</span>
-          <span class="breakdown-kcal">${Math.round(kcal)} kcal</span>
+          <span class="breakdown-kcal">${kcal != null && Number.isFinite(Number(kcal)) ? `${Math.round(Number(kcal))} kcal` : 'Calories unknown'}</span>
         </div>
       `);
     }
@@ -328,20 +447,20 @@ async function renderFoodBreakdown(meals) {
 
 function renderWeightTrendBars(measurements) {
   if (!measurements || measurements.length === 0) return '';
-  const weights = measurements.map(m => m.weight).filter(w => w > 0);
-  if (weights.length === 0) return '';
-  const min = Math.min(...weights);
-  const max = Math.max(...weights);
-  const range = max - min || 1;
+  const model = createWeightChartModel(measurements, { maxLabels: 4 });
+  if (!model) return '';
 
-  return `<div class="weight-bars">
-    ${measurements.map(m => {
-      const pct = ((m.weight - min) / range) * 80 + 20;
-      return `<div class="weight-bar-col">
-        <div class="weight-bar" style="height:${pct}%"></div>
-        <div class="weight-bar-val">${m.weight}</div>
-      </div>`;
-    }).join('')}
+  const accessibleSummary = model.entries
+    .map(m => `${formatDateShort(m.date)}: ${m.weight.toFixed(1)} ${m.unit || ''}`)
+    .join('; ');
+  return `<div class="insights-weight-bars" role="img" aria-label="Weight trend. ${escapeHTML(accessibleSummary)}">
+    <div class="insights-weight-bars-plot" aria-hidden="true">
+      ${model.points.map(point => `<div class="insights-weight-bar-col" style="left:${point.x}%;width:${model.barWidthPercent}%;--weight-bar-height:${Math.max(point.height, 2)}%;">
+        ${point.showValueLabel ? `<span class="insights-weight-bar-value">${point.entry.weight.toFixed(1)}</span>` : ''}
+        <span class="insights-weight-bar"></span>
+        ${point.showDateLabel ? `<span class="insights-weight-bar-date">${escapeHTML(formatDateShort(point.entry.date))}</span>` : ''}
+      </div>`).join('')}
+    </div>
   </div>`;
 }
 

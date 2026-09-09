@@ -5,6 +5,8 @@
 
 import { chatCompletion, logUsage, isAIConfigured, getAIConfig } from './aiClient.js';
 import { validateAIResponse } from './aiValidation.js';
+import { hasRemoteProviderConsent } from './privacy.js';
+import { getSafeIntegrationMessage, IntegrationError, requestText } from './request.js';
 
 const VOICE_PARSE_PROMPT = `You are a food logging assistant. Parse the user's spoken meal description into structured food items.
 For each food mentioned, provide:
@@ -47,77 +49,111 @@ Return a JSON object with a "foods" array. If uncertain about portions, use stan
  * @returns {Promise<{ stop: () => Promise<{blob: Blob, liveTranscript: string|null}>, cancel: () => void, getAmplitude: () => number }>}
  */
 export async function startRecording() {
+  const config = await getAIConfig();
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const useBrowserSpeech = config.provider !== 'openai' && Boolean(SpeechRecognition);
+  if (useBrowserSpeech && !(await hasRemoteProviderConsent('browser_speech'))) {
+    throw new IntegrationError('Browser speech recognition is off until you enable it.', {
+      provider: 'Browser speech recognition',
+      code: 'consent-required',
+      retryable: false,
+    });
+  }
+
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  let audioContext = null;
+  let mediaReleased = false;
+  const releaseMedia = () => {
+    if (mediaReleased) return;
+    mediaReleased = true;
+    stream.getTracks().forEach(track => {
+      try { track.stop(); } catch {}
+    });
+    try { audioContext?.close()?.catch?.(() => {}); } catch {}
+  };
 
-  // Amplitude analysis
-  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  const source = audioContext.createMediaStreamSource(stream);
-  const analyser = audioContext.createAnalyser();
-  analyser.fftSize = 256;
-  source.connect(analyser);
-  const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-  // MediaRecorder
-  const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
-  const recorder = new MediaRecorder(stream, { mimeType });
+  let analyser;
+  let dataArray;
+  let mimeType;
+  let recorder;
   const chunks = [];
+  try {
+    // Amplitude analysis
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass || typeof MediaRecorder === 'undefined') {
+      throw new Error('Voice recording is not supported in this browser');
+    }
+    audioContext = new AudioContextClass();
+    const source = audioContext.createMediaStreamSource(stream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-  recorder.addEventListener('dataavailable', (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
-  });
-  recorder.start();
+    // MediaRecorder
+    mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/mp4';
+    recorder = new MediaRecorder(stream, { mimeType });
+    recorder.addEventListener('dataavailable', (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
+    });
+    recorder.start();
+  } catch (error) {
+    releaseMedia();
+    throw error;
+  }
 
   // Start live browser speech recognition in parallel (for non-OpenAI providers)
   let liveTranscript = null;
   let recognition = null;
   try {
-    const config = await getAIConfig();
-    if (config.provider !== 'openai') {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SpeechRecognition) {
-        recognition = new SpeechRecognition();
-        recognition.lang = navigator.language || 'en-US';
-        recognition.continuous = true;
-        recognition.interimResults = false;
-        let segments = [];
-        recognition.addEventListener('result', (event) => {
-          for (let i = 0; i < event.results.length; i++) {
-            if (event.results[i].isFinal) {
-              segments.push(event.results[i][0].transcript);
-            }
+    if (useBrowserSpeech) {
+      recognition = new SpeechRecognition();
+      recognition.lang = navigator.language || 'en-US';
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      const segments = [];
+      recognition.addEventListener('result', (event) => {
+        for (let i = 0; i < event.results.length; i++) {
+          if (event.results[i].isFinal) {
+            segments.push(event.results[i][0].transcript);
           }
-          liveTranscript = segments.join(' ').trim();
-        });
-        recognition.addEventListener('error', () => { /* non-fatal */ });
-        recognition.start();
-      }
+        }
+        liveTranscript = segments.join(' ').trim();
+      });
+      recognition.addEventListener('error', () => { /* non-fatal */ });
+      recognition.start();
     }
-  } catch { /* config fetch failed — skip live recognition */ }
+  } catch { /* browser recognition startup failure is non-fatal */ }
 
   return {
     stop() {
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
         // Stop speech recognition
         if (recognition) { try { recognition.stop(); } catch {} }
 
         recorder.addEventListener('stop', () => {
-          stream.getTracks().forEach(t => t.stop());
-          audioContext.close().catch(() => {});
+          releaseMedia();
           resolve({
             blob: new Blob(chunks, { type: mimeType }),
             liveTranscript,
           });
         });
-        recorder.stop();
+        try {
+          recorder.stop();
+        } catch (error) {
+          releaseMedia();
+          reject(error);
+        }
       });
     },
 
     cancel() {
       if (recognition) { try { recognition.stop(); } catch {} }
-      recorder.stop();
-      stream.getTracks().forEach(t => t.stop());
-      audioContext.close().catch(() => {});
-      chunks.length = 0;
+      try { recorder.stop(); } catch {}
+      finally {
+        releaseMedia();
+        chunks.length = 0;
+      }
     },
 
     getAmplitude() {
@@ -147,32 +183,24 @@ export async function transcribeAudio(audioBlob, liveTranscript = null) {
     const config = await getAIConfig();
 
     // OpenAI: use Whisper API
-    if (config.provider === 'openai' && config.apiKey) {
+    if (config.provider === 'openai' && config.apiKey && config.apiKeyProvider === 'openai') {
       const formData = new FormData();
       formData.append('file', audioBlob, 'recording.webm');
       formData.append('model', 'whisper-1');
       formData.append('response_format', 'text');
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-
-      try {
-        const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      const { data } = await requestText({
+        provider: 'OpenAI',
+        consentKey: 'ai_openai',
+        url: 'https://api.openai.com/v1/audio/transcriptions',
+        init: {
           method: 'POST',
           headers: { Authorization: `Bearer ${config.apiKey}` },
           body: formData,
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error(`Whisper API error: ${response.status}`);
-        }
-
-        const text = await response.text();
-        return { text: text.trim(), method: 'whisper' };
-      } finally {
-        clearTimeout(timeout);
-      }
+        },
+        timeoutMs: 15000,
+      });
+      return { text: data.trim(), method: 'whisper' };
     }
 
     // Anthropic/Ollama: use the live transcript captured during recording
@@ -184,7 +212,7 @@ export async function transcribeAudio(audioBlob, liveTranscript = null) {
     // (this is a fallback; it won't process the blob, it requires live mic)
     return { text: null, error: 'Voice transcription requires OpenAI (Whisper) or a browser with Speech Recognition support. Your browser did not capture a transcript during recording.' };
   } catch (err) {
-    return { text: null, error: err.message || 'Transcription failed' };
+    return { text: null, error: getSafeIntegrationMessage(err, 'Transcription failed') };
   }
 }
 
@@ -210,6 +238,7 @@ export async function parseTranscription(text, options = {}) {
       temperature: 0.2,
       jsonMode: true,
       signal: options.signal,
+      mutationGeneration: options.mutationGeneration,
     });
 
     if (!response.content) {
@@ -230,7 +259,9 @@ export async function parseTranscription(text, options = {}) {
       const config = await getAIConfig();
       const tokens = response.usage.totalTokens || 0;
       const cost = config.provider === 'anthropic' ? tokens * 0.000003 : tokens * 0.000005;
-      await logUsage(config.provider, tokens, cost);
+      await logUsage(config.provider, tokens, cost, {
+        mutationGeneration: response.mutationGeneration,
+      });
     }
 
     const validated = validateAIResponse(parsed, {
@@ -242,6 +273,7 @@ export async function parseTranscription(text, options = {}) {
       foods: validated.foods,
       warnings: validated.warnings,
       rejected: validated.rejected,
+      mutationGeneration: response.mutationGeneration,
     };
   } catch (err) {
     return { success: false, error: err.message || 'Failed to parse transcription' };

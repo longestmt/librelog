@@ -190,4 +190,14 @@ export function getNutritionMultiplier(quantity, unit, food) {
   return consumedGrams / servingGrams;
 }
 
+/** Return null when imported or legacy units cannot be converted safely. */
+export function getNutritionMultiplierOrNull(quantity, unit, food) {
+  try {
+    const multiplier = getNutritionMultiplier(quantity, unit, food);
+    return Number.isFinite(multiplier) ? multiplier : null;
+  } catch {
+    return null;
+  }
+}
+
 export { UNIT_DEFINITIONS };

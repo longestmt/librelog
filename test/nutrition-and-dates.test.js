@@ -6,6 +6,7 @@ import { scaleNutrients, calculateDayTotalsSimple } from '../src/engine/nutritio
 import { normalizeProduct } from '../src/integrations/openfoodfacts.js';
 import { normalizeFood } from '../src/integrations/usdaFdc.js';
 import { DEFAULT_FOODS } from '../src/data/seed-foods.js';
+import { getProgress } from '../src/engine/goal-tracking.js';
 
 const egg = {
   servingSize: { quantity: 1, unit: 'large' },
@@ -76,6 +77,11 @@ test('missing nutrients remain unknown while totals stay usable', () => {
   assert.deepEqual(totals.incomplete, ['fiber']);
 });
 
+test('an absent meal-item nutrition snapshot marks every nutrient incomplete', () => {
+  const totals = calculateDayTotalsSimple([{ items: [{ foodId: 'legacy-food' }] }]);
+  assert.deepEqual(totals.incomplete, ['kcal', 'protein', 'carbs', 'fat', 'fiber', 'sodium']);
+});
+
 test('Open Food Facts sodium grams are converted to milligrams', () => {
   const food = normalizeProduct({
     code: '123',
@@ -104,4 +110,17 @@ test('USDA normalization distinguishes missing values from zero', () => {
   assert.equal(food.nutrients.energy.kcal, 0);
   assert.equal(food.nutrients.macros.protein.g, 3);
   assert.equal(food.nutrients.macros.carbs.g, null);
+});
+
+test('zero nutrient goals are disabled without NaN or Infinity progress', () => {
+  const progress = getProgress(
+    { kcal: 500, protein: 20, carbs: 30, fat: 10, fiber: 5, sodium: 600 },
+    { calorieTarget: 2000, proteinG: 0, carbG: 0, fatG: 0, fiberG: 0, sodiumMg: 0 },
+  );
+
+  assert.deepEqual(progress.calories, { percentage: 25, status: 'under' });
+  for (const nutrient of ['protein', 'carbs', 'fat', 'fiber', 'sodium']) {
+    assert.deepEqual(progress[nutrient], { percentage: 0, status: 'disabled' });
+    assert.equal(Number.isFinite(progress[nutrient].percentage), true);
+  }
 });

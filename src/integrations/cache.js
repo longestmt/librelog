@@ -66,7 +66,7 @@ async function getCached(source, query) {
  * @param {number} ttlSeconds - Time to live in seconds
  * @returns {Promise<void>}
  */
-async function setCache(source, query, data, ttlSeconds = 3600) {
+async function setCache(source, query, data, ttlSeconds = 3600, options = {}) {
   if (!source || !query || !data) {
     return;
   }
@@ -87,8 +87,9 @@ async function setCache(source, query, data, ttlSeconds = 3600) {
       isDeleted: false
     };
 
-    await put(STORE_NAME, entry);
+    await put(STORE_NAME, entry, options);
   } catch (error) {
+    if (error?.code === 'DATA_OPERATION_INVALIDATED') return;
     console.error('Error storing cache entry:', error);
   }
 }

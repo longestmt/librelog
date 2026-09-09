@@ -4,16 +4,89 @@
  * Uses Capacitor Filesystem when available, falls back to localStorage snapshots.
  */
 
-import { exportAllData } from './db.js';
+import { clearAllData, exportAllData, importAllData } from './db.js';
+import { withAddDraftLock } from './add-draft.js';
 import { getSetting, setSetting } from './db.js';
+import {
+  assertDataMutationGenerationCurrent,
+  captureDataMutationGeneration,
+  hasDataLifecycleLock,
+  withDataDestructiveLock,
+  withDataLifecycleLock,
+  withDataWriteLock,
+} from './operation-locks.js';
 import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
+import { Capacitor } from '@capacitor/core';
 
 const BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const MAX_BACKUPS = 7;
 const BACKUP_STORAGE_KEY = 'librelog_backups';
+const PRIVATE_BROWSER_CACHE_NAMES = ['off-api-cache'];
+export const DATA_CLEARED_STORAGE_KEY = 'librelog_data_cleared_at';
+const DATA_CLEARED_CHANNEL_NAME = 'librelog:data-cleared:v1';
+const dataClearSourceId = globalThis.crypto?.randomUUID?.()
+  || `${Date.now()}:${Math.random().toString(36).slice(2)}`;
 
 let backupTimer = null;
 let visibilityHandler = null;
+
+function announceDataReset() {
+  const message = {
+    sourceId: dataClearSourceId,
+    clearedAt: new Date().toISOString(),
+  };
+  try {
+    globalThis.localStorage?.setItem(DATA_CLEARED_STORAGE_KEY, JSON.stringify(message));
+  } catch {
+    // BroadcastChannel can still notify peers when storage is unavailable.
+  }
+  if (typeof globalThis.BroadcastChannel !== 'function') return;
+  let channel = null;
+  try {
+    channel = new globalThis.BroadcastChannel(DATA_CLEARED_CHANNEL_NAME);
+    channel.postMessage(message);
+  } catch {
+    // Peer notification is best-effort and must never turn a completed reset
+    // into an apparent failure after the primary data has already changed.
+  } finally {
+    try {
+      channel?.close();
+    } catch {
+      // Closing a one-shot notification channel is best-effort too.
+    }
+  }
+}
+
+/** Reload/cancel stale UI work in other same-origin tabs after a data reset. */
+export function listenForExternalDataClear(callback) {
+  if (typeof callback !== 'function') throw new TypeError('A data-clear callback is required');
+  const onStorage = event => {
+    if (event.key === DATA_CLEARED_STORAGE_KEY && event.newValue) callback();
+  };
+  globalThis.window?.addEventListener?.('storage', onStorage);
+  let channel = null;
+  try {
+    if (typeof globalThis.BroadcastChannel === 'function') {
+      channel = new globalThis.BroadcastChannel(DATA_CLEARED_CHANNEL_NAME);
+    }
+  } catch {
+    // Storage events still provide a best-effort fallback when channel
+    // construction is unavailable or blocked by the browser.
+  }
+  if (channel) {
+    channel.onmessage = event => {
+      if (event.data?.sourceId !== dataClearSourceId) callback();
+    };
+  }
+  return () => {
+    globalThis.window?.removeEventListener?.('storage', onStorage);
+    try {
+      channel?.close();
+    } catch {
+      // Cleanup remains safe even if the browser invalidated the channel.
+    }
+  };
+}
 
 /**
  * Initialize the auto-backup scheduler.
@@ -62,9 +135,14 @@ export function stopAutoBackup() {
 /**
  * Perform a backup of all data
  */
-export async function performBackup() {
+async function performBackupWithLifecycleLockHeld(lifecycleToken, {
+  saveFilesystem = saveToFilesystem,
+  saveBrowser = saveToLocalStorage,
+  captureSnapshot = false,
+  recordMetadata = true,
+} = {}) {
   try {
-    const data = await exportAllData();
+    const data = await exportAllData({ lifecycleToken });
     const snapshot = {
       timestamp: Date.now(),
       date: new Date().toISOString(),
@@ -72,21 +150,43 @@ export async function performBackup() {
     };
 
     // Try Capacitor Filesystem first (native apps)
-    if (await saveToFilesystem(snapshot)) {
-      await setSetting('lastBackupTime', Date.now());
-      await setSetting('lastBackupMethod', 'filesystem');
-      return true;
+    if (await saveFilesystem(snapshot)) {
+      if (recordMetadata) {
+        await setSetting('lastBackupTime', Date.now());
+        await setSetting('lastBackupMethod', 'filesystem');
+      }
+      return captureSnapshot ? data : true;
     }
 
     // Fall back to localStorage snapshots
-    if (!saveToLocalStorage(snapshot)) return false;
-    await setSetting('lastBackupTime', Date.now());
-    await setSetting('lastBackupMethod', 'localStorage');
-    return true;
+    if (!saveBrowser(snapshot)) return false;
+    if (recordMetadata) {
+      await setSetting('lastBackupTime', Date.now());
+      await setSetting('lastBackupMethod', 'localStorage');
+    }
+    return captureSnapshot ? data : true;
   } catch (err) {
     console.error('Auto-backup failed:', err);
     return false;
   }
+}
+
+export async function performBackup({
+  lifecycleToken,
+  lockManager,
+  saveFilesystem,
+  saveBrowser,
+  captureSnapshot,
+  recordMetadata,
+} = {}) {
+  const dependencies = { saveFilesystem, saveBrowser, captureSnapshot, recordMetadata };
+  if (hasDataLifecycleLock(lifecycleToken)) {
+    return performBackupWithLifecycleLockHeld(lifecycleToken, dependencies);
+  }
+  return withDataLifecycleLock(
+    token => performBackupWithLifecycleLockHeld(token, dependencies),
+    lockManager,
+  );
 }
 
 /**
@@ -203,6 +303,7 @@ function saveToLocalStorage(snapshot) {
  * If corruption is detected, prompt user to restore from backup.
  */
 async function checkIntegrity() {
+  const mutationGeneration = captureDataMutationGeneration();
   try {
     const data = await exportAllData();
     const storeNames = Object.keys(data.stores || {});
@@ -213,14 +314,15 @@ async function checkIntegrity() {
     const currentMeals = data.stores.meals?.length || 0;
     const backedUpMeals = latestBackup?.data?.stores?.meals?.length || 0;
 
+    assertDataMutationGenerationCurrent(mutationGeneration);
     if ((lastKnownCount !== null && totalRecords === 0 && lastKnownCount > 10)
       || (currentMeals === 0 && backedUpMeals > 0)) {
       // Possible data loss — offer restore
       console.warn('Possible IndexedDB data loss detected. Last known:', lastKnownCount, 'Current:', totalRecords);
-      offerRestore();
+      offerRestore(mutationGeneration);
     }
 
-    await setSetting('lastRecordCount', totalRecords);
+    await setSetting('lastRecordCount', totalRecords, { mutationGeneration });
   } catch (err) {
     console.error('Integrity check failed:', err);
   }
@@ -240,9 +342,12 @@ function getLatestBrowserBackup() {
 /**
  * Offer user the option to restore from most recent backup
  */
-function offerRestore() {
+function offerRestore(mutationGeneration) {
   const event = new CustomEvent('librelog:dataloss', {
-    detail: { message: 'Possible data loss detected. Would you like to restore from backup?' }
+    detail: {
+      message: 'Possible data loss detected. Would you like to restore from backup?',
+      mutationGeneration,
+    },
   });
   window.dispatchEvent(event);
 }
@@ -283,15 +388,148 @@ export function getBackupData(timestamp) {
  * Remove browser and native auto-backup copies when the user chooses
  * "Clear All Data".
  */
-export async function clearAutoBackups() {
-  localStorage.removeItem(BACKUP_STORAGE_KEY);
+async function removeNativeBackupDirectory() {
   try {
     await Filesystem.rmdir({
       path: 'librelog-backups',
       directory: Directory.Data,
       recursive: true,
     });
-  } catch {
-    // Expected in browsers and when no native backup directory exists.
+  } catch (error) {
+    if (!Capacitor.isNativePlatform() || error?.code === 'OS-PLUG-FILE-0008') return;
+    throw new Error('Could not remove private native backup files', { cause: error });
   }
+}
+
+async function clearAutoBackupsWithLifecycleLockHeld({
+  removeFilesystemBackups = removeNativeBackupDirectory,
+} = {}) {
+  await removeFilesystemBackups();
+  localStorage.removeItem(BACKUP_STORAGE_KEY);
+}
+
+async function removePrivateBrowserCaches(cacheStorage = globalThis.caches) {
+  if (!cacheStorage?.delete) return;
+  try {
+    await Promise.all(PRIVATE_BROWSER_CACHE_NAMES.map(name => cacheStorage.delete(name)));
+  } catch (error) {
+    throw new Error('Could not remove private browser search caches', { cause: error });
+  }
+}
+
+export async function clearAutoBackups({
+  lifecycleToken,
+  lockManager,
+  removeFilesystemBackups,
+} = {}) {
+  const dependencies = { removeFilesystemBackups };
+  if (hasDataLifecycleLock(lifecycleToken)) {
+    return clearAutoBackupsWithLifecycleLockHeld(dependencies);
+  }
+  return withDataLifecycleLock(
+    () => clearAutoBackupsWithLifecycleLockHeld(dependencies),
+    lockManager,
+  );
+}
+
+/**
+ * Erase backups and application data as one cross-tab lifecycle operation.
+ * A backup already in progress must finish first, after which its snapshot is
+ * removed before the database is cleared.
+ */
+export async function clearAllDataAndBackups({
+  lockManager,
+  removeFilesystemBackups,
+  removeBrowserCaches = removePrivateBrowserCaches,
+} = {}) {
+  return withDataLifecycleLock(async lifecycleToken => {
+    await withDataDestructiveLock(async destructiveLockToken => {
+      await withAddDraftLock(async draftLockToken => {
+        await withDataWriteLock(async writeLockToken => {
+          // Finish all fallible external cleanup before erasing IndexedDB so a
+          // cache/filesystem permission error leaves the primary data intact.
+          await removeBrowserCaches();
+          await clearAutoBackupsWithLifecycleLockHeld({ removeFilesystemBackups });
+          try {
+            await clearAllData({
+              lifecycleToken,
+              draftLockToken,
+              destructiveLockToken,
+              writeLockToken,
+              lockManager,
+            });
+          } catch (error) {
+            // Backup deletion succeeded but the atomic IndexedDB erase did
+            // not. Recreate a verified recovery point immediately while the
+            // lifecycle guard still prevents another tab from changing data.
+            const recovered = await performBackupWithLifecycleLockHeld(lifecycleToken, {
+              recordMetadata: false,
+            });
+            if (!recovered) {
+              const recoveryError = new Error(
+                'Data clearing failed, and LibreLog could not recreate its recovery backup.',
+                { cause: error },
+              );
+              recoveryError.code = 'CLEAR_RECOVERY_BACKUP_FAILED';
+              throw recoveryError;
+            }
+            throw error;
+          }
+          // Notify peers before the destructive guard is released. Their
+          // pending writes are rejected and the tabs reload to discard stale
+          // in-memory state and timers.
+          announceDataReset();
+        }, lockManager, { destructiveLockToken });
+      }, lockManager, { destructiveLockToken });
+    }, lockManager);
+  }, lockManager);
+}
+
+/**
+ * Verify a recovery snapshot and replace data without allowing another tab's
+ * clear/import operation to slip between those two steps.
+ */
+export async function replaceAllDataWithSafetyBackup(
+  data,
+  {
+    lifecycleToken,
+    lockManager,
+    mutationGeneration,
+    saveFilesystem,
+    saveBrowser,
+  } = {},
+) {
+  const replace = async token => {
+    return withDataDestructiveLock(async destructiveLockToken => {
+      await withAddDraftLock(async draftLockToken => {
+        await withDataWriteLock(async writeLockToken => {
+          const recoverySnapshot = await performBackupWithLifecycleLockHeld(token, {
+            captureSnapshot: true,
+            // Metadata writes would make this snapshot stale before the guarded
+            // replacement transaction begins.
+            recordMetadata: false,
+            saveFilesystem,
+            saveBrowser,
+          });
+          if (!recoverySnapshot) {
+            throw new Error('Full replacement stopped because a safety backup could not be verified');
+          }
+          await importAllData(data, false, {
+            lifecycleToken: token,
+            draftLockToken,
+            destructiveLockToken,
+            writeLockToken,
+            expectedCurrentData: recoverySnapshot,
+            lockManager,
+          });
+          // A replacement invalidates every other tab's in-memory view just
+          // like Clear does. Reload peers before they can persist stale state.
+          announceDataReset();
+        }, lockManager, { destructiveLockToken });
+      }, lockManager, { destructiveLockToken });
+    }, lockManager, { mutationGeneration });
+  };
+
+  if (hasDataLifecycleLock(lifecycleToken)) return replace(lifecycleToken);
+  return withDataLifecycleLock(replace, lockManager);
 }

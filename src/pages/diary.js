@@ -4,6 +4,7 @@ import {
   createIdempotencyKey,
   createMealBatch,
   removeMealItem,
+  restoreMealItem,
   updateMealItem,
 } from '../data/meal-commands.js';
 import { getGoals } from '../engine/goal-tracking.js';
@@ -11,9 +12,11 @@ import { calculateDayTotalsSimple, scaleNutrients } from '../engine/nutrition.js
 import { todayStr, formatDate, addCalendarDays } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
-import { showToast } from '../components/toast.js';
-import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
+import { showToast, showUndoToast } from '../components/toast.js';
+import { getUnitsForFood, getNutritionMultiplierOrNull } from '../utils/units.js';
 import { getRecentFoods } from '../engine/food-search.js';
+import { readPositiveNumberInput } from '../utils/form-validation.js';
+import { captureDataMutationGeneration } from '../data/operation-locks.js';
 
 function generateId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -23,13 +26,16 @@ export async function renderDiaryPage(container, queryString) {
   const params = new URLSearchParams(queryString);
   const dateParam = params.get('date');
   let currentDate = isCalendarDate(dateParam) ? dateParam : todayStr();
+  let noteTimeout = null;
 
   async function render() {
+    const renderMutationGeneration = captureDataMutationGeneration();
     const meals = await getByIndex('meals', 'date', currentDate) || [];
     const goals = await getGoals();
     const dailyNote = await getSetting(`note_${currentDate}`) || '';
 
     const totals = calculateDayTotalsSimple(meals);
+    const isIncomplete = key => totals.incomplete?.includes(key);
     const caloriesRemaining = goals.calorieTarget - totals.kcal;
 
     const nutritionRingSVG = createNutritionRing(totals.kcal, goals.calorieTarget);
@@ -79,40 +85,17 @@ export async function renderDiaryPage(container, queryString) {
           <div class="nutrition-ring-container">
             ${nutritionRingSVG}
             <div class="ring-text">
-              <div class="ring-main">${totals.kcal}</div>
-              <div class="ring-sub">of ${goals.calorieTarget}</div>
+              <div class="ring-main">${isIncomplete('kcal') ? `${totals.kcal}+` : totals.kcal}</div>
+              <div class="ring-sub">${isIncomplete('kcal') ? 'known kcal' : `of ${goals.calorieTarget}`}</div>
             </div>
           </div>
           <div class="macro-bars">
-            <div class="macro-bar" role="progressbar" aria-valuenow="${Math.round(totals.protein)}" aria-valuemax="${goals.proteinG}" aria-label="Protein progress">
-              <div class="macro-header">
-                <span class="macro-label">Protein</span>
-                <span class="macro-value">${Math.round(totals.protein)}g / ${goals.proteinG}g</span>
-              </div>
-              <div class="macro-track">
-                <div class="macro-fill protein" style="width: ${Math.min(100, (totals.protein / goals.proteinG) * 100)}%"></div>
-              </div>
-            </div>
-            <div class="macro-bar" role="progressbar" aria-valuenow="${Math.round(totals.carbs)}" aria-valuemax="${goals.carbG}" aria-label="Carbs progress">
-              <div class="macro-header">
-                <span class="macro-label">Carbs</span>
-                <span class="macro-value">${Math.round(totals.carbs)}g / ${goals.carbG}g</span>
-              </div>
-              <div class="macro-track">
-                <div class="macro-fill carbs" style="width: ${Math.min(100, (totals.carbs / goals.carbG) * 100)}%"></div>
-              </div>
-            </div>
-            <div class="macro-bar" role="progressbar" aria-valuenow="${Math.round(totals.fat)}" aria-valuemax="${goals.fatG}" aria-label="Fat progress">
-              <div class="macro-header">
-                <span class="macro-label">Fat</span>
-                <span class="macro-value">${Math.round(totals.fat)}g / ${goals.fatG}g</span>
-              </div>
-              <div class="macro-track">
-                <div class="macro-fill fat" style="width: ${Math.min(100, (totals.fat / goals.fatG) * 100)}%"></div>
-              </div>
-            </div>
+            ${renderMacroGoal('Protein', 'protein', totals.protein, goals.proteinG, isIncomplete('protein'))}
+            ${renderMacroGoal('Carbs', 'carbs', totals.carbs, goals.carbG, isIncomplete('carbs'))}
+            ${renderMacroGoal('Fat', 'fat', totals.fat, goals.fatG, isIncomplete('fat'))}
           </div>
         </div>
+        ${totals.incomplete?.length ? `<p class="nutrition-incomplete-notice" role="note"><strong>Partial nutrition:</strong> some foods do not include ${totals.incomplete.map(escapeHTML).join(', ')}. Known values are marked “+”; missing values are never counted as zero.</p>` : ''}
 
         <!-- Collapsible Micronutrients -->
         <details class="micro-details">
@@ -123,11 +106,11 @@ export async function renderDiaryPage(container, queryString) {
           <div class="micro-grid">
             <div class="micro-item">
               <span class="micro-label">Fiber</span>
-              <span class="micro-value">${totals.fiber}g / ${goals.fiberG || 30}g</span>
+              <span class="micro-value">${formatGoalTotal(totals.fiber, goals.fiberG, 'g', isIncomplete('fiber'))}</span>
             </div>
             <div class="micro-item">
               <span class="micro-label">Sodium</span>
-              <span class="micro-value">${totals.sodium}mg / ${goals.sodiumMg || 2300}mg</span>
+              <span class="micro-value">${formatGoalTotal(totals.sodium, goals.sodiumMg, 'mg', isIncomplete('sodium'))}</span>
             </div>
           </div>
           ${totals.incomplete?.length ? `<p class="field-hint">Some logged foods do not include ${totals.incomplete.join(', ')}; totals omit those missing values.</p>` : ''}
@@ -135,8 +118,8 @@ export async function renderDiaryPage(container, queryString) {
 
         <!-- Remaining Calories -->
         <div class="remaining-calories">
-          <span class="remaining-label">${caloriesRemaining >= 0 ? 'Remaining:' : 'Above target:'}</span>
-          <span class="remaining-value">${Math.abs(caloriesRemaining)} kcal</span>
+          <span class="remaining-label">${isIncomplete('kcal') ? 'Remaining:' : caloriesRemaining >= 0 ? 'Remaining:' : 'Above target:'}</span>
+          <span class="remaining-value">${isIncomplete('kcal') ? 'Unknown' : `${Math.abs(caloriesRemaining)} kcal`}</span>
         </div>
 
         <!-- Recent Meals Carousel -->
@@ -145,11 +128,11 @@ export async function renderDiaryPage(container, queryString) {
           <h3 class="carousel-title">Quick Re-log</h3>
           <div class="carousel-scroll">
             ${recentFoods.map(food => {
-              const kcal = food.nutrients?.energy?.kcal || 0;
+              const kcal = food.nutrients?.energy?.kcal;
               return `
                 <button class="carousel-chip" data-food-id="${escapeHTML(String(food.id))}" aria-label="Re-log ${escapeHTML(food.name)}">
                   <span class="chip-name">${escapeHTML(food.name)}</span>
-                  <span class="chip-kcal">${Math.round(kcal)} kcal</span>
+                  <span class="chip-kcal">${kcal != null && Number.isFinite(Number(kcal)) ? `${Math.round(Number(kcal))} kcal` : 'Calories unknown'}</span>
                 </button>
               `;
             }).join('')}
@@ -222,11 +205,20 @@ export async function renderDiaryPage(container, queryString) {
     });
 
     // Daily notes auto-save with debounce
-    let noteTimeout;
     document.getElementById('daily-note-input')?.addEventListener('input', (e) => {
       clearTimeout(noteTimeout);
+      const note = e.target.value;
+      const mutationGeneration = captureDataMutationGeneration();
       noteTimeout = setTimeout(async () => {
-        await setSetting(`note_${currentDate}`, e.target.value);
+        noteTimeout = null;
+        if (!container.isConnected) return;
+        try {
+          await setSetting(`note_${currentDate}`, note, { mutationGeneration });
+        } catch (error) {
+          if (error?.code !== 'DATA_OPERATION_INVALIDATED') {
+            console.warn('Could not save daily note:', error);
+          }
+        }
       }, 500);
     });
 
@@ -256,23 +248,43 @@ export async function renderDiaryPage(container, queryString) {
           <input type="text" id="template-name" class="form-input" maxlength="120" placeholder="e.g., My typical Monday" aria-label="Template name"></label>
         <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Cancel</button><button class="btn btn-primary" id="save-btn">Save</button></div>
       `;
-      openModal(modal);
-      document.getElementById('modal-close').addEventListener('click', closeModal);
-      document.getElementById('cancel-btn').addEventListener('click', closeModal);
-      document.getElementById('save-btn').addEventListener('click', async () => {
-        const name = document.getElementById('template-name').value.trim();
+      let templateSaveInProgress = false;
+      const templateKey = `template_${generateId()}`;
+      const dialog = openModal(modal, { canClose: () => !templateSaveInProgress });
+      const modalControls = [...dialog.querySelectorAll('button, input, select')];
+      const saveButton = dialog.querySelector('#save-btn');
+      dialog.querySelector('#modal-close').addEventListener('click', () => closeModal({ target: dialog, reason: 'close-button' }));
+      dialog.querySelector('#cancel-btn').addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
+      saveButton.addEventListener('click', async () => {
+        if (templateSaveInProgress) return;
+        const name = dialog.querySelector('#template-name').value.trim();
         if (!name) { showToast('Please enter a template name'); return; }
         const templateItems = meals.flatMap(m => (m.items || []).map(item => ({ ...item, mealType: m.type })));
-        await put('settings', { key: `template_${generateId()}`, value: { name, items: templateItems, createdAt: new Date().toISOString() }, updatedAt: new Date().toISOString() });
-        showToast('Template saved');
-        closeModal();
+        templateSaveInProgress = true;
+        modalControls.forEach(control => { control.disabled = true; });
+        saveButton.textContent = 'Saving…';
+        try {
+          await put(
+            'settings',
+            { key: templateKey, value: { kind: 'day', name, items: templateItems, createdAt: new Date().toISOString() }, updatedAt: new Date().toISOString() },
+            { mutationGeneration: renderMutationGeneration },
+          );
+          showToast('Template saved');
+          closeModal({ target: dialog, force: true, reason: 'completed' });
+        } catch (error) {
+          console.error('Template save failed:', error);
+          showToast('Template could not be saved', 'error');
+          templateSaveInProgress = false;
+          modalControls.forEach(control => { control.disabled = false; });
+          saveButton.textContent = 'Save';
+        }
       });
     });
 
     // Load template
     document.getElementById('load-template-btn')?.addEventListener('click', () => openLoadTemplateModal(currentDate, render));
     document.getElementById('meal-history-btn')?.addEventListener('click', () => {
-      window.location.hash = '#/history';
+      window.location.hash = `#/history?date=${currentDate}`;
     });
 
     // Meal section add food buttons
@@ -286,12 +298,13 @@ export async function renderDiaryPage(container, queryString) {
     // Food item click and keyboard handlers
     document.querySelectorAll('.food-item').forEach(el => {
       const handler = async () => {
+        const mutationGeneration = captureDataMutationGeneration();
         const mealId = el.dataset.mealId;
         const foodIndex = el.dataset.foodIndex;
         const meals = await getByIndex('meals', 'date', currentDate);
         const meal = meals.find(m => m.id === mealId);
         if (meal && meal.items[foodIndex]) {
-          openPortionEditor(meal, foodIndex, currentDate, render);
+          openPortionEditor(meal, foodIndex, currentDate, render, mutationGeneration);
         }
       };
       el.addEventListener('click', handler);
@@ -305,6 +318,45 @@ export async function renderDiaryPage(container, queryString) {
   }
 
   await render();
+  return () => {
+    clearTimeout(noteTimeout);
+    noteTimeout = null;
+  };
+}
+
+function hasEnabledGoal(target) {
+  return Number.isFinite(Number(target)) && Number(target) > 0;
+}
+
+function formatGoalTotal(value, target, unit, incomplete) {
+  const displayedValue = Number.isFinite(Number(value)) ? Number(value) : 0;
+  const knownValue = `${displayedValue}${unit}${incomplete ? '+ known' : ''}`;
+  return hasEnabledGoal(target)
+    ? (incomplete ? knownValue : `${knownValue} / ${target}${unit}`)
+    : `${knownValue} · no target`;
+}
+
+function renderMacroGoal(label, key, value, target, incomplete) {
+  const displayedValue = Number.isFinite(Number(value)) ? Math.round(Number(value)) : 0;
+  const enabled = hasEnabledGoal(target);
+  const percentage = enabled
+    ? Math.min(100, Math.max(0, (displayedValue / Number(target)) * 100))
+    : 0;
+  const accessibility = enabled
+    ? `role="progressbar" aria-valuenow="${displayedValue}" aria-valuemax="${target}" aria-label="${incomplete ? `${label} total is partial; known progress` : `${label} progress`}"`
+    : `role="group" aria-label="${label} ${incomplete ? 'known ' : ''}total; no target"`;
+
+  return `
+    <div class="macro-bar" ${accessibility}>
+      <div class="macro-header">
+        <span class="macro-label">${label}</span>
+        <span class="macro-value">${formatGoalTotal(displayedValue, target, 'g', incomplete)}</span>
+      </div>
+      <div class="macro-track">
+        <div class="macro-fill ${key}" style="width: ${percentage}%"></div>
+      </div>
+    </div>
+  `;
 }
 
 function createNutritionRing(consumed, target) {
@@ -376,17 +428,26 @@ function renderMealSection(mealType, mealsOfType, foodsMap) {
           <div class="meal-group" data-meal-id="${escapeHTML(String(meal.id))}">
             ${(meal.items || []).map((item, foodIdx) => {
               const food = foodsMap.get(item.foodId);
-              const kcal = item.nutrients?.kcal || 0;
-              const name = food?.name || item.foodId || 'Unknown food';
+              const kcal = item.nutrients?.kcal;
+              const calorieDisplay = kcal != null && Number.isFinite(Number(kcal)) ? `${Math.round(Number(kcal))} kcal` : 'Calories unknown';
+              const accessibleCalories = kcal != null && Number.isFinite(Number(kcal)) ? `${Math.round(Number(kcal))} calories` : 'calories unknown';
+              const name = item.nameSnapshot || food?.name || item.foodId || 'Unknown food';
               const unit = item.unit || food?.servingSize?.unit || 'g';
-              const isEstimate = food?.source?.type?.startsWith('ai-');
+              const portion = `${item.quantity} ${unit}`;
+              const servingReference = item.basisSnapshot?.label;
+              const portionDisplay = servingReference && servingReference !== portion
+                ? `${portion} · ${servingReference}`
+                : portion;
+              const sourceType = typeof food?.source?.type === 'string' ? food.source.type : '';
+              const sourceLabel = item.provenance?.nutritionSource
+                || (sourceType.startsWith('ai-') ? 'AI estimate' : '');
               return `
-                <div class="food-item" data-meal-id="${escapeHTML(String(meal.id))}" data-food-index="${foodIdx}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${item.quantity} ${escapeHTML(String(unit))}, ${Math.round(kcal)} calories. Click to edit.">
+                <div class="food-item" data-meal-id="${escapeHTML(String(meal.id))}" data-food-index="${foodIdx}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${escapeHTML(portionDisplay)}, ${escapeHTML(accessibleCalories)}. Click to edit.">
                   <div class="food-info">
-                    <div class="food-name">${escapeHTML(name)}${isEstimate ? ' <span class="source-badge ai">AI estimate</span>' : ''}</div>
-                    <div class="food-portion">${item.quantity} ${escapeHTML(String(unit))}</div>
+                    <div class="food-name">${escapeHTML(name)}${sourceLabel ? ` <span class="source-badge ${sourceLabel === 'AI estimate' ? 'ai' : ''}">${escapeHTML(sourceLabel)}</span>` : ''}</div>
+                    <div class="food-portion">${escapeHTML(portionDisplay)}</div>
                   </div>
-                  <div class="food-calories">${Math.round(kcal)} kcal</div>
+                  <div class="food-calories">${escapeHTML(calorieDisplay)}</div>
                 </div>
               `;
             }).join('')}
@@ -406,45 +467,76 @@ function renderMealSection(mealType, mealsOfType, foodsMap) {
   `;
 }
 
-async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
+async function openPortionEditor(meal, foodIndex, currentDate, onComplete, mutationGeneration) {
   const item = meal.items[foodIndex];
   const food = await getById('foods', item.foodId);
+  const basis = item.basisSnapshot;
+  const nutritionFood = basis ? {
+    ...(food || {}),
+    name: item.nameSnapshot || food?.name || 'Logged food',
+    servingSize: {
+      quantity: basis.quantity,
+      unit: basis.unit,
+      gramsPerUnit: basis.gramsPerUnit,
+      aliases: basis.aliases || [],
+      label: basis.label || null,
+      packageQuantity: basis.packageQuantity,
+      packageUnit: basis.packageUnit,
+    },
+    nutrients: {
+      energy: { kcal: basis.nutrients?.kcal },
+      macros: {
+        protein: { g: basis.nutrients?.protein },
+        carbs: { g: basis.nutrients?.carbs },
+        fat: { g: basis.nutrients?.fat },
+      },
+      fiber: { g: basis.nutrients?.fiber },
+      sodium: { mg: basis.nutrients?.sodium },
+    },
+  } : food;
 
-  if (!food) return;
+  if (!nutritionFood) return;
 
+  const numberOrNull = value => value == null || !Number.isFinite(Number(value)) ? null : Number(value);
   const baseNutrition = {
-    calories: food.nutrients?.energy?.kcal || 0,
-    protein: food.nutrients?.macros?.protein?.g || 0,
-    carbs: food.nutrients?.macros?.carbs?.g || 0,
-    fat: food.nutrients?.macros?.fat?.g || 0,
+    calories: numberOrNull(nutritionFood.nutrients?.energy?.kcal),
+    protein: numberOrNull(nutritionFood.nutrients?.macros?.protein?.g),
+    carbs: numberOrNull(nutritionFood.nutrients?.macros?.carbs?.g),
+    fat: numberOrNull(nutritionFood.nutrients?.macros?.fat?.g),
   };
 
-  let quantity = item.quantity ?? food.servingSize?.quantity ?? 100;
-  let unit = item.unit || food.servingSize?.unit || 'g';
+  let quantity = item.quantity ?? nutritionFood.servingSize?.quantity ?? 100;
+  let unit = item.unit || nutritionFood.servingSize?.unit || 'g';
 
-  const availableUnits = getUnitsForFood(food);
+  const availableUnits = getUnitsForFood(nutritionFood);
+  if (!availableUnits.some(candidate => candidate.value === unit)) {
+    availableUnits.unshift({ value: unit, label: unit });
+  }
 
   function updatePreview() {
-    const multiplier = getNutritionMultiplier(quantity, unit, food);
-    const preview = document.getElementById('nutrition-preview');
+    const multiplier = getNutritionMultiplierOrNull(quantity, unit, nutritionFood);
+    const display = (value, suffix, precision = 0) => Number.isFinite(value) && multiplier != null
+      ? `${(value * multiplier).toFixed(precision)}${suffix}`
+      : 'Unknown';
+    const preview = dialog?.querySelector('#nutrition-preview');
     if (preview) {
       preview.innerHTML = `
         <div class="nutrition-preview">
           <div class="preview-stat">
             <span class="preview-label">Calories</span>
-            <span class="preview-value">${Math.round(baseNutrition.calories * multiplier)} kcal</span>
+            <span class="preview-value">${display(baseNutrition.calories, ' kcal')}</span>
           </div>
           <div class="preview-stat">
             <span class="preview-label">Protein</span>
-            <span class="preview-value">${Math.round(baseNutrition.protein * multiplier)}g</span>
+            <span class="preview-value">${display(baseNutrition.protein, 'g', 1)}</span>
           </div>
           <div class="preview-stat">
             <span class="preview-label">Carbs</span>
-            <span class="preview-value">${Math.round(baseNutrition.carbs * multiplier)}g</span>
+            <span class="preview-value">${display(baseNutrition.carbs, 'g', 1)}</span>
           </div>
           <div class="preview-stat">
             <span class="preview-label">Fat</span>
-            <span class="preview-value">${Math.round(baseNutrition.fat * multiplier)}g</span>
+            <span class="preview-value">${display(baseNutrition.fat, 'g', 1)}</span>
           </div>
         </div>
       `;
@@ -455,7 +547,7 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
   modal.className = 'modal-content portion-editor';
   modal.innerHTML = `
     <div class="modal-header">
-      <h2>${escapeHTML(food.name)}</h2>
+      <h2>${escapeHTML(item.nameSnapshot || nutritionFood.name)}</h2>
       <button class="modal-close" id="modal-close" aria-label="Close">✕</button>
     </div>
 
@@ -479,6 +571,8 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
       </label>
     </div>
 
+    ${basis?.label ? `<p class="serving-reference">Serving reference: ${escapeHTML(basis.label)}</p>` : ''}
+
     <div id="nutrition-preview"></div>
 
     <label class="control-group">
@@ -492,28 +586,39 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
     </div>
   `;
 
-  openModal(modal);
-
-  const qtyInput = document.getElementById('qty-input');
-  const unitSelect = document.getElementById('unit-select');
-  const notesInput = document.getElementById('notes-input');
   const updateCommandKey = createIdempotencyKey('edit');
   const removeCommandKey = createIdempotencyKey('remove');
+  const undoRemoveCommandKey = createIdempotencyKey('undo-remove');
+  let actionInProgress = false;
+  let deleteArmed = false;
+  const dialog = openModal(modal, { canClose: () => !actionInProgress });
 
-  document.getElementById('qty-minus').addEventListener('click', () => {
-    qtyInput.value = Math.max(0.1, parseFloat(qtyInput.value) - 0.5);
-    quantity = parseFloat(qtyInput.value);
+  const qtyInput = dialog.querySelector('#qty-input');
+  const unitSelect = dialog.querySelector('#unit-select');
+  const notesInput = dialog.querySelector('#notes-input');
+  const saveButton = dialog.querySelector('#save-btn');
+  const deleteButton = dialog.querySelector('#delete-btn');
+  const modalControls = [...dialog.querySelectorAll('button, input, select')];
+
+  dialog.querySelector('#qty-minus').addEventListener('click', () => {
+    const current = readPositiveNumberInput(qtyInput, { report: true });
+    if (current == null) return;
+    quantity = Math.max(0.1, current - 0.5);
+    qtyInput.value = quantity;
     updatePreview();
   });
 
-  document.getElementById('qty-plus').addEventListener('click', () => {
-    qtyInput.value = (parseFloat(qtyInput.value) + 0.5).toFixed(1);
-    quantity = parseFloat(qtyInput.value);
+  dialog.querySelector('#qty-plus').addEventListener('click', () => {
+    const current = readPositiveNumberInput(qtyInput, { report: true });
+    if (current == null) return;
+    quantity = current + 0.5;
+    qtyInput.value = quantity.toFixed(1);
     updatePreview();
   });
 
   qtyInput.addEventListener('change', () => {
-    quantity = parseFloat(qtyInput.value) || 100;
+    const next = readPositiveNumberInput(qtyInput, { report: true });
+    quantity = next ?? NaN;
     updatePreview();
   });
 
@@ -522,33 +627,76 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete) {
     updatePreview();
   });
 
-  document.getElementById('modal-close').addEventListener('click', closeModal);
+  dialog.querySelector('#modal-close').addEventListener('click', () => closeModal({ target: dialog, reason: 'close-button' }));
 
-  document.getElementById('save-btn').addEventListener('click', async () => {
-    await updateMealItem(meal.id, foodIndex, {
-      ...item,
-      quantity,
-      unit,
-      notes: notesInput.value,
-      nutrients: scaleNutrients(food, quantity, unit),
-    }, { idempotencyKey: updateCommandKey });
-    showToast('Food updated');
-    closeModal();
-    if (onComplete) onComplete();
+  saveButton.addEventListener('click', async () => {
+    if (actionInProgress) return;
+    const nextQuantity = readPositiveNumberInput(qtyInput, { report: true });
+    if (nextQuantity == null) return;
+    quantity = nextQuantity;
+    actionInProgress = true;
+    modalControls.forEach(control => { control.disabled = true; });
+    saveButton.textContent = 'Updating…';
+    try {
+      await updateMealItem(meal.id, foodIndex, {
+        ...item,
+        quantity,
+        unit,
+        notes: notesInput.value,
+        nutrients: scaleNutrients(nutritionFood, quantity, unit),
+      }, {
+        idempotencyKey: updateCommandKey,
+        expectedItemId: item.itemId,
+        mutationGeneration,
+      });
+      showToast('Food updated');
+      closeModal({ target: dialog, force: true, reason: 'completed' });
+      if (onComplete) await onComplete();
+    } catch (error) {
+      console.error('Food update failed:', error);
+      showToast(error?.message?.includes('another tab')
+        ? 'This food changed in another tab. Reopen it before editing.'
+        : 'Could not update food.', 'error', 7000);
+      actionInProgress = false;
+      modalControls.forEach(control => { control.disabled = false; });
+      saveButton.textContent = 'Update';
+    }
   });
 
-  let deleteArmed = false;
-  document.getElementById('delete-btn').addEventListener('click', async (event) => {
+  deleteButton.addEventListener('click', async () => {
+    if (actionInProgress) return;
     if (!deleteArmed) {
       deleteArmed = true;
-      event.currentTarget.textContent = 'Confirm delete';
-      event.currentTarget.setAttribute('aria-label', 'Confirm removal of this food');
+      deleteButton.textContent = 'Confirm delete';
+      deleteButton.setAttribute('aria-label', 'Confirm removal of this food');
       return;
     }
-    await removeMealItem(meal.id, foodIndex, { idempotencyKey: removeCommandKey });
-    showToast('Food removed');
-    closeModal();
-    if (onComplete) onComplete();
+    actionInProgress = true;
+    modalControls.forEach(control => { control.disabled = true; });
+    deleteButton.textContent = 'Deleting…';
+    try {
+      const removal = await removeMealItem(meal.id, foodIndex, {
+        idempotencyKey: removeCommandKey,
+        expectedItemId: item.itemId,
+        mutationGeneration,
+      });
+      closeModal({ target: dialog, force: true, reason: 'completed' });
+      if (onComplete) await onComplete();
+      showUndoToast('Food removed', async () => {
+        await restoreMealItem(meal.id, removal.removedIndex, removal.removedItem, {
+          idempotencyKey: undoRemoveCommandKey,
+          mutationGeneration,
+        });
+        showToast('Food restored');
+        if (onComplete) await onComplete();
+      });
+    } catch (error) {
+      console.error('Food removal failed:', error);
+      showToast('Could not remove food');
+      actionInProgress = false;
+      modalControls.forEach(control => { control.disabled = false; });
+      deleteButton.textContent = 'Confirm delete';
+    }
   });
 
   updatePreview();
@@ -612,38 +760,57 @@ async function openCopyDayModal(targetDate, onComplete) {
       <input type="date" id="copy-source-date" class="form-input" value="${yesterday}" aria-label="Date to copy from"></label>
     <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Cancel</button><button class="btn btn-primary" id="copy-btn">Copy Meals</button></div>
   `;
-  openModal(modal);
-  document.getElementById('modal-close').addEventListener('click', closeModal);
-  document.getElementById('cancel-btn').addEventListener('click', closeModal);
+  let copyInProgress = false;
+  const dialog = openModal(modal, { canClose: () => !copyInProgress });
+  const modalControls = [...dialog.querySelectorAll('button, input, select')];
+  dialog.querySelector('#modal-close').addEventListener('click', () => closeModal({ target: dialog, reason: 'close-button' }));
+  dialog.querySelector('#cancel-btn').addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
   const copyCommandKey = createIdempotencyKey('copy-day');
-  document.getElementById('copy-btn').addEventListener('click', async (event) => {
+  dialog.querySelector('#copy-btn').addEventListener('click', async (event) => {
+    if (copyInProgress) return;
     const button = event.currentTarget;
-    button.disabled = true;
-    const sourceDate = document.getElementById('copy-source-date').value;
+    const sourceDate = dialog.querySelector('#copy-source-date').value;
     if (!sourceDate) {
       showToast('Please select a date');
-      button.disabled = false;
       return;
     }
-    const sourceMeals = await getByIndex('meals', 'date', sourceDate) || [];
-    if (sourceMeals.length === 0) {
-      showToast('No meals found on that date');
-      button.disabled = false;
-      return;
+    copyInProgress = true;
+    modalControls.forEach(control => { control.disabled = true; });
+    button.textContent = 'Copying…';
+    try {
+      const mutationGeneration = captureDataMutationGeneration();
+      const sourceMeals = await getByIndex('meals', 'date', sourceDate) || [];
+      if (sourceMeals.length === 0) {
+        showToast('No meals found on that date');
+        copyInProgress = false;
+        modalControls.forEach(control => { control.disabled = false; });
+        button.textContent = 'Copy Meals';
+        return;
+      }
+      await copyMealsToDate(sourceMeals, targetDate, {
+        idempotencyKey: copyCommandKey,
+        mutationGeneration,
+      });
+      const count = sourceMeals.reduce((total, meal) => total + (meal.items?.length || 0), 0);
+      showToast(`Copied ${count} food items`);
+      closeModal({ target: dialog, force: true, reason: 'completed' });
+      await onComplete();
+    } catch (error) {
+      console.error('Copy day failed:', error);
+      showToast('Meals could not be copied. Nothing was added.', 'error');
+      copyInProgress = false;
+      modalControls.forEach(control => { control.disabled = false; });
+      button.textContent = 'Copy Meals';
     }
-    await copyMealsToDate(sourceMeals, targetDate, { idempotencyKey: copyCommandKey });
-    const count = sourceMeals.reduce((total, meal) => total + (meal.items?.length || 0), 0);
-    showToast(`Copied ${count} food items`);
-    closeModal();
-    onComplete();
   });
 }
 
 async function openLoadTemplateModal(targetDate, onComplete) {
   // Get all templates from settings
+  const mutationGeneration = captureDataMutationGeneration();
   const allSettings = await getAll('settings');
   const templates = allSettings
-    .filter(s => s.key?.startsWith('template_') && s.value?.name)
+    .filter(s => s.key?.startsWith('template_') && s.value?.name && s.value?.kind !== 'meal')
     .map(s => ({ key: s.key, ...s.value }));
 
   if (templates.length === 0) {
@@ -665,16 +832,20 @@ async function openLoadTemplateModal(targetDate, onComplete) {
     </div>
     <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Cancel</button></div>
   `;
-  openModal(modal);
-  document.getElementById('modal-close').addEventListener('click', closeModal);
-  document.getElementById('cancel-btn').addEventListener('click', closeModal);
+  let templateLoading = false;
+  const dialog = openModal(modal, { canClose: () => !templateLoading });
+  dialog.querySelector('#modal-close').addEventListener('click', () => closeModal({ target: dialog, reason: 'close-button' }));
+  dialog.querySelector('#cancel-btn').addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
 
-  document.querySelectorAll('.template-item').forEach(el => {
+  dialog.querySelectorAll('.template-item').forEach(el => {
     const templateCommandKey = createIdempotencyKey('template');
     const handler = async () => {
+      if (templateLoading) return;
       const idx = parseInt(el.dataset.idx);
       const template = templates[idx];
       if (!template?.items) return;
+      templateLoading = true;
+      dialog.querySelectorAll('.template-item').forEach(item => item.setAttribute('aria-disabled', 'true'));
       // Group items by meal type
       const byType = {};
       for (const item of template.items) {
@@ -682,17 +853,24 @@ async function openLoadTemplateModal(targetDate, onComplete) {
         if (!byType[type]) byType[type] = [];
         byType[type].push(item);
       }
-      await createMealBatch(
-        Object.entries(byType).map(([type, items]) => ({
-          date: targetDate,
-          type,
-          items: items.map(({ mealType, ...rest }) => ({ ...rest })),
-        })),
-        { idempotencyKey: templateCommandKey },
-      );
-      showToast(`Template "${template.name}" loaded`);
-      closeModal();
-      onComplete();
+      try {
+        await createMealBatch(
+          Object.entries(byType).map(([type, items]) => ({
+            date: targetDate,
+            type,
+            items: items.map(({ mealType, ...rest }) => ({ ...rest })),
+          })),
+          { idempotencyKey: templateCommandKey, mutationGeneration },
+        );
+        showToast(`Template "${template.name}" loaded`);
+        closeModal({ target: dialog, force: true, reason: 'completed' });
+        await onComplete();
+      } catch (error) {
+        console.error('Template load failed:', error);
+        showToast('Template could not be loaded. Nothing was added.', 'error');
+        templateLoading = false;
+        dialog.querySelectorAll('.template-item').forEach(item => item.setAttribute('aria-disabled', 'false'));
+      }
     };
     el.addEventListener('click', handler);
     el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handler(); } });

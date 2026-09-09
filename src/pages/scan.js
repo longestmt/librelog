@@ -8,6 +8,7 @@ import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { requestPrivacyConsent } from '../components/privacy-consent.js';
 import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
+import { readPositiveNumberInput } from '../utils/form-validation.js';
 
 let Quagga = null;
 let scannerActive = false;
@@ -302,11 +303,12 @@ export function renderScanPage(container, queryString) {
   }
 
   function openPortionModal(food, mealType) {
+    const numberOrNull = value => value == null || !Number.isFinite(Number(value)) ? null : Number(value);
     const baseNutrition = {
-      calories: food.nutrients?.energy?.kcal || 0,
-      protein: food.nutrients?.macros?.protein?.g || 0,
-      carbs: food.nutrients?.macros?.carbs?.g || 0,
-      fat: food.nutrients?.macros?.fat?.g || 0,
+      calories: numberOrNull(food.nutrients?.energy?.kcal),
+      protein: numberOrNull(food.nutrients?.macros?.protein?.g),
+      carbs: numberOrNull(food.nutrients?.macros?.carbs?.g),
+      fat: numberOrNull(food.nutrients?.macros?.fat?.g),
     };
 
     let quantity = food.servingSize?.quantity || 100;
@@ -316,14 +318,17 @@ export function renderScanPage(container, queryString) {
 
     function updatePreview() {
       const multiplier = getNutritionMultiplier(quantity, unit, food);
+      const display = (value, suffix, precision = 1) => value != null && Number.isFinite(multiplier)
+        ? `${(value * multiplier).toFixed(precision)}${suffix}`
+        : 'Unknown';
       const preview = document.getElementById('nutrition-preview');
       if (preview) {
         preview.innerHTML = `
           <div class="nutrition-preview">
-            <div class="preview-stat"><span class="preview-label">Calories</span><span class="preview-value">${Math.round(baseNutrition.calories * multiplier)} kcal</span></div>
-            <div class="preview-stat"><span class="preview-label">Protein</span><span class="preview-value">${(baseNutrition.protein * multiplier).toFixed(1)}g</span></div>
-            <div class="preview-stat"><span class="preview-label">Carbs</span><span class="preview-value">${(baseNutrition.carbs * multiplier).toFixed(1)}g</span></div>
-            <div class="preview-stat"><span class="preview-label">Fat</span><span class="preview-value">${(baseNutrition.fat * multiplier).toFixed(1)}g</span></div>
+            <div class="preview-stat"><span class="preview-label">Calories</span><span class="preview-value">${display(baseNutrition.calories, ' kcal', 0)}</span></div>
+            <div class="preview-stat"><span class="preview-label">Protein</span><span class="preview-value">${display(baseNutrition.protein, 'g')}</span></div>
+            <div class="preview-stat"><span class="preview-label">Carbs</span><span class="preview-value">${display(baseNutrition.carbs, 'g')}</span></div>
+            <div class="preview-stat"><span class="preview-label">Fat</span><span class="preview-value">${display(baseNutrition.fat, 'g')}</span></div>
           </div>
         `;
       }
@@ -351,7 +356,7 @@ export function renderScanPage(container, queryString) {
         <label class="control-group">
           <span class="control-label">Unit</span>
           <select class="unit-select" id="unit-select" aria-label="Unit of measurement">
-            ${availableUnits.map(u => `<option value="${u.value}" ${u.value === unit ? 'selected' : ''}>${u.label}</option>`).join('')}
+            ${availableUnits.map(u => `<option value="${escapeHTML(u.value)}" ${u.value === unit ? 'selected' : ''}>${escapeHTML(u.label)}</option>`).join('')}
           </select>
         </label>
         <label class="control-group">
@@ -384,19 +389,24 @@ export function renderScanPage(container, queryString) {
     const logCommandKey = createIdempotencyKey('scan');
 
     document.getElementById('qty-minus').addEventListener('click', () => {
-      qtyInput.value = Math.max(0.1, parseFloat(qtyInput.value) - 0.5);
-      quantity = parseFloat(qtyInput.value);
+      const current = readPositiveNumberInput(qtyInput, { report: true });
+      if (current == null) return;
+      quantity = Math.max(0.1, current - 0.5);
+      qtyInput.value = quantity;
       updatePreview();
     });
 
     document.getElementById('qty-plus').addEventListener('click', () => {
-      qtyInput.value = (parseFloat(qtyInput.value) + 0.5).toFixed(1);
-      quantity = parseFloat(qtyInput.value);
+      const current = readPositiveNumberInput(qtyInput, { report: true });
+      if (current == null) return;
+      quantity = current + 0.5;
+      qtyInput.value = quantity.toFixed(1);
       updatePreview();
     });
 
     qtyInput.addEventListener('change', () => {
-      quantity = parseFloat(qtyInput.value) || 100;
+      const next = readPositiveNumberInput(qtyInput, { report: true });
+      quantity = next ?? NaN;
       updatePreview();
     });
 
@@ -406,6 +416,9 @@ export function renderScanPage(container, queryString) {
     document.getElementById('cancel-btn').addEventListener('click', closeModal);
 
     document.getElementById('log-btn').addEventListener('click', async (event) => {
+      const nextQuantity = readPositiveNumberInput(qtyInput, { report: true });
+      if (nextQuantity == null) return;
+      quantity = nextQuantity;
       event.currentTarget.disabled = true;
       await logFood(food, quantity, unit, selectedMealType, notesInput.value, logCommandKey);
     });
@@ -420,13 +433,16 @@ export function renderScanPage(container, queryString) {
       if (!existing) await put('foods', food);
 
       const multiplier = getNutritionMultiplier(quantity, unit, food);
+      const scaled = value => value != null && Number.isFinite(Number(value))
+        ? Number(value) * multiplier
+        : null;
       const scaledNutrients = {
-        kcal: (food.nutrients?.energy?.kcal || 0) * multiplier,
-        protein: (food.nutrients?.macros?.protein?.g || 0) * multiplier,
-        carbs: (food.nutrients?.macros?.carbs?.g || 0) * multiplier,
-        fat: (food.nutrients?.macros?.fat?.g || 0) * multiplier,
-        fiber: (food.nutrients?.fiber?.g || 0) * multiplier,
-        sodium: (food.nutrients?.sodium?.mg || 0) * multiplier,
+        kcal: scaled(food.nutrients?.energy?.kcal),
+        protein: scaled(food.nutrients?.macros?.protein?.g),
+        carbs: scaled(food.nutrients?.macros?.carbs?.g),
+        fat: scaled(food.nutrients?.macros?.fat?.g),
+        fiber: scaled(food.nutrients?.fiber?.g),
+        sodium: scaled(food.nutrients?.sodium?.mg),
       };
 
       await createMeal({
@@ -524,22 +540,29 @@ export function renderScanPage(container, queryString) {
 }
 
 function renderFoodResult(food) {
-  const protein = food.nutrients?.macros?.protein?.g || 0;
-  const carbs = food.nutrients?.macros?.carbs?.g || 0;
-  const fat = food.nutrients?.macros?.fat?.g || 0;
-  const kcal = food.nutrients?.energy?.kcal || 0;
-  const macroSummary = `${Math.round(protein)}P ${Math.round(carbs)}C ${Math.round(fat)}F`;
+  const protein = food.nutrients?.macros?.protein?.g;
+  const carbs = food.nutrients?.macros?.carbs?.g;
+  const fat = food.nutrients?.macros?.fat?.g;
+  const kcal = food.nutrients?.energy?.kcal;
+  const nutrient = (value, suffix) => value != null && Number.isFinite(Number(value))
+    ? `${Math.round(Number(value))}${suffix}`
+    : `—${suffix}`;
+  const macroSummary = `${nutrient(protein, 'P')} ${nutrient(carbs, 'C')} ${nutrient(fat, 'F')}`;
+  const calorieSummary = kcal != null && Number.isFinite(Number(kcal)) ? `${Math.round(Number(kcal))} kcal` : 'Calories unknown';
+  const accessibleCalories = kcal != null && Number.isFinite(Number(kcal)) ? `${Math.round(Number(kcal))} calories` : 'calories unknown';
   const servingLabel = food.servingSize ? `${food.servingSize.quantity}${food.servingSize.unit}` : '100g';
-  const sourceType = food.source?.type || '';
-  const sourceBadge = sourceType ? `<span class="source-badge ${sourceType}">${sourceType.toUpperCase()}</span>` : '';
+  const sourceType = typeof food.source?.type === 'string' ? food.source.type : '';
+  const sourceBadge = sourceType
+    ? `<span class="source-badge ${escapeHTML(sourceType)}">${escapeHTML(sourceType.toUpperCase())}</span>`
+    : '';
 
   return `
-    <div class="food-result-item" data-food-id="${food.id}" role="button" tabindex="0" aria-label="${escapeHTML(food.name)}, ${Math.round(kcal)} calories per ${servingLabel}">
+    <div class="food-result-item" data-food-id="${escapeHTML(String(food.id || ''))}" role="button" tabindex="0" aria-label="${escapeHTML(food.name)}, ${escapeHTML(accessibleCalories)} per ${escapeHTML(servingLabel)}">
       <div class="food-result-info">
         <div class="food-result-name">${escapeHTML(food.name)}</div>
         ${food.brand ? `<div class="food-result-brand">${escapeHTML(food.brand)}</div>` : ''}
         <div class="food-result-meta">
-          <span class="kcal-badge">${Math.round(kcal)} kcal/${servingLabel}</span>
+          <span class="kcal-badge">${escapeHTML(calorieSummary)}/${escapeHTML(servingLabel)}</span>
           <span class="macro-summary">${macroSummary}</span>
           ${sourceBadge}
         </div>

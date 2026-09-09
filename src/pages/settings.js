@@ -1,5 +1,4 @@
 import {
-  clearAllData,
   getMigrationBackupData,
   getMigrationBackups,
   getSetting,
@@ -15,6 +14,7 @@ import {
   summarizeImportData,
 } from '../data/io.js';
 import {
+  activateStoredWebDavConfig,
   getWebDavConfig,
   setWebDavConfig,
   disconnectWebDav,
@@ -24,30 +24,41 @@ import {
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { escapeHTML } from '../utils/sanitize.js';
-import { clearAutoBackups, performBackup, stopAutoBackup } from '../data/auto-backup.js';
 import {
-  getCredential,
+  clearAllDataAndBackups,
+  initAutoBackup,
+  replaceAllDataWithSafetyBackup,
+  stopAutoBackup,
+} from '../data/auto-backup.js';
+import { normalizeOllamaUrl } from '../integrations/ollama.js';
+import { saveAISettingsSafely } from '../integrations/ai-settings.js';
+import { captureDataMutationGeneration } from '../data/operation-locks.js';
+import {
   enableCredentialEncryption,
   hasStoredCredential,
   isCredentialEncryptionEnabled,
   isCredentialStoreUnlocked,
   lockCredentialStore,
-  removeCredential,
-  setCredential,
+  removeUsdaApiKey,
+  saveUsdaApiKey,
   unlockCredentialStore,
 } from '../data/credentials.js';
 
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.4.0';
 const LICENSE = 'AGPL-3.0';
 
 export async function renderSettingsPage(container, queryString) {
   async function render() {
+    const mutationGeneration = captureDataMutationGeneration();
     const goals = await getGoals();
     const credentialEncryptionEnabled = await isCredentialEncryptionEnabled();
     const credentialStoreUnlocked = await isCredentialStoreUnlocked();
     const usdaApiKeyConfigured = await hasStoredCredential('usdaApiKey');
     const aiProvider = await getSetting('ai_provider') || '';
     const aiApiKeyConfigured = await hasStoredCredential('aiApiKey');
+    const storedAiApiKeyProvider = await getSetting('ai_api_key_provider', null);
+    const aiApiKeyProvider = storedAiApiKeyProvider;
+    const aiApiKeyUsable = aiApiKeyConfigured && aiApiKeyProvider === aiProvider;
     const aiModel = await getSetting('ai_model') || '';
     const aiOllamaUrl = await getSetting('ai_ollama_url') || 'http://localhost:11434';
     const aiPrivacyConsent = aiProvider
@@ -62,11 +73,14 @@ export async function renderSettingsPage(container, queryString) {
     const themeMap = { dark: 'compline', light: 'lauds', amoled: 'vigil' };
     if (themeMap[theme]) {
       theme = themeMap[theme];
-      await setSetting('theme', theme);
+      await setSetting('theme', theme, { mutationGeneration });
     }
     const webdavConfig = await getWebDavConfig();
     const webdavPasswordConfigured = await hasStoredCredential('webdavPassword');
-    const webdavConnected = Boolean(webdavConfig.url && webdavConfig.username && webdavPasswordConfigured);
+    const webdavConfigured = Boolean(webdavConfig.url && webdavConfig.username && webdavPasswordConfigured);
+    const webdavConnected = webdavConfigured
+      && webdavConfig.active === true
+      && webdavPrivacyConsent;
     const webdavUrl = webdavConfig.url || '';
     const webdavUsername = webdavConfig.username || '';
     const migrationBackups = getMigrationBackups();
@@ -107,14 +121,14 @@ export async function renderSettingsPage(container, queryString) {
 
               <label class="setting-input">
                 <span class="setting-label">Fiber Target (g)</span>
-                <input type="number" id="goal-fiber" min="0" step="5" value="${goals.fiberG || 30}">
+                <input type="number" id="goal-fiber" min="0" step="5" value="${goals.fiberG ?? 30}">
               </label>
 
               <label class="setting-input">
                 <span class="setting-label">Sodium Limit (mg)
                   <span class="setting-hint">Choose a personal limit appropriate for your needs</span>
                 </span>
-                <input type="number" id="goal-sodium" min="0" step="100" value="${goals.sodiumMg || 2300}">
+                <input type="number" id="goal-sodium" min="0" step="100" value="${goals.sodiumMg ?? 2300}">
               </label>
 
               <button class="btn btn-primary" id="save-goals-btn">Save Goals</button>
@@ -169,13 +183,15 @@ export async function renderSettingsPage(container, queryString) {
               <div id="ai-key-fields" style="${aiProvider === 'ollama' || !aiProvider ? 'display:none' : ''}">
                 <label class="setting-input">
                   <span class="setting-label">API Key</span>
-                  <input type="password" id="ai-api-key" placeholder="${aiApiKeyConfigured ? 'Key saved — enter a new value to replace it' : 'sk-... or sk-ant-...'}" value="" autocomplete="new-password">
+                  <input type="password" id="ai-api-key" placeholder="${aiApiKeyUsable ? 'Key saved — enter a new value to replace it' : 'Enter a key for this provider'}" value="" autocomplete="new-password">
                 </label>
               </div>
 
               <div id="ai-ollama-fields" style="${aiProvider === 'ollama' ? '' : 'display:none'}">
                 <label class="setting-input">
-                  <span class="setting-label">Ollama URL</span>
+                  <span class="setting-label">Ollama URL
+                    <span class="setting-hint">For privacy, LibreLog only connects to Ollama on this device (localhost, 127.0.0.1, or [::1]).</span>
+                  </span>
                   <input type="url" id="ai-ollama-url" placeholder="http://localhost:11434" value="${escapeHTML(aiOllamaUrl)}">
                 </label>
               </div>
@@ -296,14 +312,27 @@ export async function renderSettingsPage(container, queryString) {
               <div id="webdav-status" class="webdav-status">
                 <span class="status-label">Connection Status:</span>
                 <span class="status-badge ${webdavConnected ? 'connected' : 'disconnected'}">
-                  ${webdavConnected
+                  ${webdavConfigured && !webdavConnected
+                    ? 'Review Required'
+                    : webdavConnected
                     ? (credentialEncryptionEnabled && !credentialStoreUnlocked ? 'Locked' : 'Connected')
                     : 'Not Connected'}
                 </span>
               </div>
 
-              ${webdavConnected ? `
-                ${credentialEncryptionEnabled && !credentialStoreUnlocked
+              ${webdavConfigured ? `
+                ${!webdavConnected ? `
+                  <label class="setting-input">
+                    <span class="setting-label">WebDAV Data Use
+                      <span class="setting-hint">A backup sends meal, food, recipe, measurement, and non-secret setting data to this server. LibreLog will securely recheck this saved connection before enabling it.</span>
+                    </span>
+                    <span><input type="checkbox" id="webdav-existing-privacy-consent"> I understand this remote data use.</span>
+                  </label>
+                  <div class="webdav-actions">
+                    <button class="btn btn-primary btn-small" id="webdav-enable">Enable WebDAV Backup</button>
+                    <button class="btn btn-small btn-outline" id="webdav-disconnect">Disconnect</button>
+                  </div>
+                ` : credentialEncryptionEnabled && !credentialStoreUnlocked
                   ? '<p class="setting-hint">Unlock credentials to use or disconnect WebDAV.</p>'
                   : `<div class="webdav-actions">
                       <button class="btn btn-small" id="webdav-push">Create Backup</button>
@@ -312,7 +341,7 @@ export async function renderSettingsPage(container, queryString) {
                       <button class="btn btn-small" id="webdav-pull-encrypted">Restore Encrypted Backup</button>
                       <button class="btn btn-small btn-outline" id="webdav-disconnect">Disconnect</button>
                     </div>`}
-                <p class="setting-hint">Encrypted backups use a passphrase for one operation. LibreLog does not store the passphrase and cannot recover it.</p>
+                ${webdavPrivacyConsent ? '<p class="setting-hint">Encrypted backups use a passphrase for one operation. LibreLog does not store the passphrase and cannot recover it.</p>' : ''}
               ` : `
                 <label class="setting-input">
                   <span class="setting-label">WebDAV Server URL</span>
@@ -331,7 +360,7 @@ export async function renderSettingsPage(container, queryString) {
 
                 <label class="setting-input">
                   <span class="setting-label">WebDAV Data Use
-                    <span class="setting-hint">A backup sends meal, food, recipe, measurement, and non-secret setting data to this server. Use encrypted backup for data protection outside LibreLog.</span>
+                    <span class="setting-hint">A backup sends meal, food, recipe, measurement, and non-secret setting data to this server. HTTPS is required except for localhost. Use encrypted backup for data protection on the server.</span>
                   </span>
                   <span><input type="checkbox" id="webdav-privacy-consent" ${webdavPrivacyConsent ? 'checked' : ''}> I understand this remote data use.</span>
                 </label>
@@ -358,7 +387,7 @@ export async function renderSettingsPage(container, queryString) {
                 <span class="about-value">Free &amp; Open Source</span>
               </div>
               <div class="about-links">
-                <a href="https://github.com/libresuite/librelog" target="_blank" rel="noopener noreferrer" class="about-link">
+                <a href="https://github.com/longestmt/librelog" target="_blank" rel="noopener noreferrer" class="about-link">
                   Source Code
                 </a>
                 <a href="https://openfoodfacts.org/" target="_blank" rel="noopener noreferrer" class="about-link">
@@ -409,22 +438,41 @@ export async function renderSettingsPage(container, queryString) {
         const consent = document.getElementById('ai-privacy-consent');
         if (consent) consent.checked = false;
       }
+      const keyInput = document.getElementById('ai-api-key');
+      if (keyInput && provider && provider !== 'ollama') {
+        keyInput.placeholder = aiApiKeyConfigured && aiApiKeyProvider === provider
+          ? 'Key saved — enter a new value to replace it'
+          : 'Enter a key for this provider';
+      }
     });
 
     document.getElementById('save-ai-btn')?.addEventListener('click', async () => {
       const provider = document.getElementById('ai-provider').value;
       const apiKey = document.getElementById('ai-api-key')?.value.trim() || '';
-      const existingApiKey = await getCredential('aiApiKey') || '';
       const model = document.getElementById('ai-model')?.value.trim() || '';
-      const ollamaUrl = document.getElementById('ai-ollama-url')?.value.trim() || 'http://localhost:11434';
+      let ollamaUrl = document.getElementById('ai-ollama-url')?.value.trim() || 'http://localhost:11434';
 
-      if (provider && provider !== 'ollama' && !apiKey && !existingApiKey) {
-        showToast('Please enter an API key for ' + provider);
+      // The render-time provider binding is enough for an immediate hint.
+      // saveAISettingsSafely revalidates the live credential and binding while
+      // holding the lifecycle lock before it writes anything.
+      const canReuseConfiguredKey = aiApiKeyConfigured && aiApiKeyProvider === provider;
+      if (provider && provider !== 'ollama' && !apiKey && !canReuseConfiguredKey) {
+        showToast('Please enter a new API key for ' + provider);
         return;
       }
       if (provider === 'ollama' && !model) {
         showToast('Enter the name of an installed Ollama model');
         return;
+      }
+      try {
+        ollamaUrl = normalizeOllamaUrl(ollamaUrl);
+      } catch (error) {
+        if (provider === 'ollama') {
+          showToast(error.message, 'error');
+          return;
+        }
+        // Do not retain an unsafe dormant endpoint while another provider is selected.
+        ollamaUrl = 'http://localhost:11434';
       }
       if (provider && provider !== 'ollama'
         && !document.getElementById('ai-privacy-consent')?.checked) {
@@ -432,19 +480,20 @@ export async function renderSettingsPage(container, queryString) {
         return;
       }
 
-      await setSetting('ai_provider', provider);
-      if (!provider) await removeCredential('aiApiKey');
-      else if (apiKey) await setCredential('aiApiKey', apiKey);
-      await setSetting('ai_model', model);
-      await setSetting('ai_ollama_url', ollamaUrl);
-      if (provider && provider !== 'ollama') {
-        await setSetting(`privacyConsent_ai_${provider}`, true);
+      try {
+        await saveAISettingsSafely({ provider, apiKey, model, ollamaUrl });
+      } catch (error) {
+        console.error('Could not save AI settings:', error);
+        showToast(error?.code === 'AI_KEY_REQUIRED'
+          ? error.message
+          : 'AI settings could not be saved. No key was enabled for a different provider.', 'error', 7000);
+        return;
       }
       showToast(provider ? `AI configured with ${provider}` : 'AI features disabled');
       render();
     });
 
-    document.getElementById('save-usda-key-btn')?.addEventListener('click', async () => {
+    document.getElementById('save-usda-key-btn')?.addEventListener('click', async event => {
       const key = document.getElementById('usda-api-key').value.trim();
       if (!key) {
         showToast(usdaApiKeyConfigured ? 'Enter a new key, or use Remove API Key' : 'Enter an API key');
@@ -454,15 +503,30 @@ export async function renderSettingsPage(container, queryString) {
         showToast('Confirm the USDA data use before you save');
         return;
       }
-      await setCredential('usdaApiKey', key);
-      await setSetting('privacyConsent_usda', true);
-      showToast('USDA API key saved');
-      render();
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await saveUsdaApiKey(key);
+        showToast('USDA API key saved');
+        if (container.isConnected) render();
+      } catch (error) {
+        console.error('Could not save USDA API key:', error);
+        showToast('USDA API key could not be saved. Remote USDA search remains off.', 'error');
+        if (button.isConnected) button.disabled = false;
+      }
     });
-    document.getElementById('remove-usda-key-btn')?.addEventListener('click', async () => {
-      await removeCredential('usdaApiKey');
-      showToast('USDA API key removed');
-      render();
+    document.getElementById('remove-usda-key-btn')?.addEventListener('click', async event => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await removeUsdaApiKey();
+        showToast('USDA API key removed');
+        if (container.isConnected) render();
+      } catch (error) {
+        console.error('Could not remove USDA API key:', error);
+        showToast('USDA API key could not be removed. USDA search remains off.', 'error');
+        if (button.isConnected) button.disabled = false;
+      }
     });
 
     document.getElementById('export-btn')?.addEventListener('click', handleExport);
@@ -473,6 +537,7 @@ export async function renderSettingsPage(container, queryString) {
     document.getElementById('clear-btn')?.addEventListener('click', handleClear);
 
     document.getElementById('webdav-test')?.addEventListener('click', handleWebDAVTest);
+    document.getElementById('webdav-enable')?.addEventListener('click', handleWebDAVReconsent);
     document.getElementById('webdav-push')?.addEventListener('click', handleWebDAVPush);
     document.getElementById('webdav-push-encrypted')?.addEventListener('click', handleEncryptedWebDAVPush);
     document.getElementById('webdav-pull')?.addEventListener('click', handleWebDAVPull);
@@ -611,35 +676,36 @@ export async function renderSettingsPage(container, queryString) {
         <button class="btn btn-primary" id="merge-import-btn">Merge (Recommended)</button>
       </div>
     `;
-    openModal(modal);
+    let importInProgress = false;
+    const dialog = openModal(modal, { canClose: () => !importInProgress });
 
-    const mergeButton = document.getElementById('merge-import-btn');
-    const replaceButton = document.getElementById('replace-import-btn');
-    document.getElementById('cancel-btn').addEventListener('click', closeModal);
+    const mergeButton = dialog.querySelector('#merge-import-btn');
+    const replaceButton = dialog.querySelector('#replace-import-btn');
+    const cancelButton = dialog.querySelector('#cancel-btn');
+    cancelButton.addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
 
     async function runImport(merge, button) {
+      if (importInProgress) return;
+      importInProgress = true;
       mergeButton.disabled = true;
       replaceButton.disabled = true;
+      cancelButton.disabled = true;
       button.textContent = merge ? 'Merging…' : 'Making Safety Backup…';
       try {
-        if (!merge) {
-          const backupSucceeded = await performBackup();
-          if (!backupSucceeded) {
-            throw new Error('Full replacement stopped because a safety backup could not be verified');
-          }
-          button.textContent = 'Replacing…';
-        }
-        await importAllData(data, merge);
-        closeModal();
+        if (merge) await importAllData(data, true);
+        else await replaceAllDataWithSafetyBackup(data);
+        closeModal({ target: dialog, force: true, reason: 'completed' });
         showToast(merge
           ? `Import merged ${summary.totalRecords} records; existing local records were kept`
           : `Import replaced local data with ${summary.totalRecords} records`);
-        render();
+        if (container.isConnected) render();
       } catch (err) {
         console.error('Import failed:', err);
         showToast(err.message || 'Import failed. Local data was not changed.');
+        importInProgress = false;
         mergeButton.disabled = false;
         replaceButton.disabled = false;
+        cancelButton.disabled = false;
         mergeButton.textContent = 'Merge (Recommended)';
         replaceButton.textContent = 'Full Replacement';
       }
@@ -663,22 +729,40 @@ export async function renderSettingsPage(container, queryString) {
       </div>
     `;
 
-    openModal(modal);
-
-    document.getElementById('cancel-btn').addEventListener('click', closeModal);
-    document.getElementById('confirm-btn').addEventListener('click', async () => {
+    let clearInProgress = false;
+    const dialog = openModal(modal, { canClose: () => !clearInProgress });
+    const cancelButton = dialog.querySelector('#cancel-btn');
+    const confirmButton = dialog.querySelector('#confirm-btn');
+    cancelButton.addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
+    confirmButton.addEventListener('click', async () => {
+      if (clearInProgress) return;
+      clearInProgress = true;
+      cancelButton.disabled = true;
+      confirmButton.disabled = true;
+      confirmButton.textContent = 'Deleting...';
       try {
         stopAutoBackup();
-        await clearAutoBackups();
-        await clearAllData();
-        closeModal();
+        await clearAllDataAndBackups();
+        closeModal({ target: dialog, force: true, reason: 'completed' });
         showToast('All data cleared');
         setTimeout(() => {
           window.location.reload();
         }, 500);
       } catch (err) {
         console.error('Clear failed:', err);
+        try {
+          // clearAllDataAndBackups recreates a recovery point immediately if
+          // IndexedDB rejects the erase. Resume its recurring schedule before
+          // returning the still-live app to the user.
+          await initAutoBackup();
+        } catch (backupError) {
+          console.warn('Could not resume automatic backups after failed clear:', backupError);
+        }
         showToast('Failed to clear data');
+        clearInProgress = false;
+        cancelButton.disabled = false;
+        confirmButton.disabled = false;
+        confirmButton.textContent = 'Delete Everything';
       }
     });
   }
@@ -697,21 +781,28 @@ export async function renderSettingsPage(container, queryString) {
         <button class="btn btn-danger" id="confirm-btn">Restore Checkpoint</button>
       </div>
     `;
-    openModal(modal);
-    document.getElementById('cancel-btn').addEventListener('click', closeModal);
-    document.getElementById('confirm-btn').addEventListener('click', async (event) => {
+    let restoreInProgress = false;
+    const dialog = openModal(modal, { canClose: () => !restoreInProgress });
+    const cancelButton = dialog.querySelector('#cancel-btn');
+    cancelButton.addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
+    dialog.querySelector('#confirm-btn').addEventListener('click', async (event) => {
+      if (restoreInProgress) return;
+      restoreInProgress = true;
       const button = event.currentTarget;
       button.disabled = true;
+      cancelButton.disabled = true;
       button.textContent = 'Restoring...';
       try {
-        await importAllData(getMigrationBackupData(timestamp), false);
-        closeModal();
+        await replaceAllDataWithSafetyBackup(getMigrationBackupData(timestamp));
+        closeModal({ target: dialog, force: true, reason: 'completed' });
         showToast('Migration checkpoint restored');
-        render();
+        if (container.isConnected) render();
       } catch (err) {
         console.error('Checkpoint restore failed:', err);
         showToast('Checkpoint restore failed. Local data was not changed.');
+        restoreInProgress = false;
         button.disabled = false;
+        cancelButton.disabled = false;
         button.textContent = 'Restore Checkpoint';
       }
     });
@@ -756,16 +847,35 @@ export async function renderSettingsPage(container, queryString) {
     btn.innerHTML = '<span class="spinner"></span> Testing...';
 
     try {
-      await setWebDavConfig(url, username, password);
-      await setSetting('privacyConsent_webdav', true);
+      await setWebDavConfig(url, username, password, { confirmRemoteDataUse: true });
       showToast('Connection successful');
       render();
     } catch (err) {
       console.error('WebDAV test failed:', err);
-      showToast('Connection error. Check your credentials and URL.');
+      showToast(err.message || 'Connection error. Check your credentials and URL.', 'error', 7000);
     } finally {
-      btn.disabled = false;
-      btn.innerHTML = 'Connect';
+      if (btn.isConnected) {
+        btn.disabled = false;
+        btn.innerHTML = 'Connect';
+      }
+    }
+  }
+
+  async function handleWebDAVReconsent() {
+    if (!document.getElementById('webdav-existing-privacy-consent')?.checked) {
+      showToast('Confirm the WebDAV data use before you enable backups');
+      return;
+    }
+    const button = document.getElementById('webdav-enable');
+    button.disabled = true;
+    try {
+      await activateStoredWebDavConfig({ confirmRemoteDataUse: true });
+      showToast('WebDAV backup enabled');
+      render();
+    } catch (error) {
+      console.error('Could not enable saved WebDAV configuration:', error);
+      showToast(error.message || 'Could not enable WebDAV backup.', 'error', 7000);
+      if (button.isConnected) button.disabled = false;
     }
   }
 
@@ -810,22 +920,32 @@ export async function renderSettingsPage(container, queryString) {
         <button class="btn btn-danger" id="confirm-btn">Restore Backup</button>
       </div>
     `;
-    openModal(modal);
-    document.getElementById('cancel-btn').addEventListener('click', closeModal);
-    document.getElementById('confirm-btn').addEventListener('click', async (event) => {
-      await performWebDAVPull(event.currentTarget);
+    let restoreInProgress = false;
+    const dialog = openModal(modal, { canClose: () => !restoreInProgress });
+    const cancelButton = dialog.querySelector('#cancel-btn');
+    cancelButton.addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
+    dialog.querySelector('#confirm-btn').addEventListener('click', async (event) => {
+      if (restoreInProgress) return;
+      restoreInProgress = true;
+      cancelButton.disabled = true;
+      try {
+        await performWebDAVPull(event.currentTarget, dialog);
+      } finally {
+        restoreInProgress = false;
+        if (cancelButton.isConnected) cancelButton.disabled = false;
+      }
     });
   }
 
-  async function performWebDAVPull(btn) {
+  async function performWebDAVPull(btn, dialog) {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Restoring...';
 
     try {
       await pullFromWebDav();
-      closeModal();
+      closeModal({ target: dialog, force: true, reason: 'completed' });
       showToast('WebDAV backup restored');
-      render();
+      if (container.isConnected) render();
     } catch (err) {
       console.error('Pull failed:', err);
       showToast(`Restore failed: ${err.message || 'check the connection'}`);
@@ -845,7 +965,7 @@ export async function renderSettingsPage(container, queryString) {
       action: async passphrase => {
         await pullFromWebDav({ passphrase });
         showToast('Encrypted WebDAV backup restored');
-        render();
+        if (container.isConnected) render();
       },
     });
   }
@@ -877,13 +997,17 @@ export async function renderSettingsPage(container, queryString) {
         <button class="btn btn-primary" id="confirm-btn">${escapeHTML(confirmLabel)}</button>
       </div>
     `;
-    openModal(modal);
-    const passphraseInput = document.getElementById('backup-passphrase');
+    let actionInProgress = false;
+    const dialog = openModal(modal, { canClose: () => !actionInProgress });
+    const passphraseInput = dialog.querySelector('#backup-passphrase');
+    const confirmationInput = dialog.querySelector('#backup-passphrase-confirm');
+    const cancelButton = dialog.querySelector('#cancel-btn');
     passphraseInput.focus();
-    document.getElementById('cancel-btn').addEventListener('click', closeModal);
-    document.getElementById('confirm-btn').addEventListener('click', async (event) => {
+    cancelButton.addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
+    dialog.querySelector('#confirm-btn').addEventListener('click', async (event) => {
+      if (actionInProgress) return;
       const passphrase = passphraseInput.value;
-      const confirmation = document.getElementById('backup-passphrase-confirm')?.value;
+      const confirmation = confirmationInput?.value;
       if (passphrase.length < 8) {
         showToast('Passphrase must contain at least 8 characters');
         return;
@@ -894,19 +1018,25 @@ export async function renderSettingsPage(container, queryString) {
       }
 
       const button = event.currentTarget;
+      actionInProgress = true;
       button.disabled = true;
+      cancelButton.disabled = true;
+      passphraseInput.disabled = true;
+      if (confirmationInput) confirmationInput.disabled = true;
       button.textContent = 'Working...';
       try {
         await action(passphrase);
         passphraseInput.value = '';
-        if (document.getElementById('backup-passphrase-confirm')) {
-          document.getElementById('backup-passphrase-confirm').value = '';
-        }
-        closeModal();
+        if (confirmationInput) confirmationInput.value = '';
+        closeModal({ target: dialog, force: true, reason: 'completed' });
       } catch (err) {
         console.error('Encrypted backup operation failed:', err);
         showToast(err.message || 'Encrypted backup operation failed');
+        actionInProgress = false;
         button.disabled = false;
+        cancelButton.disabled = false;
+        passphraseInput.disabled = false;
+        if (confirmationInput) confirmationInput.disabled = false;
         button.textContent = confirmLabel;
       }
     });
@@ -925,11 +1055,17 @@ function computeMonthlyUsage(log) {
   if (!Array.isArray(log) || log.length === 0) return { count: 0, tokens: 0, cost: 0 };
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-  const thisMonth = log.filter(e => e.date >= monthStart);
+  const thisMonth = log.filter(entry => entry
+    && typeof entry === 'object'
+    && typeof entry.date === 'string'
+    && entry.date >= monthStart);
+  const safeNumber = value => (typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : 0);
   return {
     count: thisMonth.length,
-    tokens: thisMonth.reduce((s, e) => s + (e.tokens || 0), 0),
-    cost: thisMonth.reduce((s, e) => s + (e.cost || 0), 0),
+    tokens: thisMonth.reduce((sum, entry) => sum + safeNumber(entry.tokens), 0),
+    cost: thisMonth.reduce((sum, entry) => sum + safeNumber(entry.cost), 0),
   };
 }
 

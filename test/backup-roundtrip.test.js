@@ -44,7 +44,12 @@ test('a credential-free backup survives a full replacement round-trip', async ()
     items: [{ foodId: 'roundtrip-food', quantity: 1, unit: 'serving' }],
   });
   await setSetting('theme', 'lauds');
+  await setSetting('ai_provider', 'openai');
   await setSetting('ai_api_key', 'must-stay-local');
+  await setSetting('ai_api_key_provider', 'openai');
+  await setSetting('privacyConsent_openfoodfacts', true);
+  await setSetting('privacyConsent_webdav', true);
+  await setSetting('ai_ollama_url', 'https://ollama.example.com');
   await put('meals', {
     id: 'deleted-meal',
     date: '2026-07-26',
@@ -63,17 +68,35 @@ test('a credential-free backup survives a full replacement round-trip', async ()
   assert.equal(backup.dataVersion, DATA_SCHEMA_VERSION);
   assert.equal(backup.secretsExcluded, true);
   assert.equal(backup.stores.settings.some(record => record.key === 'ai_api_key'), false);
+  assert.equal(backup.stores.settings.some(record => record.key === 'ai_api_key_provider'), false);
+  assert.equal(backup.stores.settings.some(record => record.key.startsWith('privacyConsent_')), false);
+  assert.equal(backup.stores.settings.some(record => record.key === 'ai_ollama_url'), false);
   assert.equal(Object.hasOwn(backup.stores, 'apiCache'), false);
   assert.equal(backup.stores.meals.some(record => record.id === 'deleted-meal'), false);
 
+  // A legacy or hand-edited backup cannot grant disclosure consent or restore
+  // an Ollama endpoint outside the local device.
+  backup.stores.settings.push(
+    { key: 'privacyConsent_usda', value: true },
+    { key: 'ai_ollama_url', value: 'https://ollama.example.com' },
+  );
+
   await clearAllData();
   await setSetting('ai_api_key', 'replacement-profile-secret');
+  await setSetting('ai_api_key_provider', 'openai');
+  await setSetting('privacyConsent_browser_speech', true);
+  await setSetting('privacyConsent_webdav', true);
   await importAllData(backup);
 
   assert.deepEqual((await getAll('foods')).map(record => record.id), ['roundtrip-food']);
   assert.deepEqual((await getAll('meals')).map(record => record.id), ['roundtrip-meal']);
   assert.equal(await getSetting('theme'), 'lauds');
   assert.equal(await getSetting('ai_api_key'), 'replacement-profile-secret');
+  assert.equal(await getSetting('privacyConsent_openfoodfacts', false), false);
+  assert.equal(await getSetting('privacyConsent_usda', false), false);
+  assert.equal(await getSetting('privacyConsent_browser_speech', false), false);
+  assert.equal(await getSetting('privacyConsent_webdav', false), true);
+  assert.equal(await getSetting('ai_ollama_url'), null);
   assert.deepEqual(await getAll('apiCache'), []);
 });
 
@@ -106,6 +129,61 @@ test('merge keeps local conflicts and adds new imported records', async () => {
   assert.equal(foods.find(food => food.id === 'same-id').name, 'Local food');
   assert.equal(foods.find(food => food.id === 'new-id').name, 'Imported new food');
   assert.equal(await getSetting('theme'), 'vigil');
+});
+
+test('a partial replacement clears every portable store and keeps local secrets', async () => {
+  await clearAllData();
+  const foodShape = {
+    servingSize: { quantity: 100, unit: 'g' },
+    nutrients: {
+      energy: { kcal: 100 },
+      macros: { protein: { g: 1 }, carbs: { g: 2 }, fat: { g: 3 } },
+      fiber: { g: null },
+      sodium: { mg: null },
+    },
+  };
+  await put('foods', { id: 'old-food', name: 'Old food', ...foodShape });
+  await put('meals', {
+    id: 'old-meal',
+    date: '2026-09-09',
+    type: 'lunch',
+    items: [{ foodId: 'old-food', quantity: 100, unit: 'g' }],
+  });
+  await put('recipes', { id: 'old-recipe', name: 'Old recipe', servings: 1, items: [] });
+  await put('measurements', { id: 'old-weight', date: '2026-09-09', weight: 70, unit: 'kg' });
+  await setSetting('theme', 'vigil');
+  await setSetting('usda_api_key', 'device-only-secret');
+
+  await importAllData({
+    version: BACKUP_SCHEMA_VERSION,
+    stores: {
+      foods: [{ id: 'new-food', name: 'New food', ...foodShape }],
+    },
+  }, false);
+
+  assert.deepEqual((await getAll('foods')).map(food => food.id), ['new-food']);
+  assert.deepEqual(await getAll('meals'), []);
+  assert.deepEqual(await getAll('recipes'), []);
+  assert.deepEqual(await getAll('measurements'), []);
+  assert.equal(await getSetting('theme', null), null);
+  assert.equal(await getSetting('usda_api_key'), 'device-only-secret');
+});
+
+test('replace import leaves an ambiguous legacy AI key unusable', async () => {
+  await clearAllData();
+  await setSetting('ai_provider', 'openai');
+  await setSetting('ai_api_key', 'legacy-openai-key');
+
+  await importAllData({
+    version: BACKUP_SCHEMA_VERSION,
+    stores: {
+      settings: [{ key: 'ai_provider', value: 'anthropic' }],
+    },
+  });
+
+  assert.equal(await getSetting('ai_api_key'), 'legacy-openai-key');
+  assert.equal(await getSetting('ai_api_key_provider'), null);
+  assert.equal(await getSetting('ai_provider'), 'anthropic');
 });
 
 test('the credential adapter preserves current storage behavior', async () => {

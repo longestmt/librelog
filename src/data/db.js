@@ -4,16 +4,31 @@
  * Stores: foods, meals, recipes, measurements, settings, apiCache
  */
 
+import { clearAddDraft, hasAddDraftLock, withAddDraftLock } from './add-draft.js';
+import {
+    assertDataMutationGenerationCurrent,
+    captureDataMutationGeneration,
+    hasDataLifecycleLock,
+    hasDataDestructiveLock,
+    hasDataWriteLock,
+    withDataDestructiveLock,
+    withDataLifecycleLock,
+    withDataWriteLock,
+} from './operation-locks.js';
+import { normalizeOllamaUrl } from '../integrations/ollama.js';
+
 const DB_NAME = 'librelog';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 export const DATA_SCHEMA_VERSION = DB_VERSION;
 export const BACKUP_SCHEMA_VERSION = 1;
 const DATA_STORES = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
 const PORTABLE_DATA_STORES = DATA_STORES.filter(name => name !== 'apiCache');
 const MIGRATION_BACKUP_KEY = 'librelog_migration_backups';
 const MAX_MIGRATION_BACKUPS = 3;
+const BLOCKED_UPGRADE_GRACE_MS = 1_500;
 const SENSITIVE_SETTING_KEYS = new Set([
     'ai_api_key',
+    'ai_api_key_provider',
     'usda_api_key',
     'webdavUrl',
     'webdavUsername',
@@ -27,8 +42,27 @@ const SENSITIVE_SETTING_KEYS = new Set([
     'credentialEncryptionEnabled',
     'credentialEncryptionVerifier',
 ]);
+const PRIVACY_CONSENT_SETTING_PREFIX = 'privacyConsent_';
 
 let dbInstance = null;
+
+function withMaybeDataWriteLock(operation, {
+    destructiveLockToken,
+    mutationGuardToken,
+    mutationGeneration = captureDataMutationGeneration(),
+    writeLockToken,
+    lockManager,
+} = {}) {
+    const guardedOperation = () => {
+        assertDataMutationGenerationCurrent(mutationGeneration);
+        return operation();
+    };
+    if (hasDataWriteLock(writeLockToken)) return guardedOperation();
+    return withDataWriteLock(guardedOperation, lockManager, {
+        destructiveLockToken,
+        mutationGuardToken,
+    });
+}
 
 function readMigrationBackups() {
     if (typeof localStorage === 'undefined') return [];
@@ -47,14 +81,32 @@ function writeMigrationBackup(backup) {
     localStorage.setItem(MIGRATION_BACKUP_KEY, JSON.stringify(backups));
 }
 
-function filterSensitiveSettings(storeName, records) {
+function isNonPortableSettingKey(key) {
+    return SENSITIVE_SETTING_KEYS.has(key)
+        || (typeof key === 'string' && key.startsWith(PRIVACY_CONSENT_SETTING_PREFIX));
+}
+
+function sanitizePortableSetting(record) {
+    if (isNonPortableSettingKey(record.key)) return null;
+    if (record.key !== 'ai_ollama_url') return record;
+
+    try {
+        return { ...record, value: normalizeOllamaUrl(record.value) };
+    } catch {
+        // Older releases allowed remote Ollama URLs. Drop that optional setting
+        // without preventing the user's food, meal, and measurement recovery.
+        return null;
+    }
+}
+
+function filterLocalCheckpointRecords(storeName, records) {
     return storeName === 'settings'
-        ? records.filter(record => !SENSITIVE_SETTING_KEYS.has(record.key))
+        ? records.map(sanitizePortableSetting).filter(Boolean)
         : records;
 }
 
 function filterPortableExportRecords(storeName, records) {
-    return filterSensitiveSettings(storeName, records)
+    return filterLocalCheckpointRecords(storeName, records)
         .filter(record => record.deleted !== true);
 }
 
@@ -117,6 +169,37 @@ function createStoresAndIndexes(db, transaction) {
     }
 }
 
+function normalizeMealRecordItemIds(record) {
+    if (!record || !Array.isArray(record.items)) return record;
+    const seen = new Set();
+    let changed = false;
+    const items = record.items.map(item => {
+        const existingId = typeof item?.itemId === 'string' ? item.itemId.trim() : '';
+        if (existingId && !seen.has(existingId)) {
+            seen.add(existingId);
+            if (existingId === item.itemId) return item;
+            changed = true;
+            return { ...item, itemId: existingId };
+        }
+        const itemId = uuid();
+        seen.add(itemId);
+        changed = true;
+        return { ...item, itemId };
+    });
+    return changed ? { ...record, items } : record;
+}
+
+function migrateMealsToStableItemIds(transaction) {
+    const request = transaction.objectStore('meals').openCursor();
+    request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        const normalized = normalizeMealRecordItemIds(cursor.value);
+        if (normalized !== cursor.value) cursor.update(normalized);
+        cursor.continue();
+    };
+}
+
 function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
     const stores = DATA_STORES.filter(name => db.objectStoreNames.contains(name));
     const exportedStores = {};
@@ -139,7 +222,7 @@ function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
         const request = transaction.objectStore(name).getAll();
         request.onerror = fail;
         request.onsuccess = () => {
-            exportedStores[name] = filterSensitiveSettings(name, request.result);
+            exportedStores[name] = filterLocalCheckpointRecords(name, request.result);
             pending -= 1;
             if (pending !== 0) return;
 
@@ -157,10 +240,14 @@ function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
                         stores: exportedStores,
                     },
                 });
-                onComplete();
-            } catch {
-                fail();
+            } catch (error) {
+                // The IndexedDB versionchange transaction is itself atomic.
+                // A recovery checkpoint is valuable, but unavailable, full,
+                // or corrupt localStorage must not strand an existing user on
+                // an old schema indefinitely.
+                console.warn('Could not save the optional migration checkpoint:', error);
             }
+            onComplete();
         };
     }
 }
@@ -193,6 +280,15 @@ function openDB() {
     if (dbInstance) return Promise.resolve(dbInstance);
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(DB_NAME, DB_VERSION);
+        let settled = false;
+        let blockedTimer = null;
+
+        const rejectOnce = error => {
+            if (settled) return;
+            settled = true;
+            if (blockedTimer) clearTimeout(blockedTimer);
+            reject(error);
+        };
 
         req.onupgradeneeded = (e) => {
             const db = e.target.result;
@@ -203,15 +299,38 @@ function openDB() {
             }
             captureMigrationBackup(db, transaction, e.oldVersion, () => {
                 createStoresAndIndexes(db, transaction);
+                migrateMealsToStableItemIds(transaction);
             });
         };
 
         req.onsuccess = (e) => {
-            dbInstance = e.target.result;
-            resolve(dbInstance);
+            const database = e.target.result;
+            if (settled) {
+                database.close();
+                return;
+            }
+            settled = true;
+            if (blockedTimer) clearTimeout(blockedTimer);
+            database.onversionchange = () => {
+                database.close();
+                if (dbInstance === database) dbInstance = null;
+            };
+            database.onclose = () => {
+                if (dbInstance === database) dbInstance = null;
+            };
+            dbInstance = database;
+            resolve(database);
         };
 
-        req.onerror = (e) => reject(e.target.error);
+        req.onerror = (e) => rejectOnce(e.target.error);
+        req.onblocked = () => {
+            if (settled || blockedTimer) return;
+            blockedTimer = setTimeout(() => {
+                const error = new Error('Close other LibreLog tabs or windows, then reload to finish updating local data.');
+                error.code = 'DB_UPGRADE_BLOCKED';
+                rejectOnce(error);
+            }, BLOCKED_UPGRADE_GRACE_MS);
+        };
     });
 }
 
@@ -236,6 +355,19 @@ function promisifyRequest(req) {
     return new Promise((resolve, reject) => {
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
+    });
+}
+
+/** Resolve a mutation only after IndexedDB has durably committed its transaction. */
+function waitForTransaction(transaction, result, label = 'IndexedDB transaction') {
+    return new Promise((resolve, reject) => {
+        transaction.oncomplete = () => resolve(result);
+        transaction.onerror = () => reject(
+            transaction.error || new Error(`${label} failed`),
+        );
+        transaction.onabort = () => reject(
+            transaction.error || new Error(`${label} was aborted`),
+        );
     });
 }
 
@@ -284,18 +416,26 @@ export async function getByIndex(storeName, indexName, value) {
  * @param {Object} data
  * @returns {Promise<Object>} - returns the stored record with metadata
  */
-export async function put(storeName, data) {
-    const store = await getStore(storeName, 'readwrite');
+async function putWithWriteLockHeld(storeName, data) {
+    const db = await openDB();
+    const transaction = db.transaction(storeName, 'readwrite');
+    const store = transaction.objectStore(storeName);
     const timestamp = now();
-    const record = {
+    let record = {
         ...data,
         id: data.id || uuid(),
         createdAt: data.createdAt || timestamp,
         updatedAt: timestamp,
         deleted: false,
     };
-    await promisifyRequest(store.put(record));
-    return record;
+    if (storeName === 'meals') record = normalizeMealRecordItemIds(record);
+    const committed = waitForTransaction(transaction, record, `${storeName} write`);
+    store.put(record);
+    return committed;
+}
+
+export async function put(storeName, data, options = {}) {
+    return withMaybeDataWriteLock(() => putWithWriteLockHeld(storeName, data), options);
 }
 
 /**
@@ -304,27 +444,29 @@ export async function put(storeName, data) {
  * @param {Array<Object>} items
  * @returns {Promise<Array>}
  */
-export async function putMany(storeName, items) {
+async function putManyWithWriteLockHeld(storeName, items) {
     const db = await openDB();
     const tx = db.transaction(storeName, 'readwrite');
     const store = tx.objectStore(storeName);
     const timestamp = now();
     const records = [];
     for (const data of items) {
-        const record = {
+        let record = {
             ...data,
             id: data.id || uuid(),
             createdAt: data.createdAt || timestamp,
             updatedAt: timestamp,
             deleted: data.deleted || false,
         };
+        if (storeName === 'meals') record = normalizeMealRecordItemIds(record);
         store.put(record);
         records.push(record);
     }
-    return new Promise((resolve, reject) => {
-        tx.oncomplete = () => resolve(records);
-        tx.onerror = () => reject(tx.error);
-    });
+    return waitForTransaction(tx, records, `${storeName} batch write`);
+}
+
+export async function putMany(storeName, items, options = {}) {
+    return withMaybeDataWriteLock(() => putManyWithWriteLockHeld(storeName, items), options);
 }
 
 /**
@@ -333,14 +475,24 @@ export async function putMany(storeName, items) {
  * @param {string} id
  * @returns {Promise<void>}
  */
-export async function softDelete(storeName, id) {
-    const store = await getStore(storeName, 'readwrite');
-    const item = await promisifyRequest(store.get(id));
-    if (item) {
+async function softDeleteWithWriteLockHeld(storeName, id) {
+    const db = await openDB();
+    const transaction = db.transaction(storeName, 'readwrite');
+    const store = transaction.objectStore(storeName);
+    const committed = waitForTransaction(transaction, undefined, `${storeName} delete`);
+    const request = store.get(id);
+    request.onsuccess = () => {
+        const item = request.result;
+        if (!item) return;
         item.deleted = true;
         item.updatedAt = now();
-        await promisifyRequest(store.put(item));
-    }
+        store.put(item);
+    };
+    return committed;
+}
+
+export async function softDelete(storeName, id, options = {}) {
+    return withMaybeDataWriteLock(() => softDeleteWithWriteLockHeld(storeName, id), options);
 }
 
 /**
@@ -348,9 +500,16 @@ export async function softDelete(storeName, id) {
  * @param {string} storeName
  * @returns {Promise<void>}
  */
-export async function hardDeleteAll(storeName) {
-    const store = await getStore(storeName, 'readwrite');
-    await promisifyRequest(store.clear());
+async function hardDeleteAllWithWriteLockHeld(storeName) {
+    const db = await openDB();
+    const transaction = db.transaction(storeName, 'readwrite');
+    const committed = waitForTransaction(transaction, undefined, `${storeName} clear`);
+    transaction.objectStore(storeName).clear();
+    return committed;
+}
+
+export async function hardDeleteAll(storeName, options = {}) {
+    return withMaybeDataWriteLock(() => hardDeleteAllWithWriteLockHeld(storeName), options);
 }
 
 // ---- Settings helpers ----
@@ -373,9 +532,34 @@ export async function getSetting(key, defaultValue = null) {
  * @param {any} value
  * @returns {Promise<void>}
  */
-export async function setSetting(key, value) {
-    const store = await getStore('settings', 'readwrite');
-    await promisifyRequest(store.put({ key, value, updatedAt: now() }));
+async function setSettingWithWriteLockHeld(key, value) {
+    const db = await openDB();
+    const transaction = db.transaction('settings', 'readwrite');
+    const committed = waitForTransaction(transaction, undefined, 'Settings write');
+    transaction.objectStore('settings').put({ key, value, updatedAt: now() });
+    return committed;
+}
+
+export async function setSetting(key, value, options = {}) {
+    return withMaybeDataWriteLock(() => setSettingWithWriteLockHeld(key, value), options);
+}
+
+/** Commit several settings together or not at all. */
+async function setSettingsWithWriteLockHeld(entries) {
+    if (!Array.isArray(entries) || entries.some(entry => !entry || typeof entry.key !== 'string')) {
+        throw new TypeError('Settings must be an array of keyed entries');
+    }
+    const db = await openDB();
+    const tx = db.transaction('settings', 'readwrite');
+    const store = tx.objectStore('settings');
+    const updatedAt = now();
+    for (const { key, value } of entries) store.put({ key, value, updatedAt });
+    return waitForTransaction(tx, undefined, 'Settings transaction');
+}
+
+
+export async function setSettings(entries, options = {}) {
+    return withMaybeDataWriteLock(() => setSettingsWithWriteLockHeld(entries), options);
 }
 
 // ---- Export / Import ----
@@ -384,7 +568,7 @@ export async function setSetting(key, value) {
  * Export all data from all stores
  * @returns {Promise<Object>}
  */
-export async function exportAllData() {
+async function exportAllDataWithLifecycleLockHeld() {
     const db = await openDB();
     const data = {
         version: BACKUP_SCHEMA_VERSION,
@@ -395,12 +579,24 @@ export async function exportAllData() {
     };
     const stores = PORTABLE_DATA_STORES.filter(name => db.objectStoreNames.contains(name));
     const transaction = db.transaction(stores, 'readonly');
+    const completed = waitForTransaction(transaction, undefined, 'Data export');
     const reads = stores.map(async name => {
         const records = await promisifyRequest(transaction.objectStore(name).getAll());
         return [name, filterPortableExportRecords(name, records)];
     });
-    for (const [name, records] of await Promise.all(reads)) data.stores[name] = records;
+    const [entries] = await Promise.all([Promise.all(reads), completed]);
+    for (const [name, records] of entries) data.stores[name] = records;
     return data;
+}
+
+export async function exportAllData({ lifecycleToken, lockManager } = {}) {
+    if (hasDataLifecycleLock(lifecycleToken)) {
+        return exportAllDataWithLifecycleLockHeld();
+    }
+    return withDataLifecycleLock(
+        token => exportAllData({ lifecycleToken: token }),
+        lockManager,
+    );
 }
 
 function isCalendarDate(value) {
@@ -419,8 +615,14 @@ function validatePositiveNumber(value, label) {
 }
 
 function validateOptionalNutritionValue(value, label) {
-    if (value != null && !Number.isFinite(Number(value))) {
-        throw new Error(`Backup ${label} must be a number or null`);
+    if (value != null && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
+        throw new Error(`Backup ${label} must be a non-negative number or null`);
+    }
+}
+
+function validateOptionalString(value, label) {
+    if (value != null && typeof value !== 'string') {
+        throw new Error(`Backup ${label} must be a string or null`);
     }
 }
 
@@ -478,7 +680,36 @@ function validateMealItem(item, label) {
     if (typeof item.unit !== 'string' || !item.unit.trim()) {
         throw new Error(`Backup ${label} item requires a unit`);
     }
+    validateOptionalString(item.itemId, `${label} item ID`);
+    validateOptionalString(item.nameSnapshot, `${label} item name`);
+    validateOptionalString(item.notes, `${label} item notes`);
     if (item.nutrients != null) validateNutrients(item.nutrients, `${label} item`);
+}
+
+function validatePortableSetting(record) {
+    if (record.key !== 'ai_usage_log') return;
+    if (!Array.isArray(record.value) || record.value.length > 100) {
+        throw new Error('Backup AI usage log must be an array of at most 100 entries');
+    }
+    for (const entry of record.value) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            throw new Error('Backup AI usage log contains an invalid entry');
+        }
+        const date = typeof entry.date === 'string' ? new Date(entry.date) : null;
+        if (!date || Number.isNaN(date.getTime())) {
+            throw new Error('Backup AI usage log contains an invalid date');
+        }
+        if (entry.provider != null
+            && (typeof entry.provider !== 'string' || entry.provider.length > 80)) {
+            throw new Error('Backup AI usage log contains an invalid provider');
+        }
+        for (const field of ['tokens', 'cost']) {
+            const value = entry[field];
+            if (value != null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0)) {
+                throw new Error(`Backup AI usage log contains invalid ${field}`);
+            }
+        }
+    }
 }
 
 function validateStoreRecord(name, record) {
@@ -486,6 +717,7 @@ function validateStoreRecord(name, record) {
         if (typeof record.key !== 'string' || !record.key) {
             throw new Error('Backup contains a setting without a valid key');
         }
+        validatePortableSetting(record);
         return;
     }
     if (typeof record.id !== 'string' || !record.id) {
@@ -495,6 +727,15 @@ function validateStoreRecord(name, record) {
     if (name === 'foods') {
         if (typeof record.name !== 'string' || !record.name.trim()) {
             throw new Error('Backup food requires a name');
+        }
+        validateOptionalString(record.brand, 'food brand');
+        validateOptionalString(record.category, 'food category');
+        if (record.source != null) {
+            if (typeof record.source !== 'object' || Array.isArray(record.source)) {
+                throw new Error('Backup food source must be an object or null');
+            }
+            validateOptionalString(record.source.type, 'food source type');
+            validateOptionalString(record.source.id, 'food source ID');
         }
         validateServingSize(record.servingSize, 'food');
         validateNutrients(record.nutrients, 'food');
@@ -519,6 +760,12 @@ function validateStoreRecord(name, record) {
         validatePositiveNumber(record.weight, 'measurement weight');
         if (record.unit != null && !['kg', 'lb'].includes(record.unit)) {
             throw new Error('Backup measurement requires a valid unit');
+        }
+        if (record.bodyFat != null
+            && (!Number.isFinite(Number(record.bodyFat))
+                || Number(record.bodyFat) < 0
+                || Number(record.bodyFat) > 100)) {
+            throw new Error('Backup measurement body fat must be between 0 and 100');
         }
     }
 }
@@ -572,43 +819,58 @@ export function validateBackupData(data) {
     return available;
 }
 
+function canonicalize(value) {
+    if (Array.isArray(value)) return value.map(canonicalize);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(
+        Object.keys(value).sort().map(key => [key, canonicalize(value[key])]),
+    );
+}
+
+function canonicalStore(records, storeName) {
+    const key = storeName === 'settings' ? 'key' : 'id';
+    return records
+        .map(record => canonicalize(record))
+        .sort((left, right) => String(left[key] || '').localeCompare(String(right[key] || '')));
+}
+
+function matchesPortableSnapshot(expectedData, currentStores) {
+    if (!expectedData?.stores) return true;
+    return PORTABLE_DATA_STORES.every(name => JSON.stringify(canonicalStore(
+        filterPortableExportRecords(name, currentStores[name] || []),
+        name,
+    )) === JSON.stringify(canonicalStore(expectedData.stores[name] || [], name)));
+}
+
 /**
  * Import all data into stores
  * @param {Object} data - exported data object
  * @param {boolean} merge - if false, clears stores first
  * @returns {Promise<void>}
  */
-export async function importAllData(data, merge = false) {
+async function importAllDataWithLocksHeld(data, merge = false, { expectedCurrentData } = {}) {
     const stores = validateBackupData(data);
     const db = await openDB();
 
-    // Credentials never leave the device in exports and must survive a replace
-    // restore. Read them before the all-store transaction begins.
-    const preservedSettings = new Map();
-    if (!merge && stores.includes('settings')) {
-        for (const key of SENSITIVE_SETTING_KEYS) {
-            const value = await getSetting(key, undefined);
-            if (value !== undefined && value !== null && value !== '') {
-                preservedSettings.set(key, value);
-            }
-        }
-    }
-
-    const transactionStores = !merge && db.objectStoreNames.contains('apiCache')
-        ? [...stores, 'apiCache']
-        : stores;
+    const transactionStores = merge
+        ? stores
+        : DATA_STORES.filter(name => db.objectStoreNames.contains(name));
 
     await new Promise((resolve, reject) => {
         const tx = db.transaction(transactionStores, 'readwrite');
+        let abortReason = null;
 
-        try {
+        const writeImportedRecords = () => {
             for (const name of stores) {
                 const store = tx.objectStore(name);
-                if (!merge) store.clear();
                 for (const record of data.stores[name]) {
-                    if (name === 'settings' && SENSITIVE_SETTING_KEYS.has(record.key)) continue;
+                    const portableRecord = name === 'settings'
+                        ? sanitizePortableSetting(record)
+                        : record;
+                    if (!portableRecord) continue;
                     if (record.deleted === true) continue;
-                    const copy = structuredClone(record);
+                    let copy = structuredClone(portableRecord);
+                    if (name === 'meals') copy = normalizeMealRecordItemIds(copy);
                     if (!merge) {
                         store.put(copy);
                         continue;
@@ -622,38 +884,216 @@ export async function importAllData(data, merge = false) {
                     };
                 }
             }
+        };
 
-            if (!merge && transactionStores.includes('apiCache')) {
-                tx.objectStore('apiCache').clear();
+        const applyReplacement = (preservedSettings, currentStores) => {
+            if (!matchesPortableSnapshot(expectedCurrentData, currentStores)) {
+                abortReason = new Error('Local data changed while the safety backup was being verified. Nothing was replaced; try again.');
+                abortReason.code = 'DATA_CHANGED_DURING_REPLACE';
+                tx.abort();
+                return;
             }
-
-            if (!merge && stores.includes('settings')) {
+            for (const name of transactionStores) tx.objectStore(name).clear();
+            writeImportedRecords();
+            if (transactionStores.includes('settings')) {
                 const settingsStore = tx.objectStore('settings');
                 for (const [key, value] of preservedSettings) {
                     settingsStore.put({ key, value, updatedAt: now() });
                 }
             }
+        };
+
+        try {
+            if (merge) {
+                writeImportedRecords();
+            } else {
+                // Read sensitive settings and the expected safety-snapshot
+                // state inside the same transaction that performs replacement.
+                // Writers are therefore ordered wholly before or after it.
+                const preservedSettings = new Map();
+                const currentStores = {};
+                const settingKeys = [...SENSITIVE_SETTING_KEYS, 'privacyConsent_webdav'];
+                let pending = settingKeys.length
+                    + (expectedCurrentData ? PORTABLE_DATA_STORES.length : 0);
+                const finishRead = () => {
+                    pending -= 1;
+                    if (pending === 0) applyReplacement(preservedSettings, currentStores);
+                };
+
+                for (const key of settingKeys) {
+                    const request = tx.objectStore('settings').get(key);
+                    request.onsuccess = () => {
+                        const value = request.result?.value;
+                        const shouldPreserve = key === 'privacyConsent_webdav'
+                            ? value === true
+                            : value !== undefined && value !== null && value !== '';
+                        if (shouldPreserve) preservedSettings.set(key, value);
+                        finishRead();
+                    };
+                }
+                if (expectedCurrentData) {
+                    for (const name of PORTABLE_DATA_STORES) {
+                        const request = tx.objectStore(name).getAll();
+                        request.onsuccess = () => {
+                            currentStores[name] = request.result;
+                            finishRead();
+                        };
+                    }
+                }
+            }
         } catch (error) {
+            abortReason = error;
             tx.abort();
-            reject(error);
-            return;
         }
 
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error || new Error('Import transaction failed'));
-        tx.onabort = () => reject(tx.error || new Error('Import transaction was aborted'));
+        tx.onabort = () => reject(abortReason || tx.error || new Error('Import transaction was aborted'));
     });
+    if (!merge) clearAddDraft();
+}
+
+export async function importAllData(data, merge = false, {
+    lifecycleToken,
+    draftLockToken,
+    destructiveLockToken,
+    writeLockToken,
+    expectedCurrentData,
+    lockManager,
+} = {}) {
+    if (!hasDataLifecycleLock(lifecycleToken)) {
+        return withDataLifecycleLock(
+            token => importAllData(data, merge, {
+                lifecycleToken: token,
+                draftLockToken,
+                destructiveLockToken,
+                writeLockToken,
+                expectedCurrentData,
+                lockManager,
+            }),
+            lockManager,
+        );
+    }
+    if (!hasDataDestructiveLock(destructiveLockToken)) {
+        return withDataDestructiveLock(
+            token => importAllData(data, merge, {
+                lifecycleToken,
+                draftLockToken,
+                destructiveLockToken: token,
+                writeLockToken,
+                expectedCurrentData,
+                lockManager,
+            }),
+            lockManager,
+        );
+    }
+    if (!hasAddDraftLock(draftLockToken)) {
+        return withAddDraftLock(
+            token => importAllData(data, merge, {
+                lifecycleToken,
+                draftLockToken: token,
+                destructiveLockToken,
+                writeLockToken,
+                expectedCurrentData,
+                lockManager,
+            }),
+            lockManager,
+            { destructiveLockToken },
+        );
+    }
+    if (!hasDataWriteLock(writeLockToken)) {
+        return withDataWriteLock(
+            token => importAllData(data, merge, {
+                lifecycleToken,
+                draftLockToken,
+                destructiveLockToken,
+                writeLockToken: token,
+                expectedCurrentData,
+                lockManager,
+            }),
+            lockManager,
+            { destructiveLockToken },
+        );
+    }
+    return importAllDataWithLocksHeld(data, merge, { expectedCurrentData });
 }
 
 /**
  * Clear all data from all stores
  * @returns {Promise<void>}
  */
-export async function clearAllData() {
-    for (const name of DATA_STORES) {
-        await hardDeleteAll(name);
-    }
+async function clearAllDataWithLocksHeld() {
+    const db = await openDB();
+    const stores = DATA_STORES.filter(name => db.objectStoreNames.contains(name));
+    await new Promise((resolve, reject) => {
+        const tx = db.transaction(stores, 'readwrite');
+        for (const name of stores) tx.objectStore(name).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error('Clear transaction failed'));
+        tx.onabort = () => reject(tx.error || new Error('Clear transaction was aborted'));
+    });
     clearMigrationBackups();
+    clearAddDraft();
+}
+
+export async function clearAllData({
+    lifecycleToken,
+    draftLockToken,
+    destructiveLockToken,
+    writeLockToken,
+    lockManager,
+} = {}) {
+    if (!hasDataLifecycleLock(lifecycleToken)) {
+        return withDataLifecycleLock(
+            token => clearAllData({
+                lifecycleToken: token,
+                draftLockToken,
+                destructiveLockToken,
+                writeLockToken,
+                lockManager,
+            }),
+            lockManager,
+        );
+    }
+    if (!hasDataDestructiveLock(destructiveLockToken)) {
+        return withDataDestructiveLock(
+            token => clearAllData({
+                lifecycleToken,
+                draftLockToken,
+                destructiveLockToken: token,
+                writeLockToken,
+                lockManager,
+            }),
+            lockManager,
+        );
+    }
+    if (!hasAddDraftLock(draftLockToken)) {
+        return withAddDraftLock(
+            token => clearAllData({
+                lifecycleToken,
+                draftLockToken: token,
+                destructiveLockToken,
+                writeLockToken,
+                lockManager,
+            }),
+            lockManager,
+            { destructiveLockToken },
+        );
+    }
+    if (!hasDataWriteLock(writeLockToken)) {
+        return withDataWriteLock(
+            token => clearAllData({
+                lifecycleToken,
+                draftLockToken,
+                destructiveLockToken,
+                writeLockToken: token,
+                lockManager,
+            }),
+            lockManager,
+            { destructiveLockToken },
+        );
+    }
+    return clearAllDataWithLocksHeld();
 }
 
 export function getMigrationBackups() {

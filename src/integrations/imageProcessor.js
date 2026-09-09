@@ -57,6 +57,7 @@ export async function analyzeImage(imageDataUrl, context = '', options = {}) {
       temperature: 0.2,
       jsonMode: true,
       signal: options.signal,
+      mutationGeneration: options.mutationGeneration,
     });
 
     if (!response.content) {
@@ -81,7 +82,9 @@ export async function analyzeImage(imageDataUrl, context = '', options = {}) {
     const config = await getAIConfig();
     const tokens = response.usage?.totalTokens || 0;
     const estimatedCost = config.provider === 'anthropic' ? tokens * 0.000003 : tokens * 0.000005;
-    await logUsage(config.provider, tokens, estimatedCost);
+    await logUsage(config.provider, tokens, estimatedCost, {
+      mutationGeneration: response.mutationGeneration,
+    });
 
     return {
       success: true,
@@ -89,6 +92,7 @@ export async function analyzeImage(imageDataUrl, context = '', options = {}) {
       processingTime,
       warnings: validated.warnings,
       rejected: validated.rejected,
+      mutationGeneration: response.mutationGeneration,
     };
   } catch (err) {
     return { success: false, error: err.message || 'Image analysis failed' };

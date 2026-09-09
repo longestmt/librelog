@@ -3,6 +3,8 @@ import { todayStr } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
+import { createWeightChartModel, prepareWeightData } from '../engine/weight.js';
+import { captureDataMutationGeneration } from '../data/operation-locks.js';
 
 /**
  * Render the weight tracking page
@@ -13,64 +15,24 @@ export async function renderWeightPage(container, queryString) {
   let submitInProgress = false;
 
   async function render() {
+    const mutationGeneration = captureDataMutationGeneration();
     const allEntries = await getAll('measurements');
-    // Sort by date ascending for chart/stats, then reverse for history
-    const sorted = allEntries
-      .filter(e => Number.isFinite(Number(e.weight)) && Number(e.weight) > 0)
-      .map(e => ({
-        ...e,
-        weight: Number(e.weight),
-        bodyFat: e.bodyFat != null && e.bodyFat !== '' && Number.isFinite(Number(e.bodyFat))
-          ? Number(e.bodyFat)
-          : null,
-        unit: e.unit === 'lb' ? 'lb' : 'kg',
-      }))
-      .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
-
-    const chartEntries = sorted.slice(-30);
+    const weightData = prepareWeightData(allEntries);
+    const sorted = weightData.entries;
+    // One point per calendar day keeps repeated same-day readings from
+    // overweighting averages and trends.
+    const chartEntries = weightData.dailyEntries.slice(-30);
     const historySorted = [...sorted].reverse();
 
     // Stats
-    const current = sorted.length > 0 ? sorted[sorted.length - 1] : null;
-    const starting = sorted.length > 0 ? sorted[0] : null;
-    const delta = current && starting ? (current.weight - starting.weight).toFixed(1) : null;
-    const avg = sorted.length > 0
-      ? (sorted.reduce((sum, e) => sum + e.weight, 0) / sorted.length).toFixed(1)
-      : null;
+    const { current, starting } = weightData;
+    const delta = weightData.delta;
+    const avg = weightData.average;
 
-    // Chart calculations
-    let minWeight = Infinity;
-    let maxWeight = -Infinity;
-    let minIdx = 0;
-    let maxIdx = 0;
-    chartEntries.forEach((e, i) => {
-      if (e.weight < minWeight) { minWeight = e.weight; minIdx = i; }
-      if (e.weight > maxWeight) { maxWeight = e.weight; maxIdx = i; }
-    });
-
-    const weightRange = maxWeight - minWeight || 1;
-    const chartPadding = weightRange * 0.1;
-    const chartMin = minWeight - chartPadding;
-    const chartMax = maxWeight + chartPadding;
-    const chartRange = chartMax - chartMin || 1;
-
-    // Linear regression for trend line
-    let trendStart = 0;
-    let trendEnd = 0;
-    if (chartEntries.length >= 2) {
-      const n = chartEntries.length;
-      let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-      chartEntries.forEach((e, i) => {
-        sumX += i;
-        sumY += e.weight;
-        sumXY += i * e.weight;
-        sumX2 += i * i;
-      });
-      const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-      const intercept = (sumY - slope * sumX) / n;
-      trendStart = ((intercept - chartMin) / chartRange) * 100;
-      trendEnd = ((slope * (n - 1) + intercept - chartMin) / chartRange) * 100;
-    }
+    const chartModel = createWeightChartModel(chartEntries);
+    const chartAccessibleSummary = chartEntries
+      .map(entry => `${entry.date}: ${entry.weight.toFixed(1)} ${entry.unit}${entry.readingCount > 1 ? `, average of ${entry.readingCount} readings` : ''}`)
+      .join('; ');
 
     const deltaSign = delta > 0 ? '+' : '';
     const deltaClass = delta > 0 ? 'weight-gain' : delta < 0 ? 'weight-loss' : '';
@@ -117,55 +79,41 @@ export async function renderWeightPage(container, queryString) {
         <!-- Weight Trend Chart -->
         ${chartEntries.length > 0 ? `
         <section class="weight-chart-section" role="region" aria-label="Weight trend chart">
-          <h2 class="weight-section-title">Trend (Last ${chartEntries.length} entries)</h2>
+          <h2 class="weight-section-title">Trend (Last ${chartEntries.length} logged days, ${weightData.displayUnit})</h2>
           <div class="weight-chart-container">
             <div class="weight-chart-y-axis">
-              <span class="weight-chart-y-label">${maxWeight.toFixed(1)}</span>
-              <span class="weight-chart-y-label">${((maxWeight + minWeight) / 2).toFixed(1)}</span>
-              <span class="weight-chart-y-label">${minWeight.toFixed(1)}</span>
+              <span class="weight-chart-y-label">${chartModel.chartMax.toFixed(1)}</span>
+              <span class="weight-chart-y-label">${((chartModel.chartMax + chartModel.chartMin) / 2).toFixed(1)}</span>
+              <span class="weight-chart-y-label">${chartModel.chartMin.toFixed(1)}</span>
             </div>
-            <div class="weight-chart" role="img" aria-label="Weight trend over last ${chartEntries.length} entries">
-              <!-- Trend line -->
-              ${chartEntries.length >= 2 ? `
-              <div class="weight-trend-line" style="
-                position: absolute;
-                left: 0;
-                right: 0;
-                bottom: 0;
-                top: 0;
-                pointer-events: none;
-                overflow: hidden;
-              ">
-                <div style="
-                  position: absolute;
-                  left: 0;
-                  right: 0;
-                  height: 2px;
-                  background: var(--color-warning, #f59e0b);
-                  opacity: 0.6;
-                  bottom: ${trendStart}%;
-                  transform-origin: left center;
-                  transform: rotate(${-Math.atan2((trendEnd - trendStart), 100) * (180 / Math.PI)}deg);
-                  width: ${Math.sqrt(10000 + (trendEnd - trendStart) * (trendEnd - trendStart))}%;
-                "></div>
-              </div>
-              ` : ''}
-              <!-- Bars -->
-              <div class="weight-chart-bars">
-                ${chartEntries.map((entry, i) => {
-                  const heightPct = ((entry.weight - chartMin) / chartRange) * 100;
-                  const isMin = i === minIdx;
-                  const isMax = i === maxIdx;
+            <div class="weight-chart" role="img" aria-label="Weight trend. ${escapeHTML(chartAccessibleSummary)}">
+              <div class="weight-chart-plot">
+                ${chartModel.trendLine ? `
+                  <svg class="weight-trend-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+                    <line
+                      x1="${chartModel.trendLine.x1}"
+                      y1="${chartModel.trendLine.y1}"
+                      x2="${chartModel.trendLine.x2}"
+                      y2="${chartModel.trendLine.y2}"
+                    ></line>
+                  </svg>
+                ` : ''}
+                <div class="weight-chart-bars">
+                ${chartModel.points.map(point => {
+                  const { entry, index: i } = point;
+                  const isMin = i === chartModel.minIndex;
+                  const isMax = i === chartModel.maxIndex;
                   const highlight = isMin ? 'weight-bar--min' : isMax ? 'weight-bar--max' : '';
                   const dateLabel = (entry.date || '').slice(5); // MM-DD
                   return `
-                    <div class="weight-bar-col" title="${escapeHTML(entry.date || '')}: ${entry.weight} ${escapeHTML(entry.unit || 'kg')}">
-                      <span class="weight-bar-value ${highlight}">${entry.weight}</span>
-                      <div class="weight-bar ${highlight}" style="height: ${Math.max(heightPct, 2)}%;" aria-label="${escapeHTML(entry.date || '')}: ${entry.weight} ${escapeHTML(entry.unit || 'kg')}"></div>
-                      <span class="weight-bar-date">${escapeHTML(dateLabel)}</span>
+                    <div class="weight-bar-col" style="left:${point.x}%;width:${chartModel.barWidthPercent}%;--weight-bar-height:${Math.max(point.height, 2)}%;" title="${escapeHTML(entry.date || '')}: ${entry.weight.toFixed(1)} ${escapeHTML(entry.unit)}${entry.readingCount > 1 ? `, average of ${entry.readingCount} readings` : ''}">
+                      ${point.showValueLabel ? `<span class="weight-bar-value ${highlight}">${entry.weight.toFixed(1)}</span>` : ''}
+                      <div class="weight-bar ${highlight}"></div>
+                      ${point.showDateLabel ? `<span class="weight-bar-date">${escapeHTML(dateLabel)}</span>` : ''}
                     </div>
                   `;
                 }).join('')}
+                </div>
               </div>
             </div>
           </div>
@@ -178,15 +126,15 @@ export async function renderWeightPage(container, queryString) {
           <div class="weight-stats-grid">
             <div class="weight-stat-card">
               <span class="weight-stat-label">Current</span>
-              <span class="weight-stat-value">${current ? `${current.weight} ${current.unit || 'kg'}` : '--'}</span>
+              <span class="weight-stat-value">${current ? `${current.weight.toFixed(1)} ${current.unit}` : '--'}</span>
             </div>
             <div class="weight-stat-card">
               <span class="weight-stat-label">Starting</span>
-              <span class="weight-stat-value">${starting ? `${starting.weight} ${starting.unit || 'kg'}` : '--'}</span>
+              <span class="weight-stat-value">${starting ? `${starting.weight.toFixed(1)} ${starting.unit}` : '--'}</span>
             </div>
             <div class="weight-stat-card">
               <span class="weight-stat-label">Change</span>
-              <span class="weight-stat-value ${deltaClass}">${delta !== null ? `${deltaSign}${delta}` : '--'}</span>
+              <span class="weight-stat-value ${deltaClass}">${delta !== null ? `${deltaSign}${delta.toFixed(1)} ${weightData.displayUnit}` : '--'}</span>
             </div>
             <div class="weight-stat-card">
               <span class="weight-stat-label">Entries</span>
@@ -194,7 +142,7 @@ export async function renderWeightPage(container, queryString) {
             </div>
             <div class="weight-stat-card">
               <span class="weight-stat-label">Average</span>
-              <span class="weight-stat-value">${avg !== null ? avg : '--'}</span>
+              <span class="weight-stat-value">${avg !== null ? `${avg.toFixed(1)} ${weightData.displayUnit}` : '--'}</span>
             </div>
           </div>
         </section>
@@ -258,6 +206,10 @@ export async function renderWeightPage(container, queryString) {
         showToast('Please enter a valid weight', 'error');
         return;
       }
+      if (bodyFat !== null && (!Number.isFinite(bodyFat) || bodyFat < 0 || bodyFat > 100)) {
+        showToast('Body fat must be between 0 and 100%', 'error');
+        return;
+      }
 
       submitInProgress = true;
       const submitButton = e.currentTarget.querySelector('[type="submit"]');
@@ -269,7 +221,7 @@ export async function renderWeightPage(container, queryString) {
           weight,
           unit,
           bodyFat,
-        });
+        }, { mutationGeneration });
 
         showToast('Weight logged');
         await render();
@@ -311,7 +263,7 @@ export async function renderWeightPage(container, queryString) {
         document.getElementById('confirm-close')?.addEventListener('click', closeModal);
         document.getElementById('confirm-cancel')?.addEventListener('click', closeModal);
         document.getElementById('confirm-delete')?.addEventListener('click', async () => {
-          await softDelete('measurements', entryId);
+          await softDelete('measurements', entryId, { mutationGeneration });
           showToast('Entry deleted');
           closeModal();
           render();

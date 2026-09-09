@@ -214,11 +214,9 @@ function calculateDayTotalsSimple(meals) {
   if (!meals || meals.length === 0) return totals;
   for (const meal of meals) {
     for (const item of (meal.items || [])) {
-      if (item.nutrients) {
-        for (const key of NUTRIENT_KEYS) {
-          if (Number.isFinite(item.nutrients[key])) totals[key] += item.nutrients[key];
-          else if (!totals.incomplete.includes(key)) totals.incomplete.push(key);
-        }
+      for (const key of NUTRIENT_KEYS) {
+        if (Number.isFinite(item.nutrients?.[key])) totals[key] += item.nutrients[key];
+        else if (!totals.incomplete.includes(key)) totals.incomplete.push(key);
       }
     }
   }

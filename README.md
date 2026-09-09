@@ -12,14 +12,17 @@ You can encrypt portable and WebDAV backups with a passphrase.
 ## Features
 
 ### Core Tracking
+- **Reliable Add workspace** — Build one meal from search, scans, saved foods, or manual labels without losing your draft
 - **Food search** — Open Food Facts + USDA FoodData Central databases
 - **Barcode scanning** — Camera-based or manual entry via QuaggaJS
+- **Flexible label entry** — Enter nutrition per serving, whole container, or 100 g without doing the conversion yourself
 - **Daily diary** — Meals grouped by Breakfast, Lunch, Dinner, Snacks
 - **Nutrition summary** — Calories, protein, carbs, fat, fiber, sodium
 - **Calorie ring** — Visual progress toward daily goals
 - **Daily notes** — Free-text notes per day
 
 ### AI-Assisted Logging (Optional, BYOK)
+- **AI-first when enabled** — Describe a meal first, then mix in searched, scanned, or saved foods before one review and save
 - **Photo analysis** — Take a photo, AI identifies foods and estimates portions
 - **Voice logging** — Describe your meal naturally, AI parses into structured entries
 - **Text description** — Type what you ate, AI extracts food items
@@ -32,6 +35,7 @@ You can encrypt portable and WebDAV backups with a passphrase.
 - **Day copy** — Clone meals from any previous day
 - **Favorites and usual servings** — Keep frequent food portions ready
 - **Meal history** — Search old meals and review them before reuse
+- **Familiar meals** — Save a corrected meal for quick, editable reuse
 
 ### Weight Tracking
 - **Daily logging** — Weight, body fat %, kg/lb
@@ -42,6 +46,7 @@ You can encrypt portable and WebDAV backups with a passphrase.
 ### Data & Privacy
 - **Offline-first** — Works without internet via service worker
 - **Local-first storage** — Core data stays in IndexedDB unless you use an explicit remote feature
+- **Provider consent boundaries** — Food databases remain local-only until their specific network access is enabled
 - **Auto-backup** — Verified snapshots every 6 hours to native filesystem or browser storage
 - **JSON export/import** — Private exports plus merge-first, previewed imports
 - **Encrypted backup** — Optional passphrase encryption for portable and WebDAV files
@@ -108,7 +113,7 @@ LibreLog works fully without AI. To enable photo/voice/text food logging:
 1. Go to **Settings → AI Features**
 2. Select a provider (OpenAI, Anthropic, or Ollama)
 3. Enter your API key
-4. Photo, Voice, and AI Text tabs appear in the search page
+4. The Add workspace opens with **Describe your meal**, including photo and voice controls; conventional search and scanning remain available alongside it
 
 Keys are excluded from JSON exports and WebDAV backups. Credential protection
 can encrypt keys at rest with a passphrase. If protection is off, keys are
@@ -127,15 +132,15 @@ src/
 ├── pages/                 # Route pages
 │   ├── diary.js           # Daily food diary
 │   ├── history.js         # Searchable meal history
-│   ├── search.js          # Unified search (text/scan/photo/voice/AI)
+│   ├── search.js          # Persistent mixed-source Add workspace
 │   ├── insights.js        # Statistics & progress
 │   ├── weight.js          # Weight tracking
 │   ├── recipes.js         # Recipe builder
 │   └── settings.js        # Preferences & integrations
 ├── components/            # UI components (modal, toast)
-├── data/                  # IndexedDB, backup, import/export
-├── engine/                # Nutrition calc, food search, goals
-├── integrations/          # OFF, USDA, AI client, image/voice
+├── data/                  # IndexedDB, local meal draft, backup, import/export
+├── engine/                # Nutrition, food search, goals, weight trends
+├── integrations/          # Consent boundaries, OFF, USDA, AI, image/voice
 ├── utils/                 # Units, formatting, sanitization
 └── styles/                # CSS themes & components
 ```

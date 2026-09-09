@@ -6,7 +6,8 @@
  * encrypted web implementation can replace it without changing integrations.
  */
 
-import { getSetting, setSetting } from './db.js';
+import { getSetting, setSetting, setSettings } from './db.js';
+import { withDataLifecycleLock } from './operation-locks.js';
 import { decryptBackup, encryptBackup, isEncryptedBackup } from './encryption.js';
 
 const CREDENTIAL_KEYS = Object.freeze({
@@ -90,7 +91,7 @@ export async function isCredentialStoreUnlocked() {
   return !(await isCredentialEncryptionEnabled()) || Boolean(credentialPassphrase);
 }
 
-export async function enableCredentialEncryption(passphrase) {
+async function enableCredentialEncryptionWithLifecycleLockHeld(passphrase) {
   if (typeof passphrase !== 'string' || passphrase.length < 8) {
     throw new Error('Passphrase must contain at least 8 characters');
   }
@@ -108,17 +109,43 @@ export async function enableCredentialEncryption(passphrase) {
     );
   }
 
+  const writes = new Map();
   for (const [name, encrypted] of encryptedValues) {
-    await setSetting(settingKey(name), encrypted);
+    writes.set(settingKey(name), encrypted);
     for (const legacyKey of LEGACY_KEYS[name] || []) {
-      await setSetting(legacyKey, null);
+      writes.set(legacyKey, null);
     }
   }
-  await setSetting(ENCRYPTION_VERIFIER_SETTING, verifier);
-  await setSetting(ENCRYPTION_SETTING, true);
+  writes.set(ENCRYPTION_VERIFIER_SETTING, verifier);
+  writes.set(ENCRYPTION_SETTING, true);
+  await setSettings([...writes].map(([key, value]) => ({ key, value })));
   credentialPassphrase = passphrase;
   unlockedCredentials.clear();
   for (const [name, value] of plaintextValues) unlockedCredentials.set(name, value);
+}
+
+export async function enableCredentialEncryption(passphrase, { lockManager } = {}) {
+  return withDataLifecycleLock(
+    () => enableCredentialEncryptionWithLifecycleLockHeld(passphrase),
+    lockManager,
+  );
+}
+
+export async function saveUsdaApiKey(value, { lockManager } = {}) {
+  return withDataLifecycleLock(async () => {
+    // Consent is the request-side active marker and remains false on any
+    // partial credential update.
+    await setSetting('privacyConsent_usda', false);
+    await setCredential('usdaApiKey', value);
+    await setSetting('privacyConsent_usda', true);
+  }, lockManager);
+}
+
+export async function removeUsdaApiKey({ lockManager } = {}) {
+  return withDataLifecycleLock(async () => {
+    await setSetting('privacyConsent_usda', false);
+    await removeCredential('usdaApiKey');
+  }, lockManager);
 }
 
 export async function unlockCredentialStore(passphrase) {

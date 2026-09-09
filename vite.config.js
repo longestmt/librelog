@@ -52,16 +52,6 @@ export default defineConfig({
             },
             workbox: {
                 globPatterns: ['**/*.{js,css,html,svg,woff2}'],
-                runtimeCaching: [
-                    {
-                        urlPattern: /^https:\/\/world\.openfoodfacts\.org\/api\//,
-                        handler: 'StaleWhileRevalidate',
-                        options: {
-                            cacheName: 'off-api-cache',
-                            expiration: { maxEntries: 500, maxAgeSeconds: 7 * 24 * 60 * 60 },
-                        },
-                    },
-                ],
             },
         }),
     ].filter(Boolean),

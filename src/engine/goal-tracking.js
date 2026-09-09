@@ -37,6 +37,19 @@ function validGoal(value, key) {
     : DEFAULT_GOALS[key];
 }
 
+function calculateGoalProgress(value, target) {
+  const numericTarget = Number(target);
+  if (!Number.isFinite(numericTarget) || numericTarget <= 0) {
+    return { percentage: 0, status: 'disabled' };
+  }
+
+  const numericValue = Number(value);
+  const percentage = Number.isFinite(numericValue)
+    ? Math.max(0, Math.round((numericValue / numericTarget) * 100))
+    : 0;
+  return { percentage, status: determineStatus(percentage) };
+}
+
 /**
  * Retrieve user's nutrition goals from settings
  * Returns defaults if not yet configured
@@ -76,7 +89,7 @@ async function getGoals() {
  * @param {number} [goals.sodiumMg] - Daily sodium target in milligrams
  * @returns {Promise<void>}
  */
-async function setGoals(goals) {
+async function setGoals(goals, options = {}) {
   if (!goals || typeof goals !== 'object') {
     console.error('Invalid goals object');
     return;
@@ -93,7 +106,7 @@ async function setGoals(goals) {
       sodiumMg: validGoal(goals.sodiumMg, 'sodiumMg')
     };
 
-    await setSetting(GOALS_KEY, validatedGoals);
+    await setSetting(GOALS_KEY, validatedGoals, options);
   } catch (error) {
     console.error('Error saving goals:', error);
   }
@@ -119,63 +132,14 @@ function getProgress(dayTotals, goals) {
   }
 
   try {
-    const progress = {};
-
-    // Calories
-    const caloriePercent = Math.round(
-      (dayTotals.kcal / goals.calorieTarget) * 100
-    );
-    progress.calories = {
-      percentage: Math.max(0, caloriePercent),
-      status: determineStatus(caloriePercent)
+    return {
+      calories: calculateGoalProgress(dayTotals.kcal, goals.calorieTarget),
+      protein: calculateGoalProgress(dayTotals.protein, goals.proteinG),
+      carbs: calculateGoalProgress(dayTotals.carbs, goals.carbG),
+      fat: calculateGoalProgress(dayTotals.fat, goals.fatG),
+      fiber: calculateGoalProgress(dayTotals.fiber, goals.fiberG),
+      sodium: calculateGoalProgress(dayTotals.sodium, goals.sodiumMg),
     };
-
-    // Protein
-    const proteinPercent = Math.round(
-      (dayTotals.protein / goals.proteinG) * 100
-    );
-    progress.protein = {
-      percentage: Math.max(0, proteinPercent),
-      status: determineStatus(proteinPercent)
-    };
-
-    // Carbs
-    const carbsPercent = Math.round(
-      (dayTotals.carbs / goals.carbG) * 100
-    );
-    progress.carbs = {
-      percentage: Math.max(0, carbsPercent),
-      status: determineStatus(carbsPercent)
-    };
-
-    // Fat
-    const fatPercent = Math.round(
-      (dayTotals.fat / goals.fatG) * 100
-    );
-    progress.fat = {
-      percentage: Math.max(0, fatPercent),
-      status: determineStatus(fatPercent)
-    };
-
-    // Fiber
-    const fiberPercent = Math.round(
-      (dayTotals.fiber / goals.fiberG) * 100
-    );
-    progress.fiber = {
-      percentage: Math.max(0, fiberPercent),
-      status: determineStatus(fiberPercent)
-    };
-
-    // Sodium
-    const sodiumPercent = Math.round(
-      (dayTotals.sodium / goals.sodiumMg) * 100
-    );
-    progress.sodium = {
-      percentage: Math.max(0, sodiumPercent),
-      status: determineStatus(sodiumPercent)
-    };
-
-    return progress;
   } catch (error) {
     console.error('Error calculating progress:', error);
     return {
@@ -197,7 +161,8 @@ function getProgress(dayTotals, goals) {
  * - 'over': > 110%
  * @private
  * @param {number} percentage - Percentage achieved (0-infinity)
- * @returns {string} Status: 'under', 'on-track', or 'over'
+ * @returns {string} Status: 'under', 'on-track', or 'over'. A disabled target
+ * is handled before this helper is called.
  */
 function determineStatus(percentage) {
   if (percentage < 90) {

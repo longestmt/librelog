@@ -6,6 +6,14 @@
 
 import { getSetting, setSetting } from '../data/db.js';
 import { getCredential } from '../data/credentials.js';
+import { hasRemoteProviderConsent } from './privacy.js';
+import { withAISettingsLock } from './ai-settings.js';
+import {
+    assertDataMutationGenerationCurrent,
+    captureDataMutationGeneration,
+    withDataLifecycleLock,
+} from '../data/operation-locks.js';
+import { convertMessagesForOllama, normalizeOllamaUrl } from './ollama.js';
 import {
     getSafeIntegrationMessage,
     logIntegrationFailure,
@@ -21,25 +29,42 @@ import {
  * @returns {Promise<boolean>}
  */
 export async function isAIConfigured() {
-    const provider = await getSetting('ai_provider', null);
+    const config = await getAIConfig();
+    const { provider } = config;
     if (!provider) return false;
-    if (provider === 'ollama') return true;
-    const apiKey = await getCredential('aiApiKey');
-    return Boolean(apiKey);
+    if (provider === 'ollama') {
+        const { model, ollamaUrl } = config;
+        if (typeof model !== 'string' || !model.trim()) return false;
+        try {
+            normalizeOllamaUrl(ollamaUrl);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    const hasConsent = await hasRemoteProviderConsent(`ai_${provider}`);
+    return Boolean(
+        config.apiKey
+        && config.apiKeyProvider === provider
+        && hasConsent,
+    );
 }
 
 /**
  * Read all AI-related settings from IndexedDB.
- * @returns {Promise<{provider: string|null, apiKey: string|null, model: string|null, ollamaUrl: string}>}
+ * @returns {Promise<{provider: string|null, apiKey: string|null, apiKeyProvider: string|null, model: string|null, ollamaUrl: string}>}
  */
 export async function getAIConfig() {
-    const [provider, apiKey, model, ollamaUrl] = await Promise.all([
-        getSetting('ai_provider', null),
-        getCredential('aiApiKey'),
-        getSetting('ai_model', null),
-        getSetting('ai_ollama_url', 'http://localhost:11434'),
-    ]);
-    return { provider, apiKey, model, ollamaUrl };
+    return withDataLifecycleLock(() => withAISettingsLock(async () => {
+        const [provider, apiKey, apiKeyProvider, model, ollamaUrl] = await Promise.all([
+            getSetting('ai_provider', null),
+            getCredential('aiApiKey'),
+            getSetting('ai_api_key_provider', null),
+            getSetting('ai_model', null),
+            getSetting('ai_ollama_url', 'http://localhost:11434'),
+        ]);
+        return { provider, apiKey, apiKeyProvider, model, ollamaUrl };
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +89,7 @@ async function openaiCompletion(messages, { apiKey, model, maxTokens, temperatur
 
     const { data } = await requestJSON({
         provider: 'OpenAI',
+        consentKey: 'ai_openai',
         url: 'https://api.openai.com/v1/chat/completions',
         init: {
             method: 'POST',
@@ -155,6 +181,7 @@ async function anthropicCompletion(messages, { apiKey, model, maxTokens, tempera
 
     const { data } = await requestJSON({
         provider: 'Anthropic',
+        consentKey: 'ai_anthropic',
         url: 'https://api.anthropic.com/v1/messages',
         init: {
             method: 'POST',
@@ -185,21 +212,23 @@ async function anthropicCompletion(messages, { apiKey, model, maxTokens, tempera
  * Route a chat completion request to a local Ollama instance.
  */
 async function ollamaCompletion(messages, { model, ollamaUrl, jsonMode, signal }) {
-    if (!model) {
+    if (typeof model !== 'string' || !model.trim()) {
         throw new Error('Choose an installed Ollama model in Settings');
     }
+    const baseUrl = normalizeOllamaUrl(ollamaUrl);
     const body = {
         model,
-        messages,
+        messages: convertMessagesForOllama(messages),
         stream: false,
     };
     if (jsonMode) body.format = 'json';
 
     const { data } = await requestJSON({
         provider: 'Ollama',
-        url: `${ollamaUrl}/api/chat`,
+        url: `${baseUrl}/api/chat`,
         init: {
             method: 'POST',
+            redirect: 'error',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         },
@@ -236,11 +265,18 @@ async function ollamaCompletion(messages, { model, ollamaUrl, jsonMode, signal }
  * @returns {Promise<{content: string|null, usage?: Object, error?: string}>}
  */
 export async function chatCompletion(messages, options = {}) {
-    const { maxTokens = 1024, temperature = 0.3, jsonMode = false, signal = null } = options;
+    const {
+        maxTokens = 1024,
+        temperature = 0.3,
+        jsonMode = false,
+        signal = null,
+        mutationGeneration = captureDataMutationGeneration(),
+    } = options;
 
     try {
+        assertDataMutationGenerationCurrent(mutationGeneration);
         const config = await getAIConfig();
-        const { provider, apiKey, model, ollamaUrl } = config;
+        const { provider, apiKey, apiKeyProvider, model, ollamaUrl } = config;
 
         if (!provider) {
             return { content: null, error: 'No AI provider configured' };
@@ -248,11 +284,35 @@ export async function chatCompletion(messages, options = {}) {
         if (provider !== 'ollama' && !apiKey) {
             return { content: null, error: `API key not set for provider "${provider}"` };
         }
-        if (provider === 'ollama' && !model) {
-            return { content: null, error: 'Choose an installed Ollama model in Settings' };
+        if (provider !== 'ollama' && apiKeyProvider !== provider) {
+            return { content: null, error: `Enter an API key for provider "${provider}" in Settings` };
+        }
+        let validatedOllamaUrl = ollamaUrl;
+        let validatedModel = model;
+        if (provider === 'ollama') {
+            if (typeof model !== 'string' || !model.trim()) {
+                return { content: null, error: 'Choose an installed Ollama model in Settings' };
+            }
+            validatedModel = model.trim();
+            try {
+                validatedOllamaUrl = normalizeOllamaUrl(ollamaUrl);
+            } catch {
+                return {
+                    content: null,
+                    error: 'Ollama must use a loopback URL configured in Settings.',
+                };
+            }
         }
 
-        const params = { apiKey, model, maxTokens, temperature, jsonMode, ollamaUrl, signal };
+        const params = {
+            apiKey,
+            model: validatedModel,
+            maxTokens,
+            temperature,
+            jsonMode,
+            ollamaUrl: validatedOllamaUrl,
+            signal,
+        };
 
         let result;
         switch (provider) {
@@ -269,7 +329,7 @@ export async function chatCompletion(messages, options = {}) {
                 return { content: null, error: `Unknown AI provider: ${provider}` };
         }
 
-        return result;
+        return { ...result, mutationGeneration };
     } catch (err) {
         const message = getSafeIntegrationMessage(err, 'AI request failed.');
         logIntegrationFailure(err);
@@ -289,9 +349,12 @@ export async function chatCompletion(messages, options = {}) {
  * @param {number} estimatedCost
  * @returns {Promise<void>}
  */
-export async function logUsage(provider, tokens, estimatedCost) {
+export async function logUsage(provider, tokens, estimatedCost, { mutationGeneration } = {}) {
     try {
-        const log = (await getSetting('ai_usage_log', [])).slice();
+        const storedLog = await getSetting('ai_usage_log', []);
+        const log = Array.isArray(storedLog)
+            ? storedLog.filter(entry => entry && typeof entry === 'object').slice()
+            : [];
         log.push({
             date: new Date().toISOString(),
             provider,
@@ -300,7 +363,7 @@ export async function logUsage(provider, tokens, estimatedCost) {
         });
         // Keep only the most recent 100 entries
         while (log.length > 100) log.shift();
-        await setSetting('ai_usage_log', log);
+        await setSetting('ai_usage_log', log, { mutationGeneration });
     } catch (err) {
         console.warn('[aiClient] logUsage failed:', err.message || err);
     }
@@ -312,7 +375,10 @@ export async function logUsage(provider, tokens, estimatedCost) {
  * @returns {Promise<{totalCost: number, totalTokens: number, entriesThisMonth: number, estimatedMonthlyCost: number}>}
  */
 export async function getUsageStats() {
-    const log = await getSetting('ai_usage_log', []);
+    const storedLog = await getSetting('ai_usage_log', []);
+    const log = Array.isArray(storedLog)
+        ? storedLog.filter(entry => entry && typeof entry === 'object')
+        : [];
 
     let totalCost = 0;
     let totalTokens = 0;
@@ -324,13 +390,19 @@ export async function getUsageStats() {
     const currentYear = now.getFullYear();
 
     for (const entry of log) {
-        totalCost += entry.cost ?? 0;
-        totalTokens += entry.tokens ?? 0;
+        const cost = typeof entry.cost === 'number' && Number.isFinite(entry.cost) && entry.cost >= 0
+            ? entry.cost
+            : 0;
+        const tokens = typeof entry.tokens === 'number' && Number.isFinite(entry.tokens) && entry.tokens >= 0
+            ? entry.tokens
+            : 0;
+        totalCost += cost;
+        totalTokens += tokens;
 
         const d = new Date(entry.date);
         if (d.getMonth() === currentMonth && d.getFullYear() === currentYear) {
             entriesThisMonth++;
-            monthCost += entry.cost ?? 0;
+            monthCost += cost;
         }
     }
 

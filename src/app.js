@@ -1,8 +1,15 @@
-import { openDB, getSetting, setSetting, putMany, importAllData } from './data/db.js';
+import { openDB, getSetting, setSetting, putMany } from './data/db.js';
 import { setGoals } from './engine/goal-tracking.js';
 import { DEFAULT_FOODS } from './data/seed-foods.js';
 import { hapticLight } from './utils/haptics.js';
-import { initAutoBackup, getAvailableBackups, getBackupData } from './data/auto-backup.js';
+import {
+  getAvailableBackups,
+  getBackupData,
+  initAutoBackup,
+  listenForExternalDataClear,
+  replaceAllDataWithSafetyBackup,
+  stopAutoBackup,
+} from './data/auto-backup.js';
 import { renderDiaryPage } from './pages/diary.js';
 import { renderSearchPage } from './pages/search.js';
 import { renderInsightsPage } from './pages/insights.js';
@@ -10,6 +17,11 @@ import { renderWeightPage } from './pages/weight.js';
 import { renderRecipesPage } from './pages/recipes.js';
 import { renderSettingsPage } from './pages/settings.js';
 import { renderHistoryPage } from './pages/history.js';
+import { closeModal } from './components/modal.js';
+import {
+  assertDataMutationGenerationCurrent,
+  captureDataMutationGeneration,
+} from './data/operation-locks.js';
 
 // SVG Icons (Lucide-style)
 const ICONS = {
@@ -26,7 +38,7 @@ const ICONS = {
 
 const ROUTES = {
   diary: { component: renderDiaryPage, label: 'Diary', icon: ICONS.book, nav: true },
-  search: { component: renderSearchPage, label: 'Search', icon: ICONS.search, nav: false },
+  search: { component: renderSearchPage, label: 'Add Food', icon: ICONS.search, nav: false },
   insights: { component: renderInsightsPage, label: 'Insights', icon: ICONS.barchart, nav: true },
   weight: { component: renderWeightPage, label: 'Weight', icon: ICONS.weight, nav: true },
   recipes: { component: renderRecipesPage, label: 'Recipes', icon: ICONS.recipe, nav: true },
@@ -37,21 +49,29 @@ const ROUTES = {
 let currentRoute = 'diary';
 let activePageCleanup = null;
 let routeSequence = 0;
+let externalDataClearCleanup = null;
 
 async function init() {
   try {
+    if (!externalDataClearCleanup) {
+      externalDataClearCleanup = listenForExternalDataClear(() => {
+        stopAutoBackup();
+        window.location.reload();
+      });
+    }
     await openDB();
 
+    const mutationGeneration = captureDataMutationGeneration();
     const isFirstRun = !(await getSetting('initialized'));
 
     if (isFirstRun) {
       // Seed default foods
-      await putMany('foods', DEFAULT_FOODS);
+      await putMany('foods', DEFAULT_FOODS, { mutationGeneration });
 
       // Set default settings
-      await setSetting('initialized', true);
-      await setSetting('theme', 'compline');
-      await setSetting('unit', 'metric');
+      await setSetting('initialized', true, { mutationGeneration });
+      await setSetting('theme', 'compline', { mutationGeneration });
+      await setSetting('unit', 'metric', { mutationGeneration });
 
       // Set default goals
       await setGoals({
@@ -61,10 +81,10 @@ async function init() {
         fatG: 65,
         fiberG: 30,
         sodiumMg: 2300,
-      });
+      }, { mutationGeneration });
     }
 
-    await applyTheme();
+    await applyTheme({ mutationGeneration });
     renderShell();
     await handleRoute();
 
@@ -72,32 +92,54 @@ async function init() {
     initAutoBackup().catch(err => console.warn('Auto-backup init failed:', err));
 
     // Listen for data loss events from auto-backup integrity check
-    window.addEventListener('librelog:dataloss', (e) => {
+    window.addEventListener('librelog:dataloss', async (e) => {
       const msg = e.detail?.message || 'Possible data loss detected.';
       if (confirm(msg)) {
-        const backups = getAvailableBackups();
-        if (backups.length > 0) {
-          const latest = backups[backups.length - 1];
-          const data = getBackupData(latest.timestamp);
-          if (data) {
-            importAllData(data, false).then(() => window.location.reload());
+        const mutationGeneration = e.detail?.mutationGeneration;
+        try {
+          assertDataMutationGenerationCurrent(mutationGeneration);
+          const backups = getAvailableBackups();
+          if (backups.length > 0) {
+            const latest = backups[backups.length - 1];
+            const data = getBackupData(latest.timestamp);
+            if (data) {
+              await replaceAllDataWithSafetyBackup(data, { mutationGeneration });
+              window.location.reload();
+            }
+          }
+        } catch (error) {
+          if (error?.code !== 'DATA_OPERATION_INVALIDATED') {
+            console.error('Could not restore the automatic backup:', error);
           }
         }
       }
     });
   } catch (err) {
     console.error('Failed to initialize LibreLog:', err);
-    document.body.innerHTML = '<p>Failed to initialize app. Please refresh.</p>';
+    if (err?.code === 'DB_UPGRADE_BLOCKED') {
+      document.body.innerHTML = `
+        <main class="page-container initialization-error" aria-labelledby="initialization-error-title">
+          <h1 id="initialization-error-title">Local data update paused</h1>
+          <p>Close other LibreLog tabs or windows, then reload to finish updating your local data. Your existing data has not been changed.</p>
+          <button class="btn btn-primary" id="retry-initialization">Reload LibreLog</button>
+        </main>
+      `;
+      document.getElementById('retry-initialization')?.addEventListener('click', () => window.location.reload());
+      return;
+    }
+    document.body.innerHTML = '<main class="page-container"><h1>LibreLog could not start</h1><p>Please reload and try again. Your local data has not been cleared.</p></main>';
   }
 }
 
-async function applyTheme() {
+async function applyTheme({
+  mutationGeneration = captureDataMutationGeneration(),
+} = {}) {
   let theme = (await getSetting('theme')) || 'compline';
   // Migrate old theme names
   const themeMap = { dark: 'compline', light: 'lauds', amoled: 'vigil' };
   if (themeMap[theme]) {
     theme = themeMap[theme];
-    await setSetting('theme', theme);
+    await setSetting('theme', theme, { mutationGeneration });
   }
   if (theme === 'compline') {
     document.documentElement.removeAttribute('data-theme');
@@ -110,7 +152,6 @@ function renderShell() {
   document.body.innerHTML = `
     <div id="app" class="app">
       <a href="#main-content" class="sr-only skip-link">Skip to main content</a>
-      <main id="main-content" class="page-container" tabindex="-1"></main>
       <nav class="bottom-nav" role="navigation" aria-label="Main navigation">
         <div class="navbar-brand" aria-hidden="true">
           <img src="/icon.svg" alt="" class="brand-logo" />
@@ -123,6 +164,7 @@ function renderShell() {
           </a>
         `).join('')}
       </nav>
+      <main id="main-content" class="page-container" tabindex="-1"></main>
     </div>
   `;
 
@@ -145,6 +187,11 @@ function renderShell() {
       }
     });
   });
+
+  document.querySelector('.skip-link')?.addEventListener('click', event => {
+    event.preventDefault();
+    document.getElementById('main-content')?.focus();
+  });
 }
 
 async function handleRoute() {
@@ -159,6 +206,9 @@ async function handleRoute() {
   }
 
   currentRoute = route;
+
+  // Dialogs are page-owned. Never leave one interactive over a new route.
+  closeModal({ force: true, immediate: true, restoreFocus: false, reason: 'route-change' });
 
   // Update nav active state and aria-current
   document.querySelectorAll('.nav-item').forEach(el => {
@@ -191,7 +241,14 @@ async function handleRoute() {
       return;
     }
     if (typeof cleanup === 'function') activePageCleanup = cleanup;
-    requestAnimationFrame(() => container.focus({ preventScroll: true }));
+    requestAnimationFrame(() => {
+      if (sequence !== routeSequence || !container.isConnected) return;
+      // Route focus should announce the new page, but must not pull focus out
+      // of a control the user has already reached while rendering settles.
+      if (!container.contains(document.activeElement)) {
+        container.focus({ preventScroll: true });
+      }
+    });
   } catch (err) {
     if (sequence !== routeSequence || !container.isConnected) return;
     console.error(`Error rendering ${route} page:`, err);

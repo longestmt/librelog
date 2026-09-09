@@ -1,3 +1,5 @@
+import { hasRemoteProviderConsent } from './privacy.js';
+
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 export class IntegrationError extends Error {
@@ -43,6 +45,11 @@ function safeError(provider, code, status = null) {
       provider, code, status, retryable: false,
     });
   }
+  if (code === 'consent-required') {
+    return new IntegrationError(`${provider} is off until you enable it.`, {
+      provider, code, status, retryable: false,
+    });
+  }
   return new IntegrationError(`${provider} is not available.`, {
     provider, code: 'network', status, retryable: true,
   });
@@ -66,7 +73,7 @@ function waitForRetry(delayMs, signal, provider) {
   });
 }
 
-async function requestOnce({ provider, url, init, signal, timeoutMs }) {
+async function requestOnce({ provider, url, init, signal, timeoutMs, responseType }) {
   const controller = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -82,7 +89,9 @@ async function requestOnce({ provider, url, init, signal, timeoutMs }) {
     if (!response.ok) throw safeError(provider, 'http', response.status);
 
     try {
-      const data = await response.json();
+      const data = responseType === 'text'
+        ? await response.text()
+        : await response.json();
       return { data, status: response.status, headers: response.headers };
     } catch {
       throw safeError(provider, 'invalid-response', response.status);
@@ -102,21 +111,26 @@ async function requestOnce({ provider, url, init, signal, timeoutMs }) {
  * Get JSON from one remote integration.
  * The function never puts response text, request data, or a URL in an error.
  */
-export async function requestJSON({
+async function requestRemote({
   provider,
   url,
   init = {},
   signal = null,
+  consentKey = null,
+  responseType = 'json',
   timeoutMs = 10_000,
   maxRetries = 0,
   retryDelayMs = 250,
 }) {
   if (!provider || !url) throw new Error('Integration request requires a provider and URL');
+  if (consentKey && !(await hasRemoteProviderConsent(consentKey))) {
+    throw safeError(provider, 'consent-required');
+  }
   const retryLimit = Math.max(0, Math.min(2, Number(maxRetries) || 0));
 
   for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
     try {
-      return await requestOnce({ provider, url, init, signal, timeoutMs });
+      return await requestOnce({ provider, url, init, signal, timeoutMs, responseType });
     } catch (error) {
       if (!(error instanceof IntegrationError)
         || !error.retryable
@@ -128,6 +142,16 @@ export async function requestJSON({
     }
   }
   throw safeError(provider, 'network');
+}
+
+/** Make a consent-gated request whose successful body is JSON. */
+export function requestJSON(options) {
+  return requestRemote({ ...options, responseType: 'json' });
+}
+
+/** Make a consent-gated request whose successful body is plain text. */
+export function requestText(options) {
+  return requestRemote({ ...options, responseType: 'text' });
 }
 
 export function getSafeIntegrationMessage(error, fallback = 'The integration request failed.') {

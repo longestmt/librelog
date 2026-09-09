@@ -93,6 +93,7 @@ export async function generateClarifications(foods, originalMessages = [], optio
       temperature: 0.2,
       jsonMode: true,
       signal: options.signal,
+      mutationGeneration: options.mutationGeneration,
     });
 
     if (!response.content) {
@@ -110,7 +111,9 @@ export async function generateClarifications(foods, originalMessages = [], optio
       const config = await getAIConfig();
       const tokens = response.usage.totalTokens || 0;
       const cost = config.provider === 'anthropic' ? tokens * 0.000003 : tokens * 0.000005;
-      await logUsage(config.provider, tokens, cost);
+      await logUsage(config.provider, tokens, cost, {
+        mutationGeneration: response.mutationGeneration,
+      });
     }
 
     return { questions: normalizeQuestions(parsed.questions, foods.length) };

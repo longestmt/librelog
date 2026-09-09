@@ -24,8 +24,8 @@
 
   --text-primary: #f0efeb;
   --text-secondary: #b4bcc4;
-  --text-muted: #8b919a;
-  --text-faint: #515761;
+  --text-muted: #9aa2ac;
+  --text-faint: #848c96;
 
   --accent: #d4ccb4;
   --accent-hover: #ccc4b0;
@@ -38,7 +38,7 @@
   --danger-hover: #c4a0a0;
   --info: #b4c0c8;
 
-  --border: #2a2e34;
+  --border: #454b54;
   --border-focus: #d4ccb4;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, .3);
@@ -59,8 +59,8 @@
   --sp-16: 64px;
 
   /* Typography */
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   --text-xs: 0.75rem;
   --text-sm: 0.8125rem;
@@ -111,23 +111,23 @@
   --bg-active: #c8c4bc;
 
   --text-primary: #1a1d21;
-  --text-secondary: #5a6b7a;
-  --text-muted: #7a6d5a;
-  --text-faint: #9a9791;
+  --text-secondary: #4e5d69;
+  --text-muted: #625846;
+  --text-faint: #6f6b64;
 
-  --accent: #8b7e52;
-  --accent-hover: #7a6e47;
+  --accent: #6f6237;
+  --accent-hover: #62572f;
   --accent-text: #f0efeb;
 
   --success: #5a6b5a;
   --success-text: #f0efeb;
-  --warning: #8b7e52;
-  --danger: #8b6666;
-  --danger-hover: #7a5858;
-  --info: #5a6b7a;
+  --warning: #6f6237;
+  --danger: #754c4c;
+  --danger-hover: #674141;
+  --info: #4e5d69;
 
-  --border: #e0dcd4;
-  --border-focus: #8b7e52;
+  --border: #c4bfb5;
+  --border-focus: #6f6237;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, .06);
   --shadow-md: 0 4px 12px rgba(0, 0, 0, .08);
@@ -148,8 +148,8 @@
 
   --text-primary: #f0efeb;
   --text-secondary: #b4bcc4;
-  --text-muted: #8b919a;
-  --text-faint: #515761;
+  --text-muted: #9aa2ac;
+  --text-faint: #848c96;
 
   --accent: #d4ccb4;
   --accent-hover: #ccc4b0;
@@ -162,7 +162,7 @@
   --danger-hover: #c4a0a0;
   --info: #b4c0c8;
 
-  --border: #1a1a1a;
+  --border: #3f454d;
   --border-focus: #d4ccb4;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, .6);
@@ -191,6 +191,33 @@ body {
   overflow-x: hidden;
 }
 
+/* Interactive controls use a dependable pointer target even when a component
+   renders a compact visual treatment. Checkboxes and radio buttons keep their
+   native dimensions and receive their target from their labels. */
+button,
+[role="button"],
+a.btn {
+  min-height: 44px;
+}
+
+button,
+a.btn.btn-icon {
+  min-width: 44px;
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+select,
+textarea {
+  min-height: 44px;
+}
+
+.btn-primary,
+.fab,
+.meal-add-btn,
+.nav-item {
+  min-height: 48px;
+}
+
 #app {
   display: flex;
   flex-direction: column;
@@ -217,8 +244,19 @@ body {
 
 /* ---------- Focus ---------- */
 :focus-visible {
-  outline: 2px solid var(--border-focus);
-  outline-offset: 2px;
+  outline: 3px solid var(--border-focus);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
 }
 
 /* ---------- Selection ---------- */
@@ -348,6 +386,104 @@ body {
   font-weight: var(--weight-semibold);
   font-size: var(--text-sm);
   box-shadow: var(--shadow-lg);
+}
+
+/* ---------- Progress and history accessibility ---------- */
+.chart-note {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+.week-chart .bar-column.missing .bar-gap,
+.week-chart .bar-column.in-progress .bar-gap,
+.week-chart .bar-column.unknown .bar-gap {
+  width: min(40px, 80%);
+  height: 2px;
+  margin-bottom: 1px;
+  border-top: 2px dashed var(--text-muted);
+}
+
+.week-chart .bar-column.in-progress .bar {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--accent),
+    var(--accent) 5px,
+    transparent 5px,
+    transparent 9px
+  );
+  border: 1px solid var(--accent);
+}
+
+.bar-column .bar-status {
+  position: absolute;
+  top: 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+}
+
+.month-heatmap .heatmap-day.in-progress {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--accent),
+    var(--accent) 4px,
+    var(--bg-elevated) 4px,
+    var(--bg-elevated) 7px
+  );
+  outline: 1px solid var(--accent);
+}
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  margin-top: var(--sp-3);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.chart-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.chart-legend i {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+
+.legend-logged {
+  background: var(--accent);
+}
+
+.legend-in-progress {
+  background: linear-gradient(135deg, var(--accent) 50%, var(--bg-elevated) 50%);
+}
+
+.legend-missing {
+  background: var(--bg-elevated);
+}
+
+.meal-history-review {
+  display: grid;
+  gap: var(--sp-2);
+  margin: var(--sp-4) 0;
+  padding-left: var(--sp-5);
+}
+
+.meal-history-review li {
+  padding-left: var(--sp-1);
+}
+
+.meal-history-review li span {
+  float: right;
+  margin-left: var(--sp-3);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
 }
 
 .flex {

@@ -6,6 +6,8 @@
 import { getAll, getByIndex, getSetting } from '../data/db.js';
 import * as openfoodfacts from '../integrations/openfoodfacts.js';
 import { getCached, setCache } from '../integrations/cache.js';
+import { hasRemoteProviderConsent } from '../integrations/privacy.js';
+import { captureDataMutationGeneration } from '../data/operation-locks.js';
 
 let usdaModule = null;
 async function getUsda() {
@@ -78,7 +80,8 @@ function calculateRelevance(food, query) {
   if (foodLower.startsWith(queryLower)) return 500;
 
   // Word boundary match: medium score
-  const wordBoundaryRegex = new RegExp(`\\b${query}`, 'i');
+  const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const wordBoundaryRegex = new RegExp(`\\b${escapedQuery}`, 'i');
   if (wordBoundaryRegex.test(food)) return 300;
 
   // Contains query: lower score
@@ -99,9 +102,11 @@ function calculateRelevance(food, query) {
  * @param {number} [options.offPage=1] - OFF page number for pagination
  * @param {number} [options.usdaPage=1] - USDA page number for pagination
  * @param {AbortSignal} [options.signal] - Stops remote requests
- * @returns {Promise<Array>} Combined results sorted by relevance
+ * @param {boolean} [options.includeStatus=false] - Return source status alongside foods
+ * @returns {Promise<Array|{foods: Array, status: Object}>} Combined results sorted by relevance
  */
 async function searchFoods(query, options = {}) {
+  const mutationGeneration = captureDataMutationGeneration();
   const {
     localOnly = false,
     limit = 50,
@@ -110,10 +115,19 @@ async function searchFoods(query, options = {}) {
     offPage = 1,
     usdaPage = 1,
     signal = null,
+    includeStatus = false,
   } = options;
 
+  const status = {
+    local: { state: sources.local ? 'ok' : 'disabled' },
+    off: { state: sources.off && !localOnly ? 'pending' : 'disabled' },
+    usda: { state: sources.usda && !localOnly ? 'pending' : 'disabled' },
+  };
+
+  const finish = foods => includeStatus ? { foods, status } : foods;
+
   if (!query || query.trim().length === 0) {
-    return [];
+    return finish([]);
   }
 
   const queryTrim = query.trim();
@@ -147,112 +161,159 @@ async function searchFoods(query, options = {}) {
 
     // If localOnly, stop here
     if (localOnly) {
-      return results
+      return finish(results
         .sort((a, b) => (b._relevance || 0) - (a._relevance || 0))
         .slice(0, limit)
         .map(food => {
           delete food._relevance;
           return food;
-        });
+        }));
     }
 
     // Search Open Food Facts API
     if (sources.off) {
-      const cacheKey = `search_${queryTrim}_p${offPage}`;
-      let apiResults = await getCached('openfoodfacts', cacheKey);
+      if (!(await hasRemoteProviderConsent('openfoodfacts'))) {
+        status.off = { state: 'consent-required' };
+      } else {
+        try {
+          const cacheKey = `search_${queryTrim}_p${offPage}`;
+          let apiResults = await getCached('openfoodfacts', cacheKey);
+          const fromCache = Boolean(apiResults);
 
-      if (!apiResults) {
-        apiResults = await openfoodfacts.searchFoods(
-          queryTrim,
-          offPage,
-          apiPageSize,
-          { signal },
-        );
+          if (!apiResults) {
+            apiResults = await openfoodfacts.searchFoods(
+              queryTrim,
+              offPage,
+              apiPageSize,
+              { signal, throwOnError: true },
+            );
 
-        if (apiResults && apiResults.length > 0) {
-          await setCache('openfoodfacts', cacheKey, apiResults, 86400);
-        }
-      }
-
-      if (apiResults && apiResults.length > 0) {
-        for (const apiFood of apiResults) {
-          if (!apiFood.id) {
-            apiFood.id = `off-${apiFood.barcode?.ean13 || Math.random().toString(36).slice(2, 11)}`;
+            if (apiResults && apiResults.length > 0) {
+              await setCache('openfoodfacts', cacheKey, apiResults, 86400, {
+                mutationGeneration,
+              });
+            }
           }
-          const nameLower = apiFood.name?.toLowerCase();
-          const barcode = apiFood.barcode?.ean13;
+          status.off = { state: fromCache ? 'cached' : 'ok' };
 
-          if (seenNames.has(nameLower) || (barcode && seenBarcodes.has(barcode))) {
-            continue;
+          if (apiResults && apiResults.length > 0) {
+            for (const apiFood of apiResults) {
+              if (!apiFood.id) {
+                apiFood.id = `off-${apiFood.barcode?.ean13 || Math.random().toString(36).slice(2, 11)}`;
+              }
+              const nameLower = apiFood.name?.toLowerCase();
+              const barcode = apiFood.barcode?.ean13;
+
+              if (seenNames.has(nameLower) || (barcode && seenBarcodes.has(barcode))) {
+                continue;
+              }
+
+              const isDuplicate = results.some(existing =>
+                areSimilarNames(existing.name, apiFood.name)
+              );
+
+              if (isDuplicate) {
+                continue;
+              }
+
+              apiFood._relevance = calculateRelevance(apiFood.name, queryTrim);
+              results.push(apiFood);
+
+              if (nameLower) {
+                seenNames.add(nameLower);
+              }
+              if (barcode) {
+                seenBarcodes.add(barcode);
+              }
+            }
           }
-
-          const isDuplicate = results.some(existing =>
-            areSimilarNames(existing.name, apiFood.name)
-          );
-
-          if (isDuplicate) {
-            continue;
-          }
-
-          apiFood._relevance = calculateRelevance(apiFood.name, queryTrim);
-          results.push(apiFood);
-
-          if (nameLower) {
-            seenNames.add(nameLower);
-          }
-          if (barcode) {
-            seenBarcodes.add(barcode);
-          }
+        } catch (error) {
+          if (error?.code === 'cancelled') throw error;
+          status.off = integrationFailureStatus(error);
         }
       }
     }
 
     // Search USDA FoodData Central (if API key configured)
     if (sources.usda) {
-      try {
-        const usda = await getUsda();
-        if (usda) {
-          const usdaCacheKey = `usda_search_${queryTrim}_p${usdaPage}`;
-          let usdaResults = await getCached('usda', usdaCacheKey);
+      if (!(await hasRemoteProviderConsent('usda'))) {
+        status.usda = { state: 'consent-required' };
+      } else {
+        try {
+          const usda = await getUsda();
+          if (usda) {
+            const usdaCacheKey = `usda_search_${queryTrim}_p${usdaPage}`;
+            let usdaResults = await getCached('usda', usdaCacheKey);
+            const fromCache = Boolean(usdaResults);
 
-          if (!usdaResults) {
-            usdaResults = await usda.searchFoods(queryTrim, usdaPage, apiPageSize, { signal });
+            if (!usdaResults) {
+              usdaResults = await usda.searchFoods(queryTrim, usdaPage, apiPageSize, {
+                signal,
+                throwOnError: true,
+              });
+              if (usdaResults && usdaResults.length > 0) {
+                await setCache('usda', usdaCacheKey, usdaResults, 30 * 86400, {
+                  mutationGeneration,
+                });
+              }
+            }
+            status.usda = { state: fromCache ? 'cached' : 'ok' };
+
             if (usdaResults && usdaResults.length > 0) {
-              await setCache('usda', usdaCacheKey, usdaResults, 30 * 86400);
-            }
-          }
+              for (const usdaFood of usdaResults) {
+                if (!usdaFood.id) continue;
+                const nameLower = usdaFood.name?.toLowerCase();
+                const isDuplicate = seenNames.has(nameLower) ||
+                  results.some(existing => areSimilarNames(existing.name, usdaFood.name));
+                if (isDuplicate) continue;
 
-          if (usdaResults && usdaResults.length > 0) {
-            for (const usdaFood of usdaResults) {
-              if (!usdaFood.id) continue;
-              const nameLower = usdaFood.name?.toLowerCase();
-              const isDuplicate = seenNames.has(nameLower) ||
-                results.some(existing => areSimilarNames(existing.name, usdaFood.name));
-              if (isDuplicate) continue;
-
-              usdaFood._relevance = calculateRelevance(usdaFood.name, queryTrim);
-              results.push(usdaFood);
-              if (nameLower) seenNames.add(nameLower);
+                usdaFood._relevance = calculateRelevance(usdaFood.name, queryTrim);
+                results.push(usdaFood);
+                if (nameLower) seenNames.add(nameLower);
+              }
             }
+          } else {
+            status.usda = { state: 'unavailable' };
           }
+        } catch (err) {
+          if (err?.code === 'cancelled') throw err;
+          console.warn('USDA search failed:', err);
+          status.usda = integrationFailureStatus(err);
         }
-      } catch (err) {
-        console.warn('USDA search failed:', err);
       }
     }
 
     // Sort by relevance and return limited results
-    return results
+    return finish(results
       .sort((a, b) => (b._relevance || 0) - (a._relevance || 0))
       .slice(0, limit)
       .map(food => {
         delete food._relevance;
         return food;
-      });
+      }));
   } catch (error) {
+    if (error?.code === 'cancelled') throw error;
     console.error('Error searching foods:', error);
-    return results.slice(0, limit);
+    status.local = integrationFailureStatus(error);
+    return finish(results.slice(0, limit));
   }
+}
+
+function integrationFailureStatus(error) {
+  return {
+    state: error?.code === 'consent-required' ? 'consent-required' : 'error',
+    code: error?.code || 'unknown',
+    retryable: Boolean(error?.retryable),
+    message: error?.message || 'This food source is temporarily unavailable.',
+  };
+}
+
+/**
+ * Search with per-source availability details for UIs that need to distinguish
+ * no matches from consent, offline, and provider failures.
+ */
+async function searchFoodsWithStatus(query, options = {}) {
+  return searchFoods(query, { ...options, includeStatus: true });
 }
 
 /**
@@ -378,6 +439,7 @@ async function getFavoriteFoods(limit = 10) {
 
 export {
   searchFoods,
+  searchFoodsWithStatus,
   getRecentFoods,
   getFavoriteFoods
 };
