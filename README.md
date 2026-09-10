@@ -47,6 +47,7 @@ You can encrypt portable and WebDAV backups with a passphrase.
 - **Offline-first** — Works without internet via service worker
 - **Local-first storage** — Core data stays in IndexedDB unless you use an explicit remote feature
 - **Provider consent boundaries** — Food databases remain local-only until their specific network access is enabled
+- **Optional E2EE synchronization** — Connect to a self-hosted LibreSync relay; see [synchronization details](docs/SYNCHRONIZATION.md)
 - **Auto-backup** — Verified snapshots every 6 hours to native filesystem or browser storage
 - **JSON export/import** — Private exports plus merge-first, previewed imports
 - **Encrypted backup** — Optional passphrase encryption for portable and WebDAV files

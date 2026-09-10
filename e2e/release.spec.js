@@ -303,6 +303,8 @@ test('credential-free backup restores into a clean browser profile', async ({ pa
   const backup = JSON.parse(await readFile(backupPath, 'utf8'));
   expect(backup.secretsExcluded).toBe(true);
   expect(JSON.stringify(backup)).not.toContain('test-secret-that-must-not-export');
+  expect(backup.stores.settings.map(record => record.key)).toContain('ai_provider');
+  expect(backup.stores.settings.map(record => record.key)).not.toContain('privacyConsent_ai_openai');
   expect(backup.stores.meals).toHaveLength(1);
 
   const cleanContext = await browser.newContext({ serviceWorkers: 'block' });
@@ -399,6 +401,24 @@ test('a favorite usual serving can be found and logged again from meal history',
   await expect(page.getByRole('button', { name: /Egg, large, 2 large, 140 calories/i })).toHaveCount(2);
 });
 
+test('LibreSync settings require consent and retain local connection preferences', async ({ page }) => {
+  await preparePage(page);
+  await page.goto('/#/settings', { waitUntil: 'commit' });
+  await expect(page.getByRole('heading', { name: 'LibreSync' })).toBeVisible();
+  await expect(page.locator('#libresync-status')).toHaveText('Not connected');
+  await expect(page.getByRole('button', { name: 'Create New Vault' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Join Existing Vault' })).toBeVisible();
+
+  await page.locator('#libresync-consent').check();
+  await page.locator('#libresync-server-url').fill('http://localhost:8787');
+  await page.locator('#libresync-device-label').fill('Release test browser');
+  await page.getByRole('button', { name: 'Save Sync Settings' }).click();
+  await expect(page.getByRole('status')).toContainText('LibreSync settings saved');
+  await expect(page.locator('#libresync-consent')).toBeChecked();
+  await expect(page.locator('#libresync-server-url')).toHaveValue('http://localhost:8787');
+  await expect(page.locator('#libresync-device-label')).toHaveValue('Release test browser');
+});
+
 for (const route of ['diary', 'search', 'history', 'insights', 'weight', 'recipes', 'settings']) {
   test(`${route} has no automatically detectable WCAG A or AA violations`, async ({ page }) => {
     await preparePage(page);
@@ -481,6 +501,42 @@ test('route changes close page-owned dialogs and restore the app background', as
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(page.locator('#app')).not.toHaveAttribute('aria-hidden', 'true');
   expect(await page.locator('#app').evaluate(app => app.inert)).toBe(false);
+});
+
+test('remote commits refresh the visible route once without dismissing its dialog', async ({ page }) => {
+  await preparePage(page);
+  await page.goto('/#/settings', { waitUntil: 'commit' });
+  await page.getByRole('button', { name: 'Export Encrypted Data' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Export Encrypted Data' });
+  await expect(dialog).toBeVisible();
+
+  await page.evaluate(() => {
+    window.__remoteRefreshReplacements = 0;
+    window.__remoteRefreshObserver = new MutationObserver(records => {
+      window.__remoteRefreshReplacements += records.filter(record => (
+        [...record.addedNodes, ...record.removedNodes]
+          .some(node => node instanceof HTMLElement && node.id === 'main-content')
+      )).length;
+    });
+    window.__remoteRefreshObserver.observe(document.getElementById('app'), { childList: true });
+    window.dispatchEvent(new CustomEvent('librelog:remote-mutation', {
+      detail: {
+        source: 'remote',
+        sources: ['remote'],
+        entities: [{ entityType: 'foods', entityId: 'remote-food' }],
+      },
+    }));
+  });
+  await page.waitForTimeout(100);
+  await expect(dialog).toBeVisible();
+  expect(await page.evaluate(() => window.__remoteRefreshReplacements)).toBe(0);
+
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+  await expect.poll(() => page.evaluate(() => window.__remoteRefreshReplacements)).toBe(1);
+  await page.waitForTimeout(250);
+  expect(await page.evaluate(() => window.__remoteRefreshReplacements)).toBe(1);
+  await expect(page.getByRole('main', { name: 'Settings' })).toBeVisible();
+  await page.evaluate(() => window.__remoteRefreshObserver.disconnect());
 });
 
 test('nutrition history shows missing days as gaps and excludes today from averages', async ({ page }) => {
@@ -616,7 +672,7 @@ test('a delayed destructive restore cannot be dismissed or close a newer dialog'
   await webdavUsername.fill('release-test');
   await webdavPassword.fill('release-test-password');
   await page.locator('#webdav-privacy-consent').check();
-  await page.getByRole('button', { name: 'Connect' }).click();
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Connection successful');
 
   await page.getByRole('button', { name: 'Restore Backup', exact: true }).click();
@@ -637,7 +693,7 @@ test('a delayed destructive restore cannot be dismissed or close a newer dialog'
   await expect(newerDialog).toBeVisible();
 });
 
-test('a delayed Clear All stays single-flight and cannot close a newer dialog', async ({ page }) => {
+test('a delayed device clear stays single-flight and cannot close a newer dialog', async ({ page }) => {
   await preparePage(page);
   await page.goto('/#/settings', { waitUntil: 'commit' });
   await page.evaluate(async () => {
@@ -652,14 +708,15 @@ test('a delayed Clear All stays single-flight and cannot close a newer dialog', 
     }
   });
 
-  await page.getByRole('button', { name: 'Clear All Data' }).click();
-  const clearDialog = page.getByRole('dialog', { name: 'Clear All Data?' });
-  const clearButton = clearDialog.getByRole('button', { name: 'Delete Everything' });
+  await page.getByRole('button', { name: 'Clear This Device and Disconnect' }).click();
+  const clearDialog = page.getByRole('dialog', { name: 'Clear This Device and Disconnect?' });
+  await clearDialog.locator('#sync-confirmation').fill('CLEAR THIS DEVICE');
+  const clearButton = clearDialog.getByRole('button', { name: 'Clear This Device' });
   await clearButton.evaluate(button => {
     button.click();
     button.click();
   });
-  await expect(clearDialog.getByRole('button', { name: 'Deleting...' })).toBeDisabled();
+  await expect(clearDialog.getByRole('button', { name: 'Clearing…' })).toBeDisabled();
   await expect.poll(() => page.evaluate(async () => {
     const state = await navigator.locks.query();
     return state.pending.filter(lock => lock.name === 'librelog:data-lifecycle:v1').length;
@@ -676,11 +733,11 @@ test('a delayed Clear All stays single-flight and cannot close a newer dialog', 
   await expect(newerDialog).toBeVisible();
 
   await page.evaluate(() => window.__clearTestRelease());
-  await expect(page.getByRole('status').filter({ hasText: 'All data cleared' })).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: 'This device was cleared and disconnected' })).toBeVisible();
   await expect(newerDialog).toBeVisible();
 });
 
-test('a failed Clear All resumes automatic backups and preserves current data', async ({ page }) => {
+test('a failed device clear resumes automatic backups and preserves current data', async ({ page }) => {
   await preparePage(page);
   await page.goto('/#/settings', { waitUntil: 'commit' });
   await page.evaluate(async () => {
@@ -720,10 +777,11 @@ test('a failed Clear All resumes automatic backups and preserves current data', 
     };
   });
 
-  await page.getByRole('button', { name: 'Clear All Data' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Clear All Data?' });
-  await dialog.getByRole('button', { name: 'Delete Everything' }).click();
-  await expect(page.getByRole('status').filter({ hasText: 'Failed to clear data' })).toBeVisible();
+  await page.getByRole('button', { name: 'Clear This Device and Disconnect' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Clear This Device and Disconnect?' });
+  await dialog.locator('#sync-confirmation').fill('CLEAR THIS DEVICE');
+  await dialog.getByRole('button', { name: 'Clear This Device' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Failed to clear this device' })).toBeVisible();
 
   await expect.poll(() => page.evaluate(async () => {
     const database = await new Promise((resolve, reject) => {

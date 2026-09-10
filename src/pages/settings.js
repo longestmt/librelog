@@ -24,12 +24,7 @@ import {
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { escapeHTML } from '../utils/sanitize.js';
-import {
-  clearAllDataAndBackups,
-  initAutoBackup,
-  replaceAllDataWithSafetyBackup,
-  stopAutoBackup,
-} from '../data/auto-backup.js';
+import { initAutoBackup, replaceAllDataWithSafetyBackup } from '../data/auto-backup.js';
 import { normalizeOllamaUrl } from '../integrations/ollama.js';
 import { saveAISettingsSafely } from '../integrations/ai-settings.js';
 import { captureDataMutationGeneration } from '../data/operation-locks.js';
@@ -43,13 +38,33 @@ import {
   saveUsdaApiKey,
   unlockCredentialStore,
 } from '../data/credentials.js';
+import {
+  clearThisDeviceAndDisconnect,
+  createLibreSyncVault,
+  deleteLibreLogDataEverywhere,
+  deleteLibreSyncVault,
+  disconnectLibreSync,
+  getLibreSyncClient,
+  getLibreSyncPreferences,
+  joinLibreSyncVault,
+  setLibreSyncPreferences,
+  syncLibreLogNow,
+} from '../sync/service.js';
+import { captureLibreLogEntityContext } from '../sync/entity-context.js';
 
 const APP_VERSION = '0.4.2';
 const LICENSE = 'AGPL-3.0';
 
 export async function renderSettingsPage(container, queryString) {
+  let unsubscribeSyncStatus = null;
+
   async function render() {
     const mutationGeneration = captureDataMutationGeneration();
+    const [displayedGoalsContext, initialThemeContext, displayedUnitContext] = await Promise.all([
+      captureLibreLogEntityContext('settings', 'nutritionGoals'),
+      captureLibreLogEntityContext('settings', 'theme'),
+      captureLibreLogEntityContext('settings', 'unit'),
+    ]);
     const goals = await getGoals();
     const credentialEncryptionEnabled = await isCredentialEncryptionEnabled();
     const credentialStoreUnlocked = await isCredentialStoreUnlocked();
@@ -68,12 +83,21 @@ export async function renderSettingsPage(container, queryString) {
     const webdavPrivacyConsent = await getSetting('privacyConsent_webdav', false);
     const aiUsageLog = await getSetting('ai_usage_log') || [];
     const monthlyUsage = computeMonthlyUsage(aiUsageLog);
+    let displayedThemeContext = initialThemeContext;
     let theme = await getSetting('theme') || 'compline';
+    const unit = await getSetting('unit') || 'metric';
     // Migrate old theme names
     const themeMap = { dark: 'compline', light: 'lauds', amoled: 'vigil' };
     if (themeMap[theme]) {
       theme = themeMap[theme];
-      await setSetting('theme', theme, { mutationGeneration });
+      await setSetting('theme', theme, {
+        context: displayedThemeContext,
+        mutationGeneration,
+      });
+      // Keep the context and value used by the rendered controls from the same
+      // materialized version after the migration write.
+      displayedThemeContext = await captureLibreLogEntityContext('settings', 'theme');
+      theme = await getSetting('theme') || theme;
     }
     const webdavConfig = await getWebDavConfig();
     const webdavPasswordConfigured = await hasStoredCredential('webdavPassword');
@@ -87,6 +111,12 @@ export async function renderSettingsPage(container, queryString) {
     const lastPortableBackupTime = await getSetting('lastPortableBackupTime', null);
     const portableBackupDue = !lastPortableBackupTime
       || Date.now() - Number(lastPortableBackupTime) > 30 * 24 * 60 * 60 * 1000;
+    const syncClient = await getLibreSyncClient();
+    const [syncPreferences, syncStatus] = await Promise.all([
+      getLibreSyncPreferences(),
+      syncClient.getStatus(),
+    ]);
+    const syncServerUrl = syncStatus.serverUrl || syncPreferences.serverUrl;
 
     container.innerHTML = `
       <div class="settings-page">
@@ -145,6 +175,77 @@ export async function renderSettingsPage(container, queryString) {
                 <button class="theme-chip ${theme === 'vigil' ? 'active' : ''}" data-theme="vigil">Vigil</button>
                 <button class="theme-chip ${theme === 'lauds' ? 'active' : ''}" data-theme="lauds">Lauds</button>
               </div>
+              <label class="setting-input">
+                <span class="setting-label">Default Units</span>
+                <select id="default-unit" aria-label="Default measurement units">
+                  <option value="metric" ${unit === 'metric' ? 'selected' : ''}>Metric</option>
+                  <option value="imperial" ${unit === 'imperial' ? 'selected' : ''}>Imperial</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section class="settings-section" aria-labelledby="libresync-heading">
+            <h2 class="section-title" id="libresync-heading">LibreSync</h2>
+            <div class="settings-group">
+              <p class="setting-hint">End-to-end encrypted synchronization for LibreLog. The relay stores encrypted operations, while vault keys and device credentials stay in this browser profile.</p>
+              <label class="setting-input">
+                <span class="setting-label">Remote Data Consent
+                  <span class="setting-hint">When connected, LibreLog sends encrypted foods, meals, recipes, measurements, notes, templates, goals, theme, and units to the server you choose. Backups remain a separate feature.</span>
+                </span>
+                <span><input type="checkbox" id="libresync-consent" ${syncPreferences.consent ? 'checked' : ''} ${syncStatus.connected ? 'disabled' : ''}> I consent to this encrypted remote data transfer.</span>
+              </label>
+              <label class="setting-input">
+                <span class="setting-label">Server URL
+                  <span class="setting-hint">Use HTTPS in production. Plain HTTP is accepted only for localhost development.</span>
+                </span>
+                <input type="url" id="libresync-server-url" placeholder="https://sync.example.com" value="${escapeHTML(syncServerUrl)}" ${syncStatus.connected ? 'disabled' : ''}>
+              </label>
+              <label class="setting-input">
+                <span class="setting-label">Device Label</span>
+                <input type="text" id="libresync-device-label" maxlength="100" value="${escapeHTML(syncStatus.connected ? syncStatus.deviceLabel : syncPreferences.deviceLabel)}" ${syncStatus.connected ? 'disabled' : ''}>
+              </label>
+
+              <div class="webdav-status" aria-live="polite">
+                <span class="status-label">Status:</span>
+                <span id="libresync-status" class="status-badge ${syncStatus.connected ? 'connected' : 'disconnected'}">${escapeHTML(syncStatus.connected ? syncStateLabel(syncStatus.automaticSync) : 'Not connected')}</span>
+              </div>
+              <div class="ai-cost-stats" aria-label="LibreSync counts">
+                <div class="ai-cost-stat"><span class="sync-count-label">Pending</span><span class="ai-cost-value" id="libresync-pending">${syncStatus.pendingCount}</span></div>
+                <div class="ai-cost-stat"><span class="sync-count-label">Needs Update</span><span class="ai-cost-value" id="libresync-quarantined">${syncStatus.quarantinedCount}</span></div>
+                <div class="ai-cost-stat"><span class="sync-count-label">Conflicts</span><span class="ai-cost-value" id="libresync-conflicts">${syncStatus.conflictCount}</span></div>
+              </div>
+              <p class="setting-hint" id="libresync-last-sync">Last successful sync: ${escapeHTML(formatSyncDate(syncStatus.lastSuccessfulSync))}</p>
+              ${syncStatus.lastError ? `<p class="setting-hint" id="libresync-last-error">Last attempt: ${escapeHTML(syncStatus.lastError)}</p>` : '<p class="setting-hint" id="libresync-last-error"></p>'}
+
+              ${syncStatus.connected ? `
+                <div class="webdav-actions">
+                  <button class="btn btn-primary btn-small" id="libresync-sync-now">Sync Now</button>
+                  <button class="btn btn-outline btn-small" id="libresync-pair">Pair Another Device</button>
+                  <button class="btn btn-outline btn-small" id="libresync-devices">Manage Devices</button>
+                  <button class="btn btn-outline btn-small" id="libresync-review-conflicts">Review Conflicts (${syncStatus.conflictCount})</button>
+                </div>
+                <p class="setting-hint">Offline changes remain available and sync when this app is open again. Closed-app background sync is not promised. Revoking a device blocks future relay access but cannot erase data or a vault key it already downloaded.</p>
+                <div class="webdav-actions">
+                  <button class="btn btn-outline btn-small" id="libresync-disconnect">Disconnect and Keep Local Data</button>
+                  <button class="btn btn-outline btn-danger btn-small" id="libresync-delete-everywhere">Delete Synced App Data Everywhere</button>
+                  <button class="btn btn-outline btn-danger btn-small" id="libresync-delete-vault">Permanently Delete Remote Vault</button>
+                </div>
+              ` : `
+                <button class="btn btn-outline btn-small" id="libresync-save-preferences">Save Sync Settings</button>
+                <div class="webdav-actions">
+                  <button class="btn btn-primary btn-small" id="libresync-create-vault">Create New Vault</button>
+                </div>
+                <label class="setting-input">
+                  <span class="setting-label">Pairing URI or JSON
+                    <span class="setting-hint">Paste the single-use payload from an authorized LibreLog device. If this device has existing data, LibreLog asks you to save a portable JSON backup. Browsers without direct file saving download it, then ask you to select that file once to verify it.</span>
+                  </span>
+                  <textarea id="libresync-pairing-payload" rows="5" autocomplete="off" spellcheck="false"></textarea>
+                </label>
+                <button class="btn btn-outline btn-small" id="libresync-join-vault">Join Existing Vault</button>
+                <p class="setting-hint">There is no recovery phrase in this version. An authorized connected device is required to pair a new one.</p>
+              `}
+              <p class="setting-hint">Browser-local key storage is protected only by this browser profile and app origin. End-to-end encryption does not protect a compromised device, browser profile, app, or authorized malicious replica.</p>
             </div>
           </section>
 
@@ -300,7 +401,7 @@ export async function renderSettingsPage(container, queryString) {
 
               <button class="btn btn-outline btn-danger" id="clear-btn">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
-                Clear All Data
+                Clear This Device and Disconnect
               </button>
             </div>
           </section>
@@ -407,7 +508,10 @@ export async function renderSettingsPage(container, queryString) {
     `;
 
     // Event listeners
-    document.getElementById('save-goals-btn')?.addEventListener('click', saveGoals);
+    document.getElementById('save-goals-btn')?.addEventListener('click', () => saveGoals({
+      context: displayedGoalsContext,
+      mutationGeneration,
+    }));
     document.getElementById('protect-credentials-btn')?.addEventListener('click', handleProtectCredentials);
     document.getElementById('unlock-credentials-btn')?.addEventListener('click', handleUnlockCredentials);
     document.getElementById('lock-credentials-btn')?.addEventListener('click', () => {
@@ -420,12 +524,37 @@ export async function renderSettingsPage(container, queryString) {
       btn.addEventListener('click', async (e) => {
         const theme = e.currentTarget.dataset.theme;
         applyTheme(theme);
-        await setSetting('theme', theme);
+        await setSetting('theme', theme, {
+          context: displayedThemeContext,
+          mutationGeneration,
+        });
         const themeNames = { compline: 'Compline', vigil: 'Vigil', lauds: 'Lauds' };
         showToast(`Theme changed to ${themeNames[theme] || theme}`);
-        render();
+        await render();
       });
     });
+    document.getElementById('default-unit')?.addEventListener('change', async event => {
+      await setSetting('unit', event.currentTarget.value, {
+        context: displayedUnitContext,
+        mutationGeneration,
+      });
+      showToast('Default units updated');
+      await render();
+    });
+
+    document.getElementById('libresync-save-preferences')?.addEventListener('click', handleSyncPreferences);
+    document.getElementById('libresync-create-vault')?.addEventListener('click', handleCreateVault);
+    document.getElementById('libresync-join-vault')?.addEventListener('click', handleJoinVault);
+    document.getElementById('libresync-sync-now')?.addEventListener('click', handleSyncNow);
+    document.getElementById('libresync-pair')?.addEventListener('click', handleCreatePairing);
+    document.getElementById('libresync-devices')?.addEventListener('click', handleDeviceManager);
+    document.getElementById('libresync-review-conflicts')?.addEventListener('click', handleConflictReview);
+    document.getElementById('libresync-disconnect')?.addEventListener('click', handleSyncDisconnect);
+    document.getElementById('libresync-delete-everywhere')?.addEventListener('click', handleDeleteSyncedData);
+    document.getElementById('libresync-delete-vault')?.addEventListener('click', handleDeleteRemoteVault);
+
+    unsubscribeSyncStatus?.();
+    unsubscribeSyncStatus = syncClient.subscribeStatus(updateSyncStatus);
 
     // AI provider toggle visibility
     document.getElementById('ai-provider')?.addEventListener('change', (e) => {
@@ -547,7 +676,405 @@ export async function renderSettingsPage(container, queryString) {
     document.getElementById('webdav-disconnect')?.addEventListener('click', handleWebDAVDisconnect);
   }
 
-  async function saveGoals() {
+  function syncFormValues() {
+    return {
+      consent: Boolean(document.getElementById('libresync-consent')?.checked),
+      serverUrl: document.getElementById('libresync-server-url')?.value.trim() || '',
+      deviceLabel: document.getElementById('libresync-device-label')?.value.trim() || '',
+    };
+  }
+
+  function updateSyncStatus(status) {
+    const statusElement = container.querySelector('#libresync-status');
+    if (statusElement) {
+      statusElement.textContent = status.connected
+        ? syncStateLabel(status.automaticSync)
+        : 'Not connected';
+      statusElement.classList.toggle('connected', status.connected);
+      statusElement.classList.toggle('disconnected', !status.connected);
+    }
+    const pending = container.querySelector('#libresync-pending');
+    const quarantined = container.querySelector('#libresync-quarantined');
+    const conflicts = container.querySelector('#libresync-conflicts');
+    const lastSync = container.querySelector('#libresync-last-sync');
+    const lastError = container.querySelector('#libresync-last-error');
+    if (pending) pending.textContent = String(status.pendingCount);
+    if (quarantined) quarantined.textContent = String(status.quarantinedCount);
+    if (conflicts) conflicts.textContent = String(status.conflictCount);
+    if (lastSync) lastSync.textContent = `Last successful sync: ${formatSyncDate(status.lastSuccessfulSync)}`;
+    if (lastError) lastError.textContent = status.lastError ? `Last attempt: ${status.lastError}` : '';
+  }
+
+  async function handleSyncPreferences() {
+    try {
+      const values = syncFormValues();
+      await setLibreSyncPreferences(values);
+      showToast('LibreSync settings saved');
+      await render();
+    } catch (error) {
+      showToast(error.message || 'Could not save LibreSync settings');
+    }
+  }
+
+  async function handleCreateVault(event) {
+    const button = event.currentTarget;
+    const values = syncFormValues();
+    if (!values.consent) {
+      showToast('Confirm remote-data consent before creating a vault');
+      return;
+    }
+    if (!values.serverUrl || !values.deviceLabel) {
+      showToast('Enter a server URL and device label');
+      return;
+    }
+    button.disabled = true;
+    button.textContent = 'Creating and Uploading…';
+    try {
+      await setLibreSyncPreferences(values);
+      await createLibreSyncVault(values);
+      showToast('Encrypted LibreSync vault created');
+      await render();
+    } catch (error) {
+      showToast(error.message || 'Could not create the LibreSync vault');
+      button.disabled = false;
+      button.textContent = 'Create New Vault';
+    }
+  }
+
+  async function handleJoinVault(event) {
+    const button = event.currentTarget;
+    const values = syncFormValues();
+    const pairingInput = document.getElementById('libresync-pairing-payload');
+    const pairingPayload = pairingInput?.value.trim() || '';
+    if (!values.consent) {
+      showToast('Confirm remote-data consent before joining a vault');
+      return;
+    }
+    if (!pairingPayload || !values.deviceLabel) {
+      showToast('Enter the pairing payload and a device label');
+      return;
+    }
+    // Remove the secret-bearing payload from the page before any network work.
+    pairingInput.value = '';
+    button.disabled = true;
+    button.textContent = 'Backing Up and Joining…';
+    try {
+      await setLibreSyncPreferences(values);
+      await joinLibreSyncVault(pairingPayload, { deviceLabel: values.deviceLabel });
+      showToast('This device joined the encrypted vault');
+      await render();
+    } catch (error) {
+      showToast(error.message || 'Could not join the LibreSync vault');
+      button.disabled = false;
+      button.textContent = 'Join Existing Vault';
+    }
+  }
+
+  async function handleSyncNow(event) {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Syncing…';
+    try {
+      const result = await syncLibreLogNow();
+      showToast(`Sync complete: ${result.pushed} sent, ${result.pulled} received`);
+      await render();
+    } catch (error) {
+      showToast(error.message || 'Sync failed; local changes remain pending');
+      button.disabled = false;
+      button.textContent = 'Sync Now';
+    }
+  }
+
+  async function copyPairingText(value, button) {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      const temporary = document.createElement('textarea');
+      temporary.value = value;
+      temporary.setAttribute('readonly', '');
+      temporary.style.position = 'fixed';
+      temporary.style.opacity = '0';
+      document.body.appendChild(temporary);
+      temporary.select();
+      const copied = document.execCommand?.('copy');
+      temporary.remove();
+      button.focus();
+      if (!copied) throw new Error('Clipboard access is unavailable');
+    }
+    showToast('Pairing payload copied');
+  }
+
+  async function handleCreatePairing(event) {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Creating…';
+    try {
+      const client = await getLibreSyncClient();
+      const bundle = await client.createInvitation(600);
+      const modal = document.createElement('div');
+      modal.className = 'modal-content confirm-modal';
+      modal.innerHTML = `
+        <div class="modal-header"><h2>Pair Another LibreLog Device</h2></div>
+        <p class="confirm-message">This single-use invitation expires ${escapeHTML(formatSyncDate(bundle.expiresAt))}. It includes the vault key; keep it private and send it only to the device you are pairing.</p>
+        <label class="setting-input"><span class="setting-label">Pairing URI</span>
+          <textarea id="pairing-uri" rows="5" readonly spellcheck="false">${escapeHTML(bundle.uri)}</textarea>
+        </label>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="cancel-btn">Close</button>
+          <button class="btn btn-primary" id="copy-pairing-uri">Copy Pairing URI</button>
+          <button class="btn btn-outline" id="copy-pairing-json">Copy JSON</button>
+        </div>
+      `;
+      openModal(modal);
+      document.getElementById('cancel-btn').addEventListener('click', closeModal);
+      document.getElementById('copy-pairing-uri').addEventListener('click', copyEvent => (
+        copyPairingText(bundle.uri, copyEvent.currentTarget)
+      ));
+      document.getElementById('copy-pairing-json').addEventListener('click', copyEvent => (
+        copyPairingText(bundle.json, copyEvent.currentTarget)
+      ));
+    } catch (error) {
+      showToast(error.message || 'Could not create a pairing invitation');
+    } finally {
+      if (button.isConnected) {
+        button.disabled = false;
+        button.textContent = 'Pair Another Device';
+      }
+    }
+  }
+
+  async function handleDeviceManager() {
+    try {
+      const client = await getLibreSyncClient();
+      const devices = await client.listDevices();
+      const modal = document.createElement('div');
+      modal.className = 'modal-content confirm-modal';
+      modal.innerHTML = `
+        <div class="modal-header"><h2>LibreSync Devices</h2></div>
+        <p class="confirm-message">Revocation blocks future server access. It cannot erase data or invalidate a vault key already downloaded by that device.</p>
+        <div class="settings-group">
+          ${devices.map(device => `
+            <div class="about-item">
+              <span><strong>${escapeHTML(device.label)}</strong><br><span class="setting-hint">${device.current ? 'This device' : escapeHTML(device.deviceId)}${device.revokedAt ? ' — revoked' : ''}</span></span>
+              ${!device.current && !device.revokedAt ? `<button class="btn btn-outline btn-danger btn-small revoke-sync-device" data-device-id="${escapeHTML(device.deviceId)}">Revoke</button>` : ''}
+            </div>
+          `).join('')}
+        </div>
+        <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Close</button></div>
+      `;
+      openModal(modal);
+      document.getElementById('cancel-btn').addEventListener('click', closeModal);
+      document.querySelectorAll('.revoke-sync-device').forEach(revokeButton => {
+        revokeButton.addEventListener('click', async revokeEvent => {
+          const deviceId = revokeEvent.currentTarget.dataset.deviceId;
+          if (!confirm('Revoke this device from future LibreSync access?')) return;
+          revokeEvent.currentTarget.disabled = true;
+          try {
+            await client.revokeDevice(deviceId);
+            showToast('Device revoked');
+            closeModal();
+            await handleDeviceManager();
+          } catch (error) {
+            showToast(error.message || 'Could not revoke the device');
+            revokeEvent.currentTarget.disabled = false;
+          }
+        });
+      });
+    } catch (error) {
+      showToast(error.message || 'Could not load LibreSync devices');
+    }
+  }
+
+  async function resolveDisplayedConflict(client, conflict, resolution, button) {
+    button.disabled = true;
+    try {
+      await client.resolveConflict(conflict.entityType, conflict.entityId, resolution);
+      try {
+        await client.sync();
+        showToast('Conflict resolved and synchronized');
+      } catch {
+        showToast('Conflict resolved locally; synchronization remains pending');
+      }
+      closeModal();
+      await render();
+    } catch (error) {
+      showToast(error.message || 'Could not resolve the conflict');
+      button.disabled = false;
+    }
+  }
+
+  async function handleConflictReview() {
+    try {
+      const client = await getLibreSyncClient();
+      const conflicts = await client.listConflicts();
+      if (!conflicts.length) {
+        showToast('No unresolved LibreSync conflicts');
+        return;
+      }
+      const modal = document.createElement('div');
+      modal.className = 'modal-content';
+      modal.innerHTML = `
+        <div class="modal-header"><h2>Review Sync Conflicts</h2></div>
+        <p class="confirm-message">Each alternative remains recoverable until you choose one or save an intentional merged value. Times are shown only for context; they do not decide which change wins.</p>
+        <div class="settings-group">
+          ${conflicts.map((conflict, conflictIndex) => `
+            <section class="settings-section sync-conflict" data-conflict-index="${conflictIndex}">
+              <h3>${escapeHTML(syncEntityLabel(conflict.entityType, conflict.entityId))}</h3>
+              <p class="setting-hint">Stable ID: ${escapeHTML(conflict.entityId)}</p>
+              ${conflict.projection.alternatives.map((alternative, alternativeIndex) => `
+                <div class="setting-input">
+                  <span class="setting-label">Version ${alternativeIndex + 1} — ${alternative.kind === 'delete' ? 'Deleted' : 'Saved'}
+                    <span class="setting-hint">Authored ${escapeHTML(formatSyncDate(alternative.authoredAt))}</span>
+                  </span>
+                  <pre class="setting-hint">${alternative.kind === 'delete' ? 'Deleted record' : escapeHTML(JSON.stringify(alternative.payload, null, 2))}</pre>
+                  <button class="btn btn-outline btn-small keep-conflict-version" data-conflict-index="${conflictIndex}" data-alternative-index="${alternativeIndex}">Keep This Version</button>
+                </div>
+              `).join('')}
+              <label class="setting-input">
+                <span class="setting-label">Intentional Merged Value (JSON)</span>
+                <textarea id="conflict-merge-${conflictIndex}" rows="8" spellcheck="false">${conflict.projection.kind === 'put' ? escapeHTML(JSON.stringify(conflict.projection.payload, null, 2)) : ''}</textarea>
+              </label>
+              <button class="btn btn-primary btn-small merge-conflict-version" data-conflict-index="${conflictIndex}">Save Merged Value</button>
+            </section>
+          `).join('')}
+        </div>
+        <div class="modal-actions"><button class="btn btn-secondary" id="cancel-btn">Close</button></div>
+      `;
+      openModal(modal);
+      document.getElementById('cancel-btn').addEventListener('click', closeModal);
+      document.querySelectorAll('.keep-conflict-version').forEach(versionButton => {
+        versionButton.addEventListener('click', event => {
+          const conflict = conflicts[Number(event.currentTarget.dataset.conflictIndex)];
+          const alternative = conflict.projection.alternatives[
+            Number(event.currentTarget.dataset.alternativeIndex)
+          ];
+          const resolution = alternative.kind === 'delete'
+            ? { kind: 'delete' }
+            : { kind: 'put', payload: structuredClone(alternative.payload) };
+          resolveDisplayedConflict(client, conflict, resolution, event.currentTarget);
+        });
+      });
+      document.querySelectorAll('.merge-conflict-version').forEach(mergeButton => {
+        mergeButton.addEventListener('click', event => {
+          const conflictIndex = Number(event.currentTarget.dataset.conflictIndex);
+          const conflict = conflicts[conflictIndex];
+          const text = document.getElementById(`conflict-merge-${conflictIndex}`).value;
+          let payload;
+          try {
+            payload = JSON.parse(text);
+          } catch {
+            showToast('Merged value must be valid JSON');
+            return;
+          }
+          resolveDisplayedConflict(
+            client,
+            conflict,
+            { kind: 'put', payload },
+            event.currentTarget,
+          );
+        });
+      });
+    } catch (error) {
+      showToast(error.message || 'Could not load LibreSync conflicts');
+    }
+  }
+
+  function openSyncConfirmation({
+    title,
+    message,
+    confirmLabel,
+    requiredText = '',
+    workingLabel = 'Working…',
+    failureMessage = '',
+    action,
+  }) {
+    const modal = document.createElement('div');
+    modal.className = 'modal-content confirm-modal';
+    modal.innerHTML = `
+      <div class="modal-header"><h2>${escapeHTML(title)}</h2></div>
+      <p class="confirm-message">${escapeHTML(message)}</p>
+      ${requiredText ? `<label class="setting-input"><span class="setting-label">Type ${escapeHTML(requiredText)} to confirm</span><input type="text" id="sync-confirmation" autocomplete="off"></label>` : ''}
+      <div class="modal-actions">
+        <button class="btn btn-secondary" id="cancel-btn">Cancel</button>
+        <button class="btn btn-danger" id="confirm-btn">${escapeHTML(confirmLabel)}</button>
+      </div>
+    `;
+    let actionInProgress = false;
+    const dialog = openModal(modal, { canClose: () => !actionInProgress });
+    const cancelButton = dialog.querySelector('#cancel-btn');
+    const confirmButton = dialog.querySelector('#confirm-btn');
+    cancelButton.addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
+    confirmButton.addEventListener('click', async event => {
+      if (actionInProgress) return;
+      const confirmation = dialog.querySelector('#sync-confirmation')?.value || '';
+      if (requiredText && confirmation !== requiredText) {
+        showToast(`Type ${requiredText} exactly to continue`);
+        return;
+      }
+      actionInProgress = true;
+      const button = event.currentTarget;
+      cancelButton.disabled = true;
+      button.disabled = true;
+      button.textContent = workingLabel;
+      try {
+        await action(confirmation);
+        closeModal({ target: dialog, force: true, reason: 'completed' });
+      } catch (error) {
+        showToast(failureMessage || error.message || 'LibreSync action failed');
+        actionInProgress = false;
+        cancelButton.disabled = false;
+        button.disabled = false;
+        button.textContent = confirmLabel;
+      }
+    });
+  }
+
+  function handleSyncDisconnect() {
+    openSyncConfirmation({
+      title: 'Disconnect This Device?',
+      message: 'LibreLog data stays on this device and in the remote vault. This clears this device’s sync key, credential, cursors, outbox, inbox, and conflicts, then rotates its local device identity. Re-pairing registers a new device; the old server entry remains until an authorized device revokes it or the vault is deleted.',
+      confirmLabel: 'Disconnect and Keep Data',
+      action: async () => {
+        await disconnectLibreSync();
+        showToast('LibreSync disconnected; local data was preserved');
+        await render();
+      },
+    });
+  }
+
+  function handleDeleteSyncedData() {
+    openSyncConfirmation({
+      title: 'Delete Synchronized App Data Everywhere?',
+      message: 'LibreLog will first sync, then send tombstones for foods, meals, recipes, measurements, notes, templates, goals, theme, and units. Connected replicas delete them on their next sync. A truly concurrent offline edit remains recoverable as a conflict. Local-only credentials and backups are not deleted.',
+      confirmLabel: 'Delete Synced Data Everywhere',
+      requiredText: 'DELETE EVERYWHERE',
+      action: async () => {
+        const count = await deleteLibreLogDataEverywhere();
+        showToast(`${count} synchronized records deleted`);
+        await render();
+      },
+    });
+  }
+
+  async function handleDeleteRemoteVault() {
+    const client = await getLibreSyncClient();
+    const status = await client.getStatus();
+    if (!status.vaultId) return;
+    const requiredText = `delete:${status.vaultId}`;
+    openSyncConfirmation({
+      title: 'Permanently Delete Remote Vault?',
+      message: 'This irreversibly removes the remote vault, encrypted operations, device records, invitations, and server credentials. Data already downloaded to devices remains there. Local LibreLog data on this device is preserved and disconnected.',
+      confirmLabel: 'Permanently Delete Vault',
+      requiredText,
+      action: async confirmation => {
+        await deleteLibreSyncVault(confirmation);
+        showToast('Remote LibreSync vault permanently deleted');
+        await render();
+      },
+    });
+  }
+
+  async function saveGoals({ context, mutationGeneration } = {}) {
     const calorieTarget = Number(document.getElementById('goal-calories').value);
     const proteinG = Number(document.getElementById('goal-protein').value);
     const carbG = Number(document.getElementById('goal-carbs').value);
@@ -555,8 +1082,12 @@ export async function renderSettingsPage(container, queryString) {
     const fiberG = Number(document.getElementById('goal-fiber').value);
     const sodiumMg = Number(document.getElementById('goal-sodium').value);
 
-    await setGoals({ calorieTarget, proteinG, carbG, fatG, fiberG, sodiumMg });
+    await setGoals(
+      { calorieTarget, proteinG, carbG, fatG, fiberG, sodiumMg },
+      { context, mutationGeneration },
+    );
     showToast('Goals saved');
+    await render();
   }
 
   function handleProtectCredentials() {
@@ -718,54 +1249,31 @@ export async function renderSettingsPage(container, queryString) {
   }
 
   function handleClear() {
-    const modal = document.createElement('div');
-    modal.className = 'modal-content confirm-modal';
-    modal.innerHTML = `
-      <div class="modal-header">
-        <h2>Clear All Data?</h2>
-      </div>
-      <p class="confirm-message">This will permanently delete all your foods, meals, and settings. This action cannot be undone.</p>
-      <div class="modal-actions">
-        <button class="btn btn-secondary" id="cancel-btn">Cancel</button>
-        <button class="btn btn-danger" id="confirm-btn">Delete Everything</button>
-      </div>
-    `;
-
-    let clearInProgress = false;
-    const dialog = openModal(modal, { canClose: () => !clearInProgress });
-    const cancelButton = dialog.querySelector('#cancel-btn');
-    const confirmButton = dialog.querySelector('#confirm-btn');
-    cancelButton.addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
-    confirmButton.addEventListener('click', async () => {
-      if (clearInProgress) return;
-      clearInProgress = true;
-      cancelButton.disabled = true;
-      confirmButton.disabled = true;
-      confirmButton.textContent = 'Deleting...';
-      try {
-        stopAutoBackup();
-        await clearAllDataAndBackups();
-        closeModal({ target: dialog, force: true, reason: 'completed' });
-        showToast('All data cleared');
+    openSyncConfirmation({
+      title: 'Clear This Device and Disconnect?',
+      message: 'This deletes LibreLog data, local-only settings, credentials, backups, pending changes, and LibreSync connection state from this device. It does not delete the remote vault or data already on other devices. Unsynced local changes cannot be recovered; an authorized device is required to pair this device again.',
+      confirmLabel: 'Clear This Device',
+      requiredText: 'CLEAR THIS DEVICE',
+      workingLabel: 'Clearing…',
+      failureMessage: 'Failed to clear this device. Your current data was preserved when possible.',
+      action: async () => {
+        try {
+          await clearThisDeviceAndDisconnect();
+        } catch (error) {
+          try {
+            // The guarded clear restores a recovery snapshot if IndexedDB fails.
+            // Resume its recurring schedule before returning the live app.
+            await initAutoBackup();
+          } catch (backupError) {
+            console.warn('Could not resume automatic backups after failed device clear:', backupError);
+          }
+          throw error;
+        }
+        showToast('This device was cleared and disconnected');
         setTimeout(() => {
           window.location.reload();
         }, 500);
-      } catch (err) {
-        console.error('Clear failed:', err);
-        try {
-          // clearAllDataAndBackups recreates a recovery point immediately if
-          // IndexedDB rejects the erase. Resume its recurring schedule before
-          // returning the still-live app to the user.
-          await initAutoBackup();
-        } catch (backupError) {
-          console.warn('Could not resume automatic backups after failed clear:', backupError);
-        }
-        showToast('Failed to clear data');
-        clearInProgress = false;
-        cancelButton.disabled = false;
-        confirmButton.disabled = false;
-        confirmButton.textContent = 'Delete Everything';
-      }
+      },
     });
   }
 
@@ -1051,6 +1559,41 @@ export async function renderSettingsPage(container, queryString) {
   }
 
   await render();
+  return () => unsubscribeSyncStatus?.();
+}
+
+function syncStateLabel(state) {
+  return ({
+    stopped: 'Connected — manual sync',
+    idle: 'Connected — up to date',
+    syncing: 'Synchronizing…',
+    offline: 'Offline — changes stay pending',
+    error: 'Connected — last attempt failed',
+  })[state] || 'Connected';
+}
+
+function formatSyncDate(value) {
+  if (!value) return 'Never';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Unknown';
+  return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+function syncEntityLabel(entityType, entityId = '') {
+  if (entityType === 'settings') {
+    if (entityId.startsWith('note_')) return 'Daily note';
+    if (entityId.startsWith('template_')) return 'Meal template';
+    if (entityId === 'nutritionGoals') return 'Nutrition goals';
+    if (entityId === 'theme') return 'Theme';
+    if (entityId === 'unit') return 'Units';
+  }
+  return ({
+    foods: 'Food',
+    meals: 'Meal',
+    recipes: 'Recipe',
+    measurements: 'Measurement',
+    settings: 'Preference',
+  })[entityType] || entityType;
 }
 
 function computeMonthlyUsage(log) {

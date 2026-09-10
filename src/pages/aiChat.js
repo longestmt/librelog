@@ -3,13 +3,14 @@
  * Photo analysis + voice logging with BYOK API keys
  */
 
-import { getById, put } from '../data/db.js';
+import { getById } from '../data/db.js';
 import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 import { todayStr } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
+import { newId } from '../data/identity.js';
 
 let aiClientMod = null;
 let imageProcessorMod = null;
@@ -377,10 +378,7 @@ export function renderAIChatPage(container, queryString) {
       if (!food) continue;
 
       // Ensure food has an id
-      if (!food.id) food.id = `ai-${Date.now()}-${idx}`;
-
-      // Save food to DB
-      await put('foods', food);
+      if (!food.id) food.id = newId();
 
       const qty = food.servingSize?.quantity || 100;
       const unit = food.servingSize?.unit || 'g';
@@ -403,7 +401,7 @@ export function renderAIChatPage(container, queryString) {
             sodium: (food.nutrients?.sodium?.mg || 0) * multiplier,
           },
         }],
-      }, { idempotencyKey: `${confirmCommandKey}:${idx}` });
+      }, { idempotencyKey: `${confirmCommandKey}:${idx}`, relatedFoods: [food] });
       if (result.created) logged++;
     }
 

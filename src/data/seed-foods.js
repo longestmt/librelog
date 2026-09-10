@@ -1,3 +1,5 @@
+import { canonicalSeedFoodId } from './identity.js';
+
 /**
  * seed-foods.js — Default food database for LibreLog
  * 30 common foods with accurate USDA nutrition values
@@ -8,7 +10,7 @@
  * Structure: { name, servingSize: { quantity, unit }, nutrients: { energy, macros, fiber, sodium }, category, source }
  * Nutrition values are per standard serving, sourced from USDA FoodData Central
  */
-export const DEFAULT_FOODS = [
+const SEED_FOODS = [
     {
         name: 'Egg, large',
         servingSize: { quantity: 1, unit: 'large', gramsPerUnit: 50 },
@@ -370,3 +372,8 @@ export const DEFAULT_FOODS = [
         source: { type: 'seed' }
     }
 ];
+
+export const DEFAULT_FOODS = SEED_FOODS.map(food => ({
+    ...food,
+    id: canonicalSeedFoodId(food),
+}));

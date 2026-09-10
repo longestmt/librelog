@@ -37,6 +37,7 @@ import {
   assertDataMutationGenerationCurrent,
   captureDataMutationGeneration,
 } from '../data/operation-locks.js';
+import { newId } from '../data/identity.js';
 
 const MEAL_TYPES = ['Breakfast', 'Lunch', 'Dinner', 'Snacks'];
 const MODES = [
@@ -2042,7 +2043,7 @@ function fileToDataUrl(file) {
 }
 
 function generateId() {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  return newId();
 }
 
 function isCalendarDate(value) {

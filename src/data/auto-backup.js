@@ -441,6 +441,7 @@ export async function clearAllDataAndBackups({
   lockManager,
   removeFilesystemBackups,
   removeBrowserCaches = removePrivateBrowserCaches,
+  preservedSyncStateKey,
 } = {}) {
   return withDataLifecycleLock(async lifecycleToken => {
     await withDataDestructiveLock(async destructiveLockToken => {
@@ -457,6 +458,7 @@ export async function clearAllDataAndBackups({
               destructiveLockToken,
               writeLockToken,
               lockManager,
+              preservedSyncStateKey,
             });
           } catch (error) {
             // Backup deletion succeeded but the atomic IndexedDB erase did

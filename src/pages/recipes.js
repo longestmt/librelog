@@ -1,4 +1,4 @@
-import { getAll, getById, put, softDelete } from '../data/db.js';
+import { getAll, getById, softDelete } from '../data/db.js';
 import { searchFoodsWithStatus } from '../engine/food-search.js';
 import { grantRemoteProviderConsent } from '../integrations/privacy.js';
 import { todayStr } from '../utils/format.js';
@@ -16,9 +16,12 @@ import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 import { createDraftItem, toMealItem } from '../data/add-draft.js';
 import { readPositiveNumberInput } from '../utils/form-validation.js';
 import { captureDataMutationGeneration } from '../data/operation-locks.js';
+import { newId } from '../data/identity.js';
+import { saveRecipeWithFoods } from '../data/recipe-commands.js';
+import { captureLibreLogEntityContext } from '../sync/entity-context.js';
 
 function generateId() {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  return newId();
 }
 
 export async function renderRecipesPage(container, queryString) {
@@ -114,6 +117,12 @@ async function renderRecipeList(container) {
 
 async function renderRecipeDetail(container, recipeId) {
   const mutationGeneration = captureDataMutationGeneration();
+  // Capture context first so a concurrent remote write can at worst cause an
+  // extra conflict; the form must never claim that it displayed a later head
+  // while still holding an older recipe payload.
+  let displayedContext = recipeId
+    ? await captureLibreLogEntityContext('recipes', recipeId)
+    : undefined;
   let recipe = recipeId ? await getById('recipes', recipeId) : null;
 
   // Working state
@@ -124,6 +133,7 @@ async function renderRecipeDetail(container, recipeId) {
   let items = recipe?.items ? recipe.items.map(i => ({ ...i })) : [];
   let saveInProgress = false;
   let mealLogInProgress = false;
+  const pendingFoods = new Map();
 
   // Resolve all foods for current ingredients
   const foodsMap = new Map();
@@ -206,7 +216,7 @@ async function renderRecipeDetail(container, recipeId) {
             <p class="empty-hint">No ingredients added yet.</p>
           ` : `
             <div class="ingredient-list" role="list" aria-label="Ingredient list">
-              ${items.map((item, idx) => {
+              ${items.map(item => {
                 const food = getRecipeItemFood(item, foodsMap);
                 const foodName = item.nameSnapshot || food?.name || 'Unknown food';
                 const multiplier = food
@@ -223,7 +233,7 @@ async function renderRecipeDetail(container, recipeId) {
                       <span class="ingredient-portion">${escapeHTML(String(item.quantity))} ${escapeHTML(String(item.unit))}</span>
                       <span class="ingredient-kcal">${kcal}</span>
                     </div>
-                    <button class="btn btn-ghost btn-icon ingredient-remove" data-index="${idx}" aria-label="Remove ${escapeHTML(foodName)}">
+                    <button class="btn btn-ghost btn-icon ingredient-remove" data-item-id="${escapeHTML(String(item.itemId))}" aria-label="Remove ${escapeHTML(foodName)}">
                       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                     </button>
                   </div>
@@ -295,8 +305,12 @@ async function renderRecipeDetail(container, recipeId) {
     container.querySelectorAll('.ingredient-remove').forEach(btn => {
       btn.addEventListener('click', () => {
         if (!syncFieldsFromDOM({ reportInvalid: true })) return;
-        const idx = parseInt(btn.dataset.index, 10);
-        items.splice(idx, 1);
+        const itemId = btn.dataset.itemId;
+        const removedFoodId = items.find(item => item.itemId === itemId)?.foodId;
+        items = items.filter(item => item.itemId !== itemId);
+        if (removedFoodId && !items.some(item => item.foodId === removedFoodId)) {
+          pendingFoods.delete(removedFoodId);
+        }
         render();
       });
     });
@@ -333,6 +347,7 @@ async function renderRecipeDetail(container, recipeId) {
           servings,
           category,
           items: items.map(i => ({
+            itemId: i.itemId || newId(),
             foodId: i.foodId,
             quantity: i.quantity,
             unit: i.unit,
@@ -353,8 +368,34 @@ async function renderRecipeDetail(container, recipeId) {
           createdAt: recipe?.createdAt || new Date().toISOString(),
         };
 
-        const saved = await put('recipes', record, { mutationGeneration });
+        const saved = await saveRecipeWithFoods(
+          record,
+          [...pendingFoods.values()],
+          { context: displayedContext, mutationGeneration },
+        );
+        pendingFoods.clear();
         recipe = saved;
+        items = saved.items.map(item => ({ ...item }));
+        try {
+          // Pair the refreshed context with the materialized record read after
+          // it. An intervening remote write therefore stays recoverable as a
+          // false-positive conflict instead of being silently dominated.
+          const refreshedContext = await captureLibreLogEntityContext('recipes', saved.id);
+          const materializedRecipe = await getById('recipes', saved.id);
+          if (materializedRecipe) {
+            displayedContext = refreshedContext;
+            recipe = materializedRecipe;
+            name = materializedRecipe.name || '';
+            servings = materializedRecipe.servings || 1;
+            category = materializedRecipe.category || '';
+            instructions = materializedRecipe.instructions || '';
+            items = (materializedRecipe.items || []).map(item => ({ ...item }));
+          }
+        } catch (error) {
+          // The recipe is already durably saved. A later edit using the older
+          // context remains recoverable as a conflict rather than being lost.
+          console.warn('Could not refresh recipe sync context:', error);
+        }
         saveInProgress = false;
         showToast('Recipe saved');
         const targetHash = `#/recipes?id=${encodeURIComponent(saved.id)}`;
@@ -664,10 +705,11 @@ async function renderRecipeDetail(container, recipeId) {
       confirmButton.textContent = 'Adding...';
 
       try {
-        // Ensure food is persisted in the foods store
+        // Newly discovered foods are committed with the recipe on Save so a
+        // referencing recipe and its dependency produce one atomic sync op.
         const existing = await getById('foods', food.id);
         if (!existing) {
-          await put('foods', food, { mutationGeneration });
+          pendingFoods.set(food.id, structuredClone(food));
         }
 
         foodsMap.set(food.id, food);
@@ -678,6 +720,7 @@ async function renderRecipeDetail(container, recipeId) {
           nutritionSource: 'Recipe ingredient',
         });
         items.push({
+          itemId: newId(),
           foodId: food.id,
           quantity,
           unit,
@@ -730,7 +773,10 @@ async function renderRecipeDetail(container, recipeId) {
       modalControls.forEach(control => { control.disabled = true; });
       deleteButton.textContent = 'Deleting…';
       try {
-        await softDelete('recipes', recipe.id, { mutationGeneration });
+        await softDelete('recipes', recipe.id, {
+          context: displayedContext,
+          mutationGeneration,
+        });
         showToast('Recipe deleted');
         closeModal({ target: dialog, force: true, reason: 'completed' });
         window.location.hash = '#/recipes';
@@ -909,7 +955,11 @@ async function renderRecipeDetail(container, recipeId) {
       };
 
       try {
-        await createMeal(meal, { idempotencyKey, mutationGeneration });
+        await createMeal(meal, {
+          idempotencyKey,
+          mutationGeneration,
+          relatedFoods: [...pendingFoods.values()],
+        });
         showToast(`${name || recipe.name} logged to ${mealType.charAt(0).toUpperCase() + mealType.slice(1)}`);
         closeModal({ target: dialog, force: true, reason: 'completed' });
         setTimeout(() => {

@@ -19,6 +19,7 @@
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",
     "@capacitor/cli": "8.4.2",
+    "@libresync/testkit": "file:vendor/libresync/libresync-testkit-0.1.0.tgz",
     "@playwright/test": "^1.62.0",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
     "fake-indexeddb": "^6.2.5",
@@ -32,7 +33,9 @@
     "@capacitor/filesystem": "^8.1.2",
     "@capacitor/haptics": "^8.0.1",
     "@capacitor/ios": "^8.5.0",
-    "@ericblade/quagga2": "1.12.0"
+    "@ericblade/quagga2": "1.12.0",
+    "@libresync/client": "file:vendor/libresync/libresync-client-0.1.4.tgz",
+    "@libresync/protocol": "file:vendor/libresync/libresync-protocol-0.1.0.tgz"
   },
   "overrides": {
     "@xmldom/xmldom": "0.8.15",

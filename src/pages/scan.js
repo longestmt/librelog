@@ -1,6 +1,6 @@
 import { lookupBarcode } from '../integrations/openfoodfacts.js';
 import { searchFoods, getRecentFoods, getFavoriteFoods } from '../engine/food-search.js';
-import { getById, put } from '../data/db.js';
+import { getById } from '../data/db.js';
 import { createIdempotencyKey, createMeal } from '../data/meal-commands.js';
 import { todayStr } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
@@ -9,6 +9,7 @@ import { showToast } from '../components/toast.js';
 import { requestPrivacyConsent } from '../components/privacy-consent.js';
 import { getUnitsForFood, getNutritionMultiplier } from '../utils/units.js';
 import { readPositiveNumberInput } from '../utils/form-validation.js';
+import { newId } from '../data/identity.js';
 
 let Quagga = null;
 let scannerActive = false;
@@ -430,7 +431,6 @@ export function renderScanPage(container, queryString) {
     try {
       if (!food.id) food.id = generateId();
       const existing = await getById('foods', food.id);
-      if (!existing) await put('foods', food);
 
       const multiplier = getNutritionMultiplier(quantity, unit, food);
       const scaled = value => value != null && Number.isFinite(Number(value))
@@ -449,7 +449,7 @@ export function renderScanPage(container, queryString) {
         date: todayStr(),
         type: mealType.toLowerCase(),
         items: [{ foodId: food.id, quantity, unit, notes, nutrients: scaledNutrients }],
-      }, { idempotencyKey });
+      }, { idempotencyKey, relatedFoods: existing ? [] : [food] });
 
       showToast(`${food.name} logged to ${mealType}`);
       closeModal();
@@ -583,5 +583,5 @@ function getMealTypeForTime() {
 }
 
 function generateId() {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  return newId();
 }

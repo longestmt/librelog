@@ -1,3 +1,5 @@
+import { newId } from '../data/identity.js';
+
 /**
  * Deterministic validation for untrusted AI nutrition output.
  * This module deliberately has no browser or provider dependencies so the same
@@ -45,7 +47,7 @@ function normalizeAssumptions(value) {
  * Invalid items are rejected rather than coerced into plausible-looking zeros.
  *
  * @param {unknown} payload
- * @param {{sourceType?: string, idPrefix?: string, now?: () => number}} options
+ * @param {{sourceType?: string, idFactory?: () => string}} options
  * @returns {{foods: Array, rejected: Array, warnings: Array}}
  */
 export function validateAIResponse(payload, options = {}) {
@@ -61,13 +63,11 @@ export function validateAIResponse(payload, options = {}) {
 
   const {
     sourceType = 'ai-text',
-    idPrefix = 'ai',
-    now = Date.now,
+    idFactory = newId,
   } = options;
   const foods = [];
   const rejected = [];
   const warnings = [];
-  const timestamp = now();
 
   payload.foods.forEach((raw, index) => {
     const itemErrors = [];
@@ -112,7 +112,7 @@ export function validateAIResponse(payload, options = {}) {
 
     const assumptions = normalizeAssumptions(raw.assumptions);
     foods.push({
-      id: `${idPrefix}-${timestamp}-${index}`,
+      id: idFactory(),
       name,
       servingSize: { quantity, unit },
       nutrients: {

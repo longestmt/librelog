@@ -1,10 +1,12 @@
-import { getAll, put, softDelete } from '../data/db.js';
+import { getAll, getById, getSetting, put, softDelete } from '../data/db.js';
 import { todayStr } from '../utils/format.js';
 import { escapeHTML } from '../utils/sanitize.js';
 import { openModal, closeModal } from '../components/modal.js';
 import { showToast } from '../components/toast.js';
 import { createWeightChartModel, prepareWeightData } from '../engine/weight.js';
 import { captureDataMutationGeneration } from '../data/operation-locks.js';
+import { updateMeasurement } from '../data/measurement-commands.js';
+import { captureLibreLogEntityContext } from '../sync/entity-context.js';
 
 /**
  * Render the weight tracking page
@@ -17,6 +19,7 @@ export async function renderWeightPage(container, queryString) {
   async function render() {
     const mutationGeneration = captureDataMutationGeneration();
     const allEntries = await getAll('measurements');
+    const preferredUnits = await getSetting('unit', 'metric');
     const weightData = prepareWeightData(allEntries);
     const sorted = weightData.entries;
     // One point per calendar day keeps repeated same-day readings from
@@ -60,8 +63,8 @@ export async function renderWeightPage(container, queryString) {
             <label class="weight-form-group">
               <span class="weight-form-label">Unit</span>
               <select id="weight-unit" class="weight-input" aria-label="Weight unit" tabindex="0">
-                <option value="kg">kg</option>
-                <option value="lb">lb</option>
+                <option value="kg" ${preferredUnits !== 'imperial' ? 'selected' : ''}>kg</option>
+                <option value="lb" ${preferredUnits === 'imperial' ? 'selected' : ''}>lb</option>
               </select>
             </label>
           </div>
@@ -169,9 +172,12 @@ export async function renderWeightPage(container, queryString) {
                     <span class="weight-history-value">${entry.weight} ${escapeHTML(entry.unit || 'kg')}</span>
                     ${entry.bodyFat != null ? `<span class="weight-history-bf">${entry.bodyFat}% BF</span>` : ''}
                   </div>
-                  <button class="btn btn-ghost btn-icon weight-delete-btn" data-id="${escapeHTML(String(entry.id))}" aria-label="Delete entry from ${escapeHTML(entry.date || '')}" tabindex="0">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                  </button>
+                  <div>
+                    <button class="btn btn-ghost btn-icon weight-edit-btn" data-id="${escapeHTML(String(entry.id))}" aria-label="Edit entry from ${escapeHTML(entry.date || '')}" tabindex="0">Edit</button>
+                    <button class="btn btn-ghost btn-icon weight-delete-btn" data-id="${escapeHTML(String(entry.id))}" aria-label="Delete entry from ${escapeHTML(entry.date || '')}" tabindex="0">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1 2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                    </button>
+                  </div>
                 </div>
               `).join('')}
             </div>
@@ -238,10 +244,60 @@ export async function renderWeightPage(container, queryString) {
     });
 
     // Delete buttons
-    document.querySelectorAll('.weight-delete-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
+    document.querySelectorAll('.weight-edit-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
         const entryId = btn.dataset.id;
-        const entry = historySorted.find(e => e.id === entryId);
+        // Read the causal context before re-reading the domain record. If a
+        // remote write lands between the two reads, a later save may produce a
+        // harmless extra conflict but can never claim to have observed values
+        // that were not actually shown in this editor.
+        const displayedContext = await captureLibreLogEntityContext('measurements', entryId);
+        const entry = await getById('measurements', entryId);
+        if (!entry) return;
+        const content = document.createElement('div');
+        content.className = 'modal-content';
+        content.innerHTML = `
+          <div class="modal-header"><h2>Edit Weight Entry</h2><button class="modal-close" id="edit-close" aria-label="Close">&#10005;</button></div>
+          <label class="control-group"><span class="control-label">Date</span><input class="form-input" type="date" id="edit-weight-date" value="${escapeHTML(entry.date)}"></label>
+          <label class="control-group"><span class="control-label">Weight</span><input class="form-input" type="number" min="0.1" step="0.1" id="edit-weight-value" value="${entry.weight}"></label>
+          <label class="control-group"><span class="control-label">Unit</span><select class="form-input" id="edit-weight-unit"><option value="kg" ${entry.unit === 'kg' ? 'selected' : ''}>kg</option><option value="lb" ${entry.unit === 'lb' ? 'selected' : ''}>lb</option></select></label>
+          <label class="control-group"><span class="control-label">Body Fat % (optional)</span><input class="form-input" type="number" min="0" max="100" step="0.1" id="edit-weight-bodyfat" value="${entry.bodyFat ?? ''}"></label>
+          <div class="modal-actions"><button class="btn btn-secondary" id="edit-cancel">Cancel</button><button class="btn btn-primary" id="edit-save">Save</button></div>
+        `;
+        openModal(content);
+        document.getElementById('edit-close')?.addEventListener('click', closeModal);
+        document.getElementById('edit-cancel')?.addEventListener('click', closeModal);
+        document.getElementById('edit-save')?.addEventListener('click', async () => {
+          const weight = Number(document.getElementById('edit-weight-value').value);
+          const date = document.getElementById('edit-weight-date').value;
+          const bodyFatValue = document.getElementById('edit-weight-bodyfat').value;
+          const bodyFat = bodyFatValue === '' ? null : Number(bodyFatValue);
+          if (!date || !Number.isFinite(weight) || weight <= 0 || (bodyFat != null && (!Number.isFinite(bodyFat) || bodyFat < 0 || bodyFat > 100))) {
+            showToast('Enter a valid measurement', 'error');
+            return;
+          }
+          await updateMeasurement(entry.id, {
+            date,
+            weight,
+            unit: document.getElementById('edit-weight-unit').value,
+            bodyFat,
+          }, {
+            context: displayedContext,
+            baseRecord: entry,
+            mutationGeneration,
+          });
+          closeModal();
+          showToast('Weight entry updated');
+          render();
+        });
+      });
+    });
+
+    document.querySelectorAll('.weight-delete-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const entryId = btn.dataset.id;
+        const displayedContext = await captureLibreLogEntityContext('measurements', entryId);
+        const entry = await getById('measurements', entryId);
         if (!entry) return;
 
         const confirmContent = document.createElement('div');
@@ -263,7 +319,10 @@ export async function renderWeightPage(container, queryString) {
         document.getElementById('confirm-close')?.addEventListener('click', closeModal);
         document.getElementById('confirm-cancel')?.addEventListener('click', closeModal);
         document.getElementById('confirm-delete')?.addEventListener('click', async () => {
-          await softDelete('measurements', entryId, { mutationGeneration });
+          await softDelete('measurements', entryId, {
+            context: displayedContext,
+            mutationGeneration,
+          });
           showToast('Entry deleted');
           closeModal();
           render();

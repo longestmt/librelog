@@ -49,7 +49,13 @@ test('a credential-free backup survives a full replacement round-trip', async ()
   await setSetting('ai_api_key_provider', 'openai');
   await setSetting('privacyConsent_openfoodfacts', true);
   await setSetting('privacyConsent_webdav', true);
-  await setSetting('ai_ollama_url', 'https://ollama.example.com');
+  await setSetting('ai_model', 'private-model-choice');
+  await setSetting('ai_ollama_url', 'http://localhost:11434');
+  await setSetting('privacyConsent_usda', true);
+  await setSetting('ai_usage_log', [{ date: '2026-07-01', tokens: 12 }]);
+  await setSetting('initialized', true);
+  await setSetting('libresync_deviceId', 'local-sync-device-id');
+  await setSetting('lastBackupTime', 1234);
   await put('meals', {
     id: 'deleted-meal',
     date: '2026-07-26',
@@ -70,22 +76,31 @@ test('a credential-free backup survives a full replacement round-trip', async ()
   assert.equal(backup.stores.settings.some(record => record.key === 'ai_api_key'), false);
   assert.equal(backup.stores.settings.some(record => record.key === 'ai_api_key_provider'), false);
   assert.equal(backup.stores.settings.some(record => record.key.startsWith('privacyConsent_')), false);
-  assert.equal(backup.stores.settings.some(record => record.key === 'ai_ollama_url'), false);
+  assert.equal(backup.stores.settings.some(record => record.key === 'libresync_deviceId'), false);
+  const portableSettings = new Map(
+    backup.stores.settings.map(record => [record.key, record.value]),
+  );
+  assert.equal(portableSettings.get('ai_provider'), 'openai');
+  assert.equal(portableSettings.get('ai_model'), 'private-model-choice');
+  assert.equal(portableSettings.get('ai_ollama_url'), 'http://localhost:11434');
+  assert.deepEqual(portableSettings.get('ai_usage_log'), [{ date: '2026-07-01', tokens: 12 }]);
+  assert.equal(portableSettings.get('initialized'), true);
+  assert.equal(portableSettings.get('lastBackupTime'), 1234);
   assert.equal(Object.hasOwn(backup.stores, 'apiCache'), false);
   assert.equal(backup.stores.meals.some(record => record.id === 'deleted-meal'), false);
 
   // A legacy or hand-edited backup cannot grant disclosure consent or restore
   // an Ollama endpoint outside the local device.
-  backup.stores.settings.push(
-    { key: 'privacyConsent_usda', value: true },
-    { key: 'ai_ollama_url', value: 'https://ollama.example.com' },
-  );
+  backup.stores.settings.find(record => record.key === 'ai_ollama_url').value =
+    'https://ollama.example.com';
+  backup.stores.settings.push({ key: 'privacyConsent_usda', value: true });
 
   await clearAllData();
   await setSetting('ai_api_key', 'replacement-profile-secret');
   await setSetting('ai_api_key_provider', 'openai');
   await setSetting('privacyConsent_browser_speech', true);
   await setSetting('privacyConsent_webdav', true);
+  await setSetting('ai_provider', 'ollama');
   await importAllData(backup);
 
   assert.deepEqual((await getAll('foods')).map(record => record.id), ['roundtrip-food']);
@@ -97,6 +112,11 @@ test('a credential-free backup survives a full replacement round-trip', async ()
   assert.equal(await getSetting('privacyConsent_browser_speech', false), false);
   assert.equal(await getSetting('privacyConsent_webdav', false), true);
   assert.equal(await getSetting('ai_ollama_url'), null);
+  assert.equal(await getSetting('ai_provider'), 'openai');
+  assert.equal(await getSetting('ai_model'), 'private-model-choice');
+  assert.deepEqual(await getSetting('ai_usage_log'), [{ date: '2026-07-01', tokens: 12 }]);
+  assert.equal(await getSetting('initialized'), true);
+  assert.equal(await getSetting('lastBackupTime'), 1234);
   assert.deepEqual(await getAll('apiCache'), []);
 });
 

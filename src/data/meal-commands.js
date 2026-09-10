@@ -5,6 +5,12 @@ import {
   hasDataWriteLock,
   withDataWriteLock,
 } from './operation-locks.js';
+import {
+  recordLibreLogChanges,
+  storesForLocalMutation,
+  waitForTransaction,
+} from '../sync/atomic.js';
+import { toSyncChange } from '../sync/policy.js';
 
 const MEAL_TYPES = new Set(['breakfast', 'lunch', 'dinner', 'snacks']);
 const MAX_APPLIED_COMMAND_KEYS = 20;
@@ -108,10 +114,12 @@ async function createMealWithWriteLockHeld(input, {
   idempotencyKey,
   relatedFoods = [],
   catalogPreferences = [],
+  context,
 } = {}) {
   const key = normalizeIdempotencyKey(idempotencyKey);
-  const id = `meal:${key}`;
   const validated = validateMealInput(input);
+  if (!Array.isArray(relatedFoods)) throw new Error('Related foods must be an array');
+  if (!Array.isArray(catalogPreferences)) throw new Error('Catalog preferences must be an array');
   const normalizedFoods = relatedFoods
     .filter(food => food != null)
     .map(food => {
@@ -163,64 +171,73 @@ async function createMealWithWriteLockHeld(input, {
     ...preferenceByFood.keys(),
   ])];
   const db = await openDB();
-  const transaction = db.transaction(['foods', 'meals'], 'readwrite');
+  const transaction = db.transaction(storesForLocalMutation(['foods', 'meals']), 'readwrite');
+  const completion = waitForTransaction(transaction);
   const foodsStore = transaction.objectStore('foods');
   const mealsStore = transaction.objectStore('meals');
-  const [existing, ...existingFoods] = await Promise.all([
-    transactionRequest(mealsStore.get(id)),
-    ...foodIds.map(foodId => transactionRequest(foodsStore.get(foodId))),
-  ]);
-  if (existing && !existing.deleted) {
-    await waitForTransaction(transaction);
-    return { meal: existing, created: false };
+  try {
+    const [existing, ...existingFoods] = await Promise.all([
+      transactionRequest(mealsStore.index('idempotencyKey').get(key)),
+      ...foodIds.map(foodId => transactionRequest(foodsStore.get(foodId))),
+    ]);
+    if (existing) {
+      await completion;
+      return { meal: existing, created: false };
+    }
+
+    const timestamp = now();
+    const writtenFoods = [];
+    // Related foods are provisional dependencies, not catalog updates. Existing
+    // (including soft-deleted) records win so historical data cannot roll back
+    // catalog edits or resurrect a deleted item.
+    foodIds.forEach((foodId, index) => {
+      const existingFood = existingFoods[index];
+      if (existingFood?.deleted) return;
+      const provisionalFood = provisionalFoods.get(foodId);
+      if (!existingFood && !provisionalFood) {
+        throw new Error('Catalog preferences require a related or existing food');
+      }
+      const preference = preferenceByFood.get(foodId);
+      if (existingFood && !preference) return;
+
+      const record = existingFood
+        ? { ...existingFood, updatedAt: timestamp }
+        : {
+          ...provisionalFood,
+          createdAt: provisionalFood.createdAt || timestamp,
+          updatedAt: timestamp,
+          deleted: false,
+        };
+      if (Object.hasOwn(preference || {}, 'favorite')) record.favorite = preference.favorite;
+      if (Object.hasOwn(preference || {}, 'usualServing')) {
+        if (preference.usualServing == null) delete record.usualServing;
+        else record.usualServing = structuredClone(preference.usualServing);
+      }
+      foodsStore.put(record);
+      writtenFoods.push(record);
+    });
+
+    const meal = {
+      ...validated,
+      id: uuid(),
+      idempotencyKey: key,
+      createdAt: validated.createdAt || timestamp,
+      updatedAt: timestamp,
+      deleted: false,
+    };
+    mealsStore.put(meal);
+    const changes = [
+      ...writtenFoods.map(record => toSyncChange('foods', record, 'put')),
+      attachContext(toSyncChange('meals', meal, 'put'), context),
+    ].filter(Boolean);
+    if (changes.length) await recordLibreLogChanges(transaction, changes);
+    await completion;
+    return { meal, created: true };
+  } catch (error) {
+    try { transaction.abort(); } catch { /* already closed */ }
+    try { await completion; } catch { /* consume transaction failure */ }
+    throw error;
   }
-
-  const timestamp = now();
-  // Related foods are provisional dependencies, not catalog updates. Existing
-  // (including soft-deleted) records win so logging a historical/familiar meal
-  // can never roll back edits or resurrect a deleted catalog item.
-  foodIds.forEach((foodId, index) => {
-    const existingFood = existingFoods[index];
-    // A food deleted while the draft was open remains deleted. Historical
-    // draft data must never resurrect or replace it.
-    if (existingFood?.deleted) return;
-    const provisionalFood = provisionalFoods.get(foodId);
-    if (!existingFood && !provisionalFood) {
-      transaction.abort();
-      throw new Error('Catalog preferences require a related or existing food');
-    }
-    const preference = preferenceByFood.get(foodId);
-    if (existingFood && !preference) return;
-
-    const record = existingFood
-      ? { ...existingFood, updatedAt: timestamp }
-      : {
-        ...provisionalFood,
-        createdAt: provisionalFood.createdAt || timestamp,
-        updatedAt: timestamp,
-        deleted: false,
-      };
-    if (Object.hasOwn(preference || {}, 'favorite')) {
-      record.favorite = preference.favorite;
-    }
-    if (Object.hasOwn(preference || {}, 'usualServing')) {
-      if (preference.usualServing == null) delete record.usualServing;
-      else record.usualServing = structuredClone(preference.usualServing);
-    }
-    foodsStore.put(record);
-  });
-
-  const meal = {
-    ...validated,
-    id,
-    idempotencyKey: key,
-    createdAt: validated.createdAt || timestamp,
-    updatedAt: timestamp,
-    deleted: false,
-  };
-  mealsStore.put(meal);
-  await waitForTransaction(transaction);
-  return { meal, created: true };
 }
 
 export async function createMeal(input, options = {}) {
@@ -237,88 +254,96 @@ function transactionRequest(request) {
   });
 }
 
-function waitForTransaction(transaction) {
-  return new Promise((resolve, reject) => {
-    transaction.oncomplete = resolve;
-    transaction.onerror = () => reject(transaction.error || new Error('Meal transaction failed'));
-    transaction.onabort = () => reject(transaction.error || new Error('Meal transaction was aborted'));
-  });
+function attachContext(change, context) {
+  if (change && context !== undefined) change.context = structuredClone(context);
+  return change;
 }
 
-async function mutateMealWithWriteLockHeld(mealId, idempotencyKey, mutation) {
+async function mutateMealWithWriteLockHeld(mealId, idempotencyKey, mutation, { context } = {}) {
   const key = normalizeIdempotencyKey(idempotencyKey);
   const db = await openDB();
-  const transaction = db.transaction('meals', 'readwrite');
+  const transaction = db.transaction(storesForLocalMutation(['meals']), 'readwrite');
+  const completion = waitForTransaction(transaction);
   const store = transaction.objectStore('meals');
-  const meal = await transactionRequest(store.get(mealId));
+  try {
+    const meal = await transactionRequest(store.get(mealId));
+    if (!meal) throw new Error('Meal was not found');
+    if (meal.appliedCommandKeys?.includes(key)) {
+      await completion;
+      return { meal, changed: false };
+    }
+    if (meal.deleted) throw new Error('Meal was not found');
 
-  if (!meal) {
-    transaction.abort();
-    throw new Error('Meal was not found');
+    const next = mutation(structuredClone(meal));
+    const record = {
+      ...next,
+      appliedCommandKeys: [...(meal.appliedCommandKeys || []), key]
+        .slice(-MAX_APPLIED_COMMAND_KEYS),
+      updatedAt: now(),
+    };
+    store.put(record);
+    const change = attachContext(
+      toSyncChange('meals', record, record.deleted ? 'delete' : 'put'),
+      context,
+    );
+    if (change) await recordLibreLogChanges(transaction, [change]);
+    await completion;
+    return { meal: record, changed: true };
+  } catch (error) {
+    try { transaction.abort(); } catch { /* already closed */ }
+    try { await completion; } catch { /* consume transaction failure */ }
+    throw error;
   }
-  if (meal.appliedCommandKeys?.includes(key)) {
-    return { meal, changed: false };
-  }
-  if (meal.deleted) {
-    transaction.abort();
-    throw new Error('Meal was not found');
-  }
-
-  const next = mutation(structuredClone(meal));
-  const appliedCommandKeys = [...(meal.appliedCommandKeys || []), key]
-    .slice(-MAX_APPLIED_COMMAND_KEYS);
-  const record = {
-    ...next,
-    appliedCommandKeys,
-    updatedAt: now(),
-  };
-  store.put(record);
-
-  await new Promise((resolve, reject) => {
-    transaction.oncomplete = resolve;
-    transaction.onerror = () => reject(transaction.error || new Error('Meal command failed'));
-    transaction.onabort = () => reject(transaction.error || new Error('Meal command was aborted'));
-  });
-  return { meal: record, changed: true };
 }
 
 async function mutateMeal(mealId, idempotencyKey, mutation, options = {}) {
   return withMaybeDataWriteLock(
-    () => mutateMealWithWriteLockHeld(mealId, idempotencyKey, mutation),
+    () => mutateMealWithWriteLockHeld(mealId, idempotencyKey, mutation, options),
     options,
   );
 }
 
-function resolveMealItemIndex(meal, requestedIndex, expectedItemId) {
+function resolveMealItemIndex(meal, requestedIdentity, expectedItemId) {
+  const items = Array.isArray(meal.items) ? meal.items : [];
+  if (typeof requestedIdentity === 'string') {
+    const itemId = requestedIdentity.trim();
+    if (!itemId) throw new Error('Meal item ID is invalid');
+    const index = items.findIndex(candidate => candidate.itemId === itemId);
+    if (index < 0) throw new Error('Meal item was changed or removed in another tab');
+    return index;
+  }
+  const requestedIndex = Number(requestedIdentity);
+  if (!Number.isInteger(requestedIndex) || requestedIndex < 0) {
+    throw new Error('Meal item index is invalid');
+  }
   if (!expectedItemId) return requestedIndex;
-  const currentIndex = (meal.items || []).findIndex(candidate => candidate.itemId === expectedItemId);
+  const currentIndex = items.findIndex(candidate => candidate.itemId === expectedItemId);
   if (currentIndex < 0) throw new Error('Meal item was changed or removed in another tab');
   return currentIndex;
 }
 
-export async function updateMealItem(mealId, itemIndex, item, options = {}) {
+export async function updateMealItem(mealId, itemIdentity, item, options = {}) {
   const { idempotencyKey, expectedItemId } = options;
-  const index = Number(itemIndex);
-  if (!Number.isInteger(index) || index < 0) throw new Error('Meal item index is invalid');
   const validatedItem = validateMealItem(item);
   return mutateMeal(mealId, idempotencyKey, meal => {
-    const currentIndex = resolveMealItemIndex(meal, index, expectedItemId);
+    const currentIndex = resolveMealItemIndex(meal, itemIdentity, expectedItemId);
     if (!Array.isArray(meal.items) || !meal.items[currentIndex]) {
       throw new Error('Meal item was not found');
     }
-    meal.items[currentIndex] = validatedItem;
+    meal.items[currentIndex] = {
+      ...validatedItem,
+      itemId: meal.items[currentIndex].itemId,
+    };
     return meal;
   }, options);
 }
 
-export async function removeMealItem(mealId, itemIndex, options = {}) {
+export async function removeMealItem(mealId, itemIdentity, options = {}) {
   const { idempotencyKey, expectedItemId } = options;
-  const index = Number(itemIndex);
-  if (!Number.isInteger(index) || index < 0) throw new Error('Meal item index is invalid');
   let removedItem = null;
-  let removedIndex = index;
+  let removedIndex = -1;
   const result = await mutateMeal(mealId, idempotencyKey, meal => {
-    const currentIndex = resolveMealItemIndex(meal, index, expectedItemId);
+    const currentIndex = resolveMealItemIndex(meal, itemIdentity, expectedItemId);
     if (!Array.isArray(meal.items) || !meal.items[currentIndex]) {
       throw new Error('Meal item was not found');
     }
@@ -335,41 +360,54 @@ export async function removeMealItem(mealId, itemIndex, options = {}) {
  * Restore one previously removed item without replacing any sibling edits that
  * happened after the removal. This also revives a meal that became empty.
  */
-async function restoreMealItemWithWriteLockHeld(mealId, itemIndex, item, { idempotencyKey } = {}) {
+async function restoreMealItemWithWriteLockHeld(
+  mealId,
+  itemIndex,
+  item,
+  { idempotencyKey, context } = {},
+) {
   const index = Number(itemIndex);
   if (!Number.isInteger(index) || index < 0) throw new Error('Meal item index is invalid');
   const key = normalizeIdempotencyKey(idempotencyKey);
   const restoredItem = validateMealItem(item);
   const db = await openDB();
-  const transaction = db.transaction('meals', 'readwrite');
+  const transaction = db.transaction(storesForLocalMutation(['meals']), 'readwrite');
+  const completion = waitForTransaction(transaction);
   const store = transaction.objectStore('meals');
-  const meal = await transactionRequest(store.get(mealId));
+  try {
+    const meal = await transactionRequest(store.get(mealId));
+    if (!meal) throw new Error('Meal was not found');
+    if (meal.appliedCommandKeys?.includes(key)) {
+      await completion;
+      return { meal, changed: false };
+    }
 
-  if (!meal) {
-    transaction.abort();
-    throw new Error('Meal was not found');
+    const items = [...(meal.items || [])];
+    const alreadyPresent = restoredItem.itemId
+      && items.some(existing => existing.itemId === restoredItem.itemId);
+    if (alreadyPresent) {
+      await completion;
+      return { meal, changed: false };
+    }
+    items.splice(Math.min(index, items.length), 0, restoredItem);
+    const record = {
+      ...meal,
+      items,
+      deleted: false,
+      appliedCommandKeys: [...(meal.appliedCommandKeys || []), key]
+        .slice(-MAX_APPLIED_COMMAND_KEYS),
+      updatedAt: now(),
+    };
+    store.put(record);
+    const change = attachContext(toSyncChange('meals', record, 'put'), context);
+    if (change) await recordLibreLogChanges(transaction, [change]);
+    await completion;
+    return { meal: record, changed: true };
+  } catch (error) {
+    try { transaction.abort(); } catch { /* already closed */ }
+    try { await completion; } catch { /* consume transaction failure */ }
+    throw error;
   }
-  if (meal.appliedCommandKeys?.includes(key)) {
-    await waitForTransaction(transaction);
-    return { meal, changed: false };
-  }
-
-  const items = [...(meal.items || [])];
-  const alreadyPresent = restoredItem.itemId
-    && items.some(existing => existing.itemId === restoredItem.itemId);
-  if (!alreadyPresent) items.splice(Math.min(index, items.length), 0, restoredItem);
-  const record = {
-    ...meal,
-    items,
-    deleted: false,
-    appliedCommandKeys: [...(meal.appliedCommandKeys || []), key]
-      .slice(-MAX_APPLIED_COMMAND_KEYS),
-    updatedAt: now(),
-  };
-  store.put(record);
-
-  await waitForTransaction(transaction);
-  return { meal: record, changed: !alreadyPresent };
 }
 
 export async function restoreMealItem(mealId, itemIndex, item, options = {}) {
@@ -383,8 +421,10 @@ async function createMealBatchWithWriteLockHeld(inputs, {
   idempotencyKey,
   idempotencyKeys,
   relatedFoods = [],
+  context,
 } = {}) {
   if (!Array.isArray(inputs)) throw new Error('Meal batch must be an array');
+  if (inputs.length === 0) return [];
   // Validate every record before opening the transaction so a bad tail item
   // cannot leave a successfully written prefix behind.
   const validated = inputs.map(validateMealInput);
@@ -408,50 +448,71 @@ async function createMealBatchWithWriteLockHeld(inputs, {
   const baseKey = idempotencyKeys ? null : normalizeIdempotencyKey(idempotencyKey);
   const commandKeys = idempotencyKeys
     ? idempotencyKeys.map(normalizeIdempotencyKey)
-    : validated.map((_, index) => normalizeIdempotencyKey(`${baseKey}:${index}`));
+    : validated.map((_, index) => (
+      validated.length === 1 ? baseKey : normalizeIdempotencyKey(`${baseKey}:${index}`)
+    ));
   if (new Set(commandKeys).size !== commandKeys.length) {
     throw new Error('Meal batch idempotency keys must be unique');
   }
-  const ids = commandKeys.map(commandKey => `meal:${commandKey}`);
   const db = await openDB();
-  const transaction = db.transaction(['foods', 'meals'], 'readwrite');
+  const transaction = db.transaction(storesForLocalMutation(['foods', 'meals']), 'readwrite');
+  const completion = waitForTransaction(transaction);
   const foodsStore = transaction.objectStore('foods');
   const mealsStore = transaction.objectStore('meals');
-  const [existingMeals, existingFoods] = await Promise.all([
-    Promise.all(ids.map(id => transactionRequest(mealsStore.get(id)))),
-    Promise.all(uniqueFoods.map(food => transactionRequest(foodsStore.get(food.id)))),
-  ]);
-  const timestamp = now();
-  uniqueFoods.forEach((food, index) => {
-    // Imported food definitions are dependencies. Never overwrite a catalog
-    // record the user has already edited or deleted.
-    if (existingFoods[index]) return;
-    foodsStore.put({
-      ...food,
-      createdAt: food.createdAt || timestamp,
-      updatedAt: timestamp,
-      deleted: false,
+  try {
+    const [existingMeals, existingFoods] = await Promise.all([
+      Promise.all(commandKeys.map(commandKey => transactionRequest(
+        mealsStore.index('idempotencyKey').get(commandKey),
+      ))),
+      Promise.all(uniqueFoods.map(food => transactionRequest(foodsStore.get(food.id)))),
+    ]);
+    const timestamp = now();
+    const writtenFoods = [];
+    if (existingMeals.some(meal => !meal)) {
+      uniqueFoods.forEach((food, index) => {
+        // Imported food definitions are dependencies. Never overwrite a
+        // catalog record the user has already edited or deleted.
+        if (existingFoods[index]) return;
+        const record = {
+          ...food,
+          createdAt: food.createdAt || timestamp,
+          updatedAt: timestamp,
+          deleted: false,
+        };
+        foodsStore.put(record);
+        writtenFoods.push(record);
+      });
+    }
+    const results = validated.map((mealInput, index) => {
+      const existing = existingMeals[index];
+      // A command key identifies an already handled import/copy. A tombstone
+      // is a deliberate deletion, not permission to revive it on retry.
+      if (existing) return { meal: existing, created: false };
+      const meal = {
+        ...mealInput,
+        id: uuid(),
+        idempotencyKey: commandKeys[index],
+        createdAt: mealInput.createdAt || timestamp,
+        updatedAt: timestamp,
+        deleted: false,
+      };
+      mealsStore.put(meal);
+      return { meal, created: true };
     });
-  });
-  const results = validated.map((mealInput, index) => {
-    const existing = existingMeals[index];
-    // A deterministic batch key identifies an already handled import/copy.
-    // Its tombstone is a deliberate local deletion, not permission to revive
-    // the record when the same source data is seen again.
-    if (existing) return { meal: existing, created: false };
-    const meal = {
-      ...mealInput,
-      id: ids[index],
-      idempotencyKey: commandKeys[index],
-      createdAt: mealInput.createdAt || timestamp,
-      updatedAt: timestamp,
-      deleted: false,
-    };
-    mealsStore.put(meal);
-    return { meal, created: true };
-  });
-  await waitForTransaction(transaction);
-  return results;
+    const changes = [
+      ...writtenFoods.map(record => toSyncChange('foods', record, 'put')),
+      ...results
+        .filter(result => result.created)
+        .map(result => attachContext(toSyncChange('meals', result.meal, 'put'), context)),
+    ].filter(Boolean);
+    if (changes.length) await recordLibreLogChanges(transaction, changes);
+    await completion;
+    return results;
+  } catch (error) {
+    try { transaction.abort(); } catch { /* already closed */ }
+    try { await completion; } catch { /* consume transaction failure */ }
+    throw error;
+  }
 }
 
 export async function createMealBatch(inputs, options = {}) {

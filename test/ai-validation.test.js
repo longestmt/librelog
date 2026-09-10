@@ -21,11 +21,11 @@ const validFood = {
 test('normalizes valid AI food without paid provider calls', () => {
   const result = validateAIResponse(
     { foods: [validFood] },
-    { now: () => 123, sourceType: 'ai-voice', idPrefix: 'fixture' },
+    { sourceType: 'ai-voice', idFactory: () => 'fixture-id' },
   );
   assert.equal(result.foods.length, 1);
   assert.equal(result.schemaVersion, AI_RESULT_SCHEMA_VERSION);
-  assert.equal(result.foods[0].id, 'fixture-123-0');
+  assert.equal(result.foods[0].id, 'fixture-id');
   assert.equal(result.foods[0].servingSize.quantity, 1);
   assert.equal(result.foods[0].nutrients.energy.kcal, 520);
   assert.deepEqual(result.foods[0]._aiMeta.assumptions, ['One medium bowl', 'Sauce included']);

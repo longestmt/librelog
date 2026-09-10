@@ -30,6 +30,7 @@ import {
   saveAddDraftIfCurrent,
 } from '../src/data/add-draft.js';
 import { createMeal } from '../src/data/meal-commands.js';
+import { updateMeasurement } from '../src/data/measurement-commands.js';
 import { searchFoods } from '../src/engine/food-search.js';
 import { grantRemoteProviderConsent } from '../src/integrations/privacy.js';
 import {
@@ -267,6 +268,24 @@ test('writes first attempted during Clear All are rejected instead of recreating
       type: 'lunch',
       items: [{ foodId: 'during-clear', quantity: 1, unit: 'serving' }],
     }, { idempotencyKey: 'test:during-clear-meal', lockManager: locks }),
+    isDestructiveConflict,
+  );
+  await assert.rejects(
+    updateMeasurement('during-clear', {
+      date: '2026-09-09',
+      weight: 70,
+      unit: 'kg',
+      bodyFat: null,
+    }, {
+      baseRecord: {
+        id: 'during-clear',
+        date: '2026-09-08',
+        weight: 71,
+        unit: 'kg',
+        bodyFat: null,
+      },
+      lockManager: locks,
+    }),
     isDestructiveConflict,
   );
   await assert.rejects(

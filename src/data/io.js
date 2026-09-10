@@ -196,7 +196,7 @@ async function importMyFitnessPalCSVWithLifecycleLockHeld(file) {
     // Create or find food entry
     const foodId = `mfp-${name.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 50)}`;
 
-    foods.push({
+    const food = {
       id: foodId,
       name,
       servingSize: { quantity: 100, unit: 'g', aliases: [] },
@@ -207,7 +207,8 @@ async function importMyFitnessPalCSVWithLifecycleLockHeld(file) {
         sodium: { mg: sodium },
       },
       source: { type: 'myfitnesspal' },
-    });
+    };
+    foods.push(food);
 
     meals.push({
       date,

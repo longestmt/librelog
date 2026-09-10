@@ -8,6 +8,7 @@ import * as openfoodfacts from '../integrations/openfoodfacts.js';
 import { getCached, setCache } from '../integrations/cache.js';
 import { hasRemoteProviderConsent } from '../integrations/privacy.js';
 import { captureDataMutationGeneration } from '../data/operation-locks.js';
+import { newId } from '../data/identity.js';
 
 let usdaModule = null;
 async function getUsda() {
@@ -199,7 +200,9 @@ async function searchFoods(query, options = {}) {
           if (apiResults && apiResults.length > 0) {
             for (const apiFood of apiResults) {
               if (!apiFood.id) {
-                apiFood.id = `off-${apiFood.barcode?.ean13 || Math.random().toString(36).slice(2, 11)}`;
+                apiFood.id = apiFood.barcode?.ean13
+                  ? `off-${apiFood.barcode.ean13}`
+                  : newId();
               }
               const nameLower = apiFood.name?.toLowerCase();
               const barcode = apiFood.barcode?.ean13;

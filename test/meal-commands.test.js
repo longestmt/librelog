@@ -26,6 +26,7 @@ test('a meal command uses one record for repeated idempotency keys', async () =>
   assert.equal(first.created, true);
   assert.equal(second.created, false);
   assert.equal(first.meal.id, second.meal.id);
+  assert.match(first.meal.id, /^[0-9a-f-]{36}$/i);
   assert.equal((await getAll('meals')).length, 1);
 });
 
@@ -143,22 +144,24 @@ test('a meal command rejects invalid dates, meal types, and quantities', () => {
 test('edit and remove commands apply each idempotency key one time', async () => {
   await clearAllData();
   const { meal } = await createMeal(validMeal, { idempotencyKey: 'test:meal-mutation-create' });
+  const itemId = meal.items[0].itemId;
+  assert.match(itemId, /^[0-9a-f-]{36}$/i);
   const changedItem = { ...validMeal.items[0], quantity: 2 };
 
-  const firstEdit = await updateMealItem(meal.id, 0, changedItem, {
+  const firstEdit = await updateMealItem(meal.id, itemId, changedItem, {
     idempotencyKey: 'test:meal-mutation-edit',
   });
-  const repeatedEdit = await updateMealItem(meal.id, 0, changedItem, {
+  const repeatedEdit = await updateMealItem(meal.id, itemId, changedItem, {
     idempotencyKey: 'test:meal-mutation-edit',
   });
   assert.equal(firstEdit.changed, true);
   assert.equal(repeatedEdit.changed, false);
   assert.equal(repeatedEdit.meal.items[0].quantity, 2);
 
-  const firstRemove = await removeMealItem(meal.id, 0, {
+  const firstRemove = await removeMealItem(meal.id, itemId, {
     idempotencyKey: 'test:meal-mutation-remove',
   });
-  const repeatedRemove = await removeMealItem(meal.id, 0, {
+  const repeatedRemove = await removeMealItem(meal.id, itemId, {
     idempotencyKey: 'test:meal-mutation-remove',
   });
   assert.equal(firstRemove.changed, true);
@@ -287,4 +290,39 @@ test('undo restores the exact item version removed after a concurrent edit', asy
   const restored = await getById('meals', meal.id);
   assert.equal(restored.items[0].itemId, originalItem.itemId);
   assert.equal(restored.items[0].quantity, 2);
+});
+
+test('a newly discovered food and its referencing meal commit together', async () => {
+  await clearAllData();
+  const food = {
+    id: 'atomic-food',
+    name: 'Atomic food',
+    servingSize: { quantity: 1, unit: 'serving' },
+    nutrients: {
+      energy: { kcal: 100 },
+      macros: { protein: { g: 1 }, carbs: { g: 2 }, fat: { g: 3 } },
+      fiber: { g: null },
+      sodium: { mg: null },
+    },
+  };
+  const input = {
+    ...validMeal,
+    items: [{ ...validMeal.items[0], foodId: food.id }],
+  };
+  const first = await createMeal(input, {
+    idempotencyKey: 'test:atomic-food-meal',
+    relatedFoods: [food],
+  });
+  assert.equal(first.created, true);
+  assert.equal((await getById('foods', food.id)).name, 'Atomic food');
+  assert.equal(first.meal.items[0].foodId, food.id);
+
+  const storedFood = await getById('foods', food.id);
+  const second = await createMeal(input, {
+    idempotencyKey: 'test:atomic-food-meal',
+    relatedFoods: [{ ...food, name: 'Must not rewrite on retry' }],
+  });
+  assert.equal(second.created, false);
+  assert.equal((await getById('foods', food.id)).updatedAt, storedFood.updatedAt);
+  assert.equal((await getById('foods', food.id)).name, 'Atomic food');
 });

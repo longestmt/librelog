@@ -4,6 +4,7 @@
  */
 
 import { logIntegrationFailure, requestJSON } from './request.js';
+import { newId } from '../data/identity.js';
 
 const OFF_BASE_URL = 'https://world.openfoodfacts.org';
 const REQUEST_TIMEOUT_MS = 8000;
@@ -47,7 +48,7 @@ function normalizeProduct(product) {
       : { quantity: 100, unit: 'g' };
 
     return {
-      id: `off-${product.code || product.id || Math.random().toString(36).slice(2)}`,
+      id: product.code || product.id ? `off-${product.code || product.id}` : newId(),
       name: product.product_name || 'Unknown',
       brand: product.brands || '',
       servingSize,

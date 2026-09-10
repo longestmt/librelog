@@ -1,4 +1,11 @@
-import { getById, getByIndex, getAll, put, getSetting, setSetting } from '../data/db.js';
+import {
+  deleteSetting,
+  getById,
+  getByIndex,
+  getAll,
+  getSetting,
+  setSetting,
+} from '../data/db.js';
 import {
   copyMealsToDate,
   createIdempotencyKey,
@@ -17,9 +24,11 @@ import { getUnitsForFood, getNutritionMultiplierOrNull } from '../utils/units.js
 import { getRecentFoods } from '../engine/food-search.js';
 import { readPositiveNumberInput } from '../utils/form-validation.js';
 import { captureDataMutationGeneration } from '../data/operation-locks.js';
+import { assignNewItemIds, newId } from '../data/identity.js';
+import { captureLibreLogEntityContext } from '../sync/entity-context.js';
 
 function generateId() {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  return newId();
 }
 
 export async function renderDiaryPage(container, queryString) {
@@ -32,7 +41,12 @@ export async function renderDiaryPage(container, queryString) {
     const renderMutationGeneration = captureDataMutationGeneration();
     const meals = await getByIndex('meals', 'date', currentDate) || [];
     const goals = await getGoals();
-    const dailyNote = await getSetting(`note_${currentDate}`) || '';
+    const noteKey = `note_${currentDate}`;
+    // Context is captured before the value read so a remote update racing this
+    // render cannot be silently treated as something the user already saw.
+    let displayedNoteContext = await captureLibreLogEntityContext('settings', noteKey);
+    const dailyNote = await getSetting(noteKey) || '';
+    let noteSaveChain = Promise.resolve();
 
     const totals = calculateDayTotalsSimple(meals);
     const isIncomplete = key => totals.incomplete?.includes(key);
@@ -207,18 +221,31 @@ export async function renderDiaryPage(container, queryString) {
     // Daily notes auto-save with debounce
     document.getElementById('daily-note-input')?.addEventListener('input', (e) => {
       clearTimeout(noteTimeout);
-      const note = e.target.value;
+      const value = e.target.value;
       const mutationGeneration = captureDataMutationGeneration();
-      noteTimeout = setTimeout(async () => {
+      noteTimeout = setTimeout(() => {
         noteTimeout = null;
         if (!container.isConnected) return;
-        try {
-          await setSetting(`note_${currentDate}`, note, { mutationGeneration });
-        } catch (error) {
+        noteSaveChain = noteSaveChain.then(async () => {
+          const context = structuredClone(displayedNoteContext);
+          if (value === '') {
+            await deleteSetting(noteKey, { context, mutationGeneration });
+          } else {
+            await setSetting(noteKey, value, { context, mutationGeneration });
+          }
+
+          // Refresh in context-before-value order. Adopt the new context only
+          // when the materialized value matches what this editor saved; a
+          // differing remote value remains an explicit conflict on the next
+          // local edit.
+          const refreshedContext = await captureLibreLogEntityContext('settings', noteKey);
+          const materializedNote = await getSetting(noteKey, '');
+          if (materializedNote === value) displayedNoteContext = refreshedContext;
+        }).catch(error => {
           if (error?.code !== 'DATA_OPERATION_INVALIDATED') {
             console.warn('Could not save daily note:', error);
           }
-        }
+        });
       }, 500);
     });
 
@@ -259,16 +286,19 @@ export async function renderDiaryPage(container, queryString) {
         if (templateSaveInProgress) return;
         const name = dialog.querySelector('#template-name').value.trim();
         if (!name) { showToast('Please enter a template name'); return; }
-        const templateItems = meals.flatMap(m => (m.items || []).map(item => ({ ...item, mealType: m.type })));
+        const templateItems = assignNewItemIds(meals.flatMap(m => (m.items || []).map(
+          ({ itemId, ...item }) => ({ ...item, mealType: m.type }),
+        )));
         templateSaveInProgress = true;
         modalControls.forEach(control => { control.disabled = true; });
         saveButton.textContent = 'Saving…';
         try {
-          await put(
-            'settings',
-            { key: templateKey, value: { kind: 'day', name, items: templateItems, createdAt: new Date().toISOString() }, updatedAt: new Date().toISOString() },
-            { mutationGeneration: renderMutationGeneration },
-          );
+          await setSetting(templateKey, {
+            kind: 'day',
+            name,
+            items: templateItems,
+            createdAt: new Date().toISOString(),
+          }, { mutationGeneration: renderMutationGeneration });
           showToast('Template saved');
           closeModal({ target: dialog, force: true, reason: 'completed' });
         } catch (error) {
@@ -300,11 +330,19 @@ export async function renderDiaryPage(container, queryString) {
       const handler = async () => {
         const mutationGeneration = captureDataMutationGeneration();
         const mealId = el.dataset.mealId;
-        const foodIndex = el.dataset.foodIndex;
+        const itemId = el.dataset.itemId;
+        const displayedContext = await captureLibreLogEntityContext('meals', mealId);
         const meals = await getByIndex('meals', 'date', currentDate);
         const meal = meals.find(m => m.id === mealId);
-        if (meal && meal.items[foodIndex]) {
-          openPortionEditor(meal, foodIndex, currentDate, render, mutationGeneration);
+        if (meal?.items?.some(item => item.itemId === itemId)) {
+          openPortionEditor(
+            meal,
+            itemId,
+            currentDate,
+            render,
+            mutationGeneration,
+            displayedContext,
+          );
         }
       };
       el.addEventListener('click', handler);
@@ -426,7 +464,7 @@ function renderMealSection(mealType, mealsOfType, foodsMap) {
       <div class="meal-section-content">
         ${mealsOfType.map((meal, mealIdx) => `
           <div class="meal-group" data-meal-id="${escapeHTML(String(meal.id))}">
-            ${(meal.items || []).map((item, foodIdx) => {
+            ${(meal.items || []).map(item => {
               const food = foodsMap.get(item.foodId);
               const kcal = item.nutrients?.kcal;
               const calorieDisplay = kcal != null && Number.isFinite(Number(kcal)) ? `${Math.round(Number(kcal))} kcal` : 'Calories unknown';
@@ -442,7 +480,7 @@ function renderMealSection(mealType, mealsOfType, foodsMap) {
               const sourceLabel = item.provenance?.nutritionSource
                 || (sourceType.startsWith('ai-') ? 'AI estimate' : '');
               return `
-                <div class="food-item" data-meal-id="${escapeHTML(String(meal.id))}" data-food-index="${foodIdx}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${escapeHTML(portionDisplay)}, ${escapeHTML(accessibleCalories)}. Click to edit.">
+                <div class="food-item" data-meal-id="${escapeHTML(String(meal.id))}" data-item-id="${escapeHTML(String(item.itemId))}" role="button" tabindex="0" aria-label="${escapeHTML(name)}, ${escapeHTML(portionDisplay)}, ${escapeHTML(accessibleCalories)}. Click to edit.">
                   <div class="food-info">
                     <div class="food-name">${escapeHTML(name)}${sourceLabel ? ` <span class="source-badge ${sourceLabel === 'AI estimate' ? 'ai' : ''}">${escapeHTML(sourceLabel)}</span>` : ''}</div>
                     <div class="food-portion">${escapeHTML(portionDisplay)}</div>
@@ -467,8 +505,16 @@ function renderMealSection(mealType, mealsOfType, foodsMap) {
   `;
 }
 
-async function openPortionEditor(meal, foodIndex, currentDate, onComplete, mutationGeneration) {
-  const item = meal.items[foodIndex];
+async function openPortionEditor(
+  meal,
+  itemId,
+  currentDate,
+  onComplete,
+  mutationGeneration,
+  displayedContext,
+) {
+  const item = meal.items.find(candidate => candidate.itemId === itemId);
+  if (!item) return;
   const food = await getById('foods', item.foodId);
   const basis = item.basisSnapshot;
   const nutritionFood = basis ? {
@@ -638,15 +684,15 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete, mutat
     modalControls.forEach(control => { control.disabled = true; });
     saveButton.textContent = 'Updating…';
     try {
-      await updateMealItem(meal.id, foodIndex, {
+      await updateMealItem(meal.id, itemId, {
         ...item,
         quantity,
         unit,
         notes: notesInput.value,
         nutrients: scaleNutrients(nutritionFood, quantity, unit),
       }, {
+        context: displayedContext,
         idempotencyKey: updateCommandKey,
-        expectedItemId: item.itemId,
         mutationGeneration,
       });
       showToast('Food updated');
@@ -675,9 +721,9 @@ async function openPortionEditor(meal, foodIndex, currentDate, onComplete, mutat
     modalControls.forEach(control => { control.disabled = true; });
     deleteButton.textContent = 'Deleting…';
     try {
-      const removal = await removeMealItem(meal.id, foodIndex, {
+      const removal = await removeMealItem(meal.id, itemId, {
+        context: displayedContext,
         idempotencyKey: removeCommandKey,
-        expectedItemId: item.itemId,
         mutationGeneration,
       });
       closeModal({ target: dialog, force: true, reason: 'completed' });
@@ -824,9 +870,12 @@ async function openLoadTemplateModal(targetDate, onComplete) {
     <div class="modal-header"><h2>Load Meal Template</h2><button class="modal-close" id="modal-close" aria-label="Close">✕</button></div>
     <div class="template-list">
       ${templates.map((t, i) => `
-        <div class="template-item" data-idx="${i}" role="button" tabindex="0">
-          <span class="template-name">${escapeHTML(t.name)}</span>
-          <span class="template-meta">${t.items?.length || 0} items</span>
+        <div class="template-item">
+          <button class="btn btn-ghost template-load" data-idx="${i}">
+            <span class="template-name">${escapeHTML(t.name)}</span>
+            <span class="template-meta">${t.items?.length || 0} items</span>
+          </button>
+          <button class="btn btn-ghost btn-small template-delete" data-idx="${i}" aria-label="Delete ${escapeHTML(t.name)} template">Delete</button>
         </div>
       `).join('')}
     </div>
@@ -837,7 +886,7 @@ async function openLoadTemplateModal(targetDate, onComplete) {
   dialog.querySelector('#modal-close').addEventListener('click', () => closeModal({ target: dialog, reason: 'close-button' }));
   dialog.querySelector('#cancel-btn').addEventListener('click', () => closeModal({ target: dialog, reason: 'cancel' }));
 
-  dialog.querySelectorAll('.template-item').forEach(el => {
+  dialog.querySelectorAll('.template-load').forEach(el => {
     const templateCommandKey = createIdempotencyKey('template');
     const handler = async () => {
       if (templateLoading) return;
@@ -873,6 +922,31 @@ async function openLoadTemplateModal(targetDate, onComplete) {
       }
     };
     el.addEventListener('click', handler);
-    el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handler(); } });
+  });
+  dialog.querySelectorAll('.template-delete').forEach(button => {
+    button.addEventListener('click', async event => {
+      if (templateLoading) return;
+      const template = templates[Number(event.currentTarget.dataset.idx)];
+      if (!template) return;
+      templateLoading = true;
+      try {
+        const displayedContext = await captureLibreLogEntityContext('settings', template.key);
+        const currentTemplate = await getSetting(template.key, null);
+        if (!currentTemplate || !confirm(`Delete the template "${currentTemplate.name}"?`)) {
+          templateLoading = false;
+          return;
+        }
+        dialog.querySelectorAll('button').forEach(control => { control.disabled = true; });
+        await deleteSetting(template.key, { context: displayedContext, mutationGeneration });
+        showToast(`Template "${currentTemplate.name}" deleted`);
+        closeModal({ target: dialog, force: true, reason: 'completed' });
+        await onComplete();
+      } catch (error) {
+        console.error('Template delete failed:', error);
+        showToast('Template could not be deleted', 'error');
+        templateLoading = false;
+        dialog.querySelectorAll('button').forEach(control => { control.disabled = false; });
+      }
+    });
   });
 }

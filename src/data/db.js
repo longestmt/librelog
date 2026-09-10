@@ -16,9 +16,25 @@ import {
     withDataWriteLock,
 } from './operation-locks.js';
 import { normalizeOllamaUrl } from '../integrations/ollama.js';
+import {
+    backfillItemIds,
+    canonicalSeedFoodId,
+    newId,
+} from './identity.js';
+import { canonicalEqual } from '@libresync/protocol';
+import { clearStateExcept } from '@libresync/client';
+import {
+    ALL_SYNC_STORE_NAMES,
+    installLibreSyncStores,
+    recordLibreLogChanges,
+    storesForLocalMutation,
+} from '../sync/atomic.js';
+import { toSyncChange } from '../sync/policy.js';
 
 const DB_NAME = 'librelog';
-const DB_VERSION = 3;
+// Version 3 shipped the stable meal-item migration. LibreSync adds stores and
+// deterministic identities, so existing version-3 profiles need an upgrade.
+const DB_VERSION = 4;
 export const DATA_SCHEMA_VERSION = DB_VERSION;
 export const BACKUP_SCHEMA_VERSION = 1;
 const DATA_STORES = ['foods', 'meals', 'recipes', 'measurements', 'settings', 'apiCache'];
@@ -41,9 +57,10 @@ const SENSITIVE_SETTING_KEYS = new Set([
     'githubGistId',
     'credentialEncryptionEnabled',
     'credentialEncryptionVerifier',
+    'libresync_deviceId',
 ]);
 const PRIVACY_CONSENT_SETTING_PREFIX = 'privacyConsent_';
-
+const LIBRESYNC_SETTING_PREFIX = 'libresync_';
 let dbInstance = null;
 
 function withMaybeDataWriteLock(operation, {
@@ -83,7 +100,10 @@ function writeMigrationBackup(backup) {
 
 function isNonPortableSettingKey(key) {
     return SENSITIVE_SETTING_KEYS.has(key)
-        || (typeof key === 'string' && key.startsWith(PRIVACY_CONSENT_SETTING_PREFIX));
+        || (typeof key === 'string' && (
+            key.startsWith(PRIVACY_CONSENT_SETTING_PREFIX)
+            || key.startsWith(LIBRESYNC_SETTING_PREFIX)
+        ));
 }
 
 function sanitizePortableSetting(record) {
@@ -128,7 +148,10 @@ function createStoresAndIndexes(db, transaction) {
         meals = transaction.objectStore('meals');
     }
     if (!meals.indexNames.contains('date')) meals.createIndex('date', 'date', { unique: false });
-    if (!meals.indexNames.contains('mealType')) meals.createIndex('mealType', 'mealType', { unique: false });
+    // Meal records use `type`; the legacy `mealType` index pointed at a field
+    // that is never written and is removed during the v3 repair migration.
+    if (meals.indexNames.contains('mealType')) meals.deleteIndex('mealType');
+    if (!meals.indexNames.contains('type')) meals.createIndex('type', 'type', { unique: false });
     if (!meals.indexNames.contains('idempotencyKey')) {
         meals.createIndex('idempotencyKey', 'idempotencyKey', { unique: false });
     }
@@ -167,6 +190,67 @@ function createStoresAndIndexes(db, transaction) {
     if (!apiCache.indexNames.contains('expiresAt')) {
         apiCache.createIndex('expiresAt', 'expiresAt', { unique: false });
     }
+
+    installLibreSyncStores(db, transaction);
+}
+
+function migrateStableIdentities(transaction) {
+    const storeNames = ['foods', 'meals', 'recipes', 'settings'];
+    const results = new Map();
+    let pending = storeNames.length;
+
+    const fail = () => {
+        try { transaction.abort(); } catch { /* transaction is already closing */ }
+    };
+
+    const apply = () => {
+        const foodsStore = transaction.objectStore('foods');
+        const mealsStore = transaction.objectStore('meals');
+        const recipesStore = transaction.objectStore('recipes');
+        const settingsStore = transaction.objectStore('settings');
+        const foodIdMap = new Map();
+
+        for (const food of results.get('foods') || []) {
+            if (food?.source?.type !== 'seed') continue;
+            const canonicalId = canonicalSeedFoodId(food);
+            if (food.id === canonicalId) continue;
+            foodIdMap.set(food.id, canonicalId);
+            foodsStore.put({ ...food, id: canonicalId });
+            foodsStore.delete(food.id);
+        }
+
+        const remapItems = (parentId, items) => backfillItemIds(parentId, items).map(item => ({
+            ...item,
+            foodId: foodIdMap.get(item.foodId) || item.foodId,
+        }));
+
+        for (const meal of results.get('meals') || []) {
+            mealsStore.put({ ...meal, items: remapItems(meal.id, meal.items) });
+        }
+        for (const recipe of results.get('recipes') || []) {
+            recipesStore.put({ ...recipe, items: remapItems(recipe.id, recipe.items) });
+        }
+        for (const setting of results.get('settings') || []) {
+            if (!setting?.key?.startsWith('template_') || !Array.isArray(setting.value?.items)) continue;
+            settingsStore.put({
+                ...setting,
+                value: {
+                    ...setting.value,
+                    items: remapItems(setting.key, setting.value.items),
+                },
+            });
+        }
+    };
+
+    for (const name of storeNames) {
+        const request = transaction.objectStore(name).getAll();
+        request.onerror = fail;
+        request.onsuccess = () => {
+            results.set(name, request.result);
+            pending -= 1;
+            if (pending === 0) apply();
+        };
+    }
 }
 
 function normalizeMealRecordItemIds(record) {
@@ -189,19 +273,8 @@ function normalizeMealRecordItemIds(record) {
     return changed ? { ...record, items } : record;
 }
 
-function migrateMealsToStableItemIds(transaction) {
-    const request = transaction.objectStore('meals').openCursor();
-    request.onsuccess = () => {
-        const cursor = request.result;
-        if (!cursor) return;
-        const normalized = normalizeMealRecordItemIds(cursor.value);
-        if (normalized !== cursor.value) cursor.update(normalized);
-        cursor.continue();
-    };
-}
-
 function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
-    const stores = DATA_STORES.filter(name => db.objectStoreNames.contains(name));
+    const stores = PORTABLE_DATA_STORES.filter(name => db.objectStoreNames.contains(name));
     const exportedStores = {};
     let pending = stores.length;
 
@@ -257,11 +330,7 @@ function captureMigrationBackup(db, transaction, oldVersion, onComplete) {
  * @returns {string}
  */
 function uuid() {
-    return crypto.randomUUID ? crypto.randomUUID() :
-        'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-            const r = Math.random() * 16 | 0;
-            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
-        });
+    return newId();
 }
 
 /**
@@ -299,7 +368,7 @@ function openDB() {
             }
             captureMigrationBackup(db, transaction, e.oldVersion, () => {
                 createStoresAndIndexes(db, transaction);
-                migrateMealsToStableItemIds(transaction);
+                if (e.oldVersion < DB_VERSION) migrateStableIdentities(transaction);
             });
         };
 
@@ -371,6 +440,16 @@ function waitForTransaction(transaction, result, label = 'IndexedDB transaction'
     });
 }
 
+async function finishWrite(completion, work = null) {
+    try {
+        if (work) await work();
+        await completion;
+    } catch (error) {
+        try { await completion; } catch { /* consume the transaction abort */ }
+        throw error;
+    }
+}
+
 // ---- CRUD operations ----
 
 /**
@@ -416,10 +495,7 @@ export async function getByIndex(storeName, indexName, value) {
  * @param {Object} data
  * @returns {Promise<Object>} - returns the stored record with metadata
  */
-async function putWithWriteLockHeld(storeName, data) {
-    const db = await openDB();
-    const transaction = db.transaction(storeName, 'readwrite');
-    const store = transaction.objectStore(storeName);
+async function putWithWriteLockHeld(storeName, data, { context } = {}) {
     const timestamp = now();
     let record = {
         ...data,
@@ -429,13 +505,23 @@ async function putWithWriteLockHeld(storeName, data) {
         deleted: false,
     };
     if (storeName === 'meals') record = normalizeMealRecordItemIds(record);
-    const committed = waitForTransaction(transaction, record, `${storeName} write`);
-    store.put(record);
-    return committed;
+    const change = toSyncChange(storeName, record);
+    if (change && context !== undefined) change.context = structuredClone(context);
+    const db = await openDB();
+    const transaction = db.transaction(
+        change ? storesForLocalMutation([storeName]) : [storeName],
+        'readwrite',
+    );
+    const completion = waitForTransaction(transaction, undefined, `${storeName} write`);
+    transaction.objectStore(storeName).put(record);
+    await finishWrite(completion, () => (
+        change ? recordLibreLogChanges(transaction, [change]) : null
+    ));
+    return record;
 }
 
 export async function put(storeName, data, options = {}) {
-    return withMaybeDataWriteLock(() => putWithWriteLockHeld(storeName, data), options);
+    return withMaybeDataWriteLock(() => putWithWriteLockHeld(storeName, data, options), options);
 }
 
 /**
@@ -446,11 +532,8 @@ export async function put(storeName, data, options = {}) {
  */
 async function putManyWithWriteLockHeld(storeName, items) {
     const db = await openDB();
-    const tx = db.transaction(storeName, 'readwrite');
-    const store = tx.objectStore(storeName);
     const timestamp = now();
-    const records = [];
-    for (const data of items) {
+    const records = items.map(data => {
         let record = {
             ...data,
             id: data.id || uuid(),
@@ -459,10 +542,22 @@ async function putManyWithWriteLockHeld(storeName, items) {
             deleted: data.deleted || false,
         };
         if (storeName === 'meals') record = normalizeMealRecordItemIds(record);
-        store.put(record);
-        records.push(record);
-    }
-    return waitForTransaction(tx, records, `${storeName} batch write`);
+        return record;
+    });
+    const changes = records
+        .map(record => toSyncChange(storeName, record, record.deleted ? 'delete' : 'put'))
+        .filter(Boolean);
+    const tx = db.transaction(
+        changes.length ? storesForLocalMutation([storeName]) : [storeName],
+        'readwrite',
+    );
+    const completion = waitForTransaction(tx, undefined, `${storeName} batch write`);
+    const store = tx.objectStore(storeName);
+    for (const record of records) store.put(record);
+    await finishWrite(completion, () => (
+        changes.length ? recordLibreLogChanges(tx, changes) : null
+    ));
+    return records;
 }
 
 export async function putMany(storeName, items, options = {}) {
@@ -475,24 +570,35 @@ export async function putMany(storeName, items, options = {}) {
  * @param {string} id
  * @returns {Promise<void>}
  */
-async function softDeleteWithWriteLockHeld(storeName, id) {
+async function softDeleteWithWriteLockHeld(storeName, id, { context } = {}) {
+    const synchronized = Boolean(toSyncChange(storeName, { id, key: id }, 'delete'));
     const db = await openDB();
-    const transaction = db.transaction(storeName, 'readwrite');
+    const transaction = db.transaction(
+        synchronized ? storesForLocalMutation([storeName]) : [storeName],
+        'readwrite',
+    );
+    const completion = waitForTransaction(transaction, undefined, `${storeName} delete`);
     const store = transaction.objectStore(storeName);
-    const committed = waitForTransaction(transaction, undefined, `${storeName} delete`);
-    const request = store.get(id);
-    request.onsuccess = () => {
-        const item = request.result;
-        if (!item) return;
+    const item = await promisifyRequest(store.get(id));
+    if (item) {
         item.deleted = true;
         item.updatedAt = now();
         store.put(item);
-    };
-    return committed;
+        const change = toSyncChange(storeName, item, 'delete');
+        if (change && context !== undefined) change.context = structuredClone(context);
+        await finishWrite(completion, () => (
+            change ? recordLibreLogChanges(transaction, [change]) : null
+        ));
+        return;
+    }
+    await finishWrite(completion);
 }
 
 export async function softDelete(storeName, id, options = {}) {
-    return withMaybeDataWriteLock(() => softDeleteWithWriteLockHeld(storeName, id), options);
+    return withMaybeDataWriteLock(
+        () => softDeleteWithWriteLockHeld(storeName, id, options),
+        options,
+    );
 }
 
 /**
@@ -501,6 +607,9 @@ export async function softDelete(storeName, id, options = {}) {
  * @returns {Promise<void>}
  */
 async function hardDeleteAllWithWriteLockHeld(storeName) {
+    if (storeName !== 'apiCache') {
+        throw new Error('Hard deletion failed: it is restricted to the local-only API cache');
+    }
     const db = await openDB();
     const transaction = db.transaction(storeName, 'readwrite');
     const committed = waitForTransaction(transaction, undefined, `${storeName} clear`);
@@ -523,7 +632,7 @@ export async function hardDeleteAll(storeName, options = {}) {
 export async function getSetting(key, defaultValue = null) {
     const store = await getStore('settings');
     const item = await promisifyRequest(store.get(key));
-    return item ? item.value : defaultValue;
+    return item && item.deleted !== true ? item.value : defaultValue;
 }
 
 /**
@@ -532,16 +641,24 @@ export async function getSetting(key, defaultValue = null) {
  * @param {any} value
  * @returns {Promise<void>}
  */
-async function setSettingWithWriteLockHeld(key, value) {
+async function setSettingWithWriteLockHeld(key, value, { context } = {}) {
+    const record = { key, value, updatedAt: now(), deleted: false };
+    const change = toSyncChange('settings', record);
+    if (change && context !== undefined) change.context = structuredClone(context);
     const db = await openDB();
-    const transaction = db.transaction('settings', 'readwrite');
-    const committed = waitForTransaction(transaction, undefined, 'Settings write');
-    transaction.objectStore('settings').put({ key, value, updatedAt: now() });
-    return committed;
+    const transaction = db.transaction(
+        change ? storesForLocalMutation(['settings']) : ['settings'],
+        'readwrite',
+    );
+    const completion = waitForTransaction(transaction, undefined, 'Settings write');
+    transaction.objectStore('settings').put(record);
+    await finishWrite(completion, () => (
+        change ? recordLibreLogChanges(transaction, [change]) : null
+    ));
 }
 
 export async function setSetting(key, value, options = {}) {
-    return withMaybeDataWriteLock(() => setSettingWithWriteLockHeld(key, value), options);
+    return withMaybeDataWriteLock(() => setSettingWithWriteLockHeld(key, value, options), options);
 }
 
 /** Commit several settings together or not at all. */
@@ -549,17 +666,45 @@ async function setSettingsWithWriteLockHeld(entries) {
     if (!Array.isArray(entries) || entries.some(entry => !entry || typeof entry.key !== 'string')) {
         throw new TypeError('Settings must be an array of keyed entries');
     }
-    const db = await openDB();
-    const tx = db.transaction('settings', 'readwrite');
-    const store = tx.objectStore('settings');
     const updatedAt = now();
-    for (const { key, value } of entries) store.put({ key, value, updatedAt });
-    return waitForTransaction(tx, undefined, 'Settings transaction');
+    const records = entries.map(({ key, value }) => ({ key, value, updatedAt, deleted: false }));
+    const changes = records.map(record => toSyncChange('settings', record)).filter(Boolean);
+    const db = await openDB();
+    const tx = db.transaction(
+        changes.length ? storesForLocalMutation(['settings']) : ['settings'],
+        'readwrite',
+    );
+    const completion = waitForTransaction(tx, undefined, 'Settings transaction');
+    const store = tx.objectStore('settings');
+    for (const record of records) store.put(record);
+    await finishWrite(completion, () => (
+        changes.length ? recordLibreLogChanges(tx, changes) : null
+    ));
 }
 
 
 export async function setSettings(entries, options = {}) {
     return withMaybeDataWriteLock(() => setSettingsWithWriteLockHeld(entries), options);
+}
+
+async function deleteSettingWithWriteLockHeld(key, { context } = {}) {
+    const record = { key, value: null, updatedAt: now(), deleted: true };
+    const change = toSyncChange('settings', record, 'delete');
+    if (change && context !== undefined) change.context = structuredClone(context);
+    const db = await openDB();
+    const transaction = db.transaction(
+        change ? storesForLocalMutation(['settings']) : ['settings'],
+        'readwrite',
+    );
+    const completion = waitForTransaction(transaction, undefined, 'Settings delete');
+    transaction.objectStore('settings').put(record);
+    await finishWrite(completion, () => (
+        change ? recordLibreLogChanges(transaction, [change]) : null
+    ));
+}
+
+export async function deleteSetting(key, options = {}) {
+    return withMaybeDataWriteLock(() => deleteSettingWithWriteLockHeld(key, options), options);
 }
 
 // ---- Export / Import ----
@@ -675,6 +820,12 @@ function validateMealItem(item, label) {
     }
     if (typeof item.foodId !== 'string' || !item.foodId) {
         throw new Error(`Backup ${label} item requires a food ID`);
+    }
+    if (item.itemId != null && typeof item.itemId !== 'string') {
+        throw new Error(`Backup ${label} item ID must be a string`);
+    }
+    if (item.itemId === '') {
+        throw new Error(`Backup ${label} item ID must not be empty`);
     }
     validatePositiveNumber(item.quantity, `${label} item quantity`);
     if (typeof item.unit !== 'string' || !item.unit.trim()) {
@@ -842,6 +993,37 @@ function matchesPortableSnapshot(expectedData, currentStores) {
     )) === JSON.stringify(canonicalStore(expectedData.stores[name] || [], name)));
 }
 
+function normalizeImportedStores(data, stores) {
+    const normalized = Object.fromEntries(stores.map(name => [
+        name,
+        (data.stores[name] || [])
+            .map(record => (name === 'settings' ? sanitizePortableSetting(record) : record))
+            .filter(Boolean)
+            .map(record => structuredClone(record)),
+    ]));
+    const foodIdMap = new Map();
+
+    for (const food of normalized.foods || []) {
+        if (food?.source?.type !== 'seed') continue;
+        const canonicalId = canonicalSeedFoodId(food);
+        foodIdMap.set(food.id, canonicalId);
+        food.id = canonicalId;
+    }
+
+    const remapItems = (parentId, items) => backfillItemIds(parentId, items).map(item => ({
+        ...item,
+        foodId: foodIdMap.get(item.foodId) || item.foodId,
+    }));
+    for (const meal of normalized.meals || []) meal.items = remapItems(meal.id, meal.items);
+    for (const recipe of normalized.recipes || []) recipe.items = remapItems(recipe.id, recipe.items);
+    for (const setting of normalized.settings || []) {
+        if (setting?.key?.startsWith('template_') && Array.isArray(setting.value?.items)) {
+            setting.value.items = remapItems(setting.key, setting.value.items);
+        }
+    }
+    return normalized;
+}
+
 /**
  * Import all data into stores
  * @param {Object} data - exported data object
@@ -849,107 +1031,124 @@ function matchesPortableSnapshot(expectedData, currentStores) {
  * @returns {Promise<void>}
  */
 async function importAllDataWithLocksHeld(data, merge = false, { expectedCurrentData } = {}) {
-    const stores = validateBackupData(data);
+    const availableStores = validateBackupData(data);
+    const normalizedStores = normalizeImportedStores(data, availableStores);
     const db = await openDB();
+    const targetStores = (merge ? availableStores : PORTABLE_DATA_STORES)
+        .filter(name => db.objectStoreNames.contains(name));
+    const domainStores = !merge && db.objectStoreNames.contains('apiCache')
+        ? [...targetStores, 'apiCache']
+        : targetStores;
+    const tx = db.transaction(storesForLocalMutation(domainStores), 'readwrite');
+    const completion = waitForTransaction(tx, undefined, 'Import transaction');
 
-    const transactionStores = merge
-        ? stores
-        : DATA_STORES.filter(name => db.objectStoreNames.contains(name));
+    try {
+        // Read the old record set before issuing writes. Replacement is a causal
+        // diff: synchronized removals become tombstones and existing heads stay
+        // intact, instead of clearing domain stores behind stale sync metadata.
+        const existingByStore = new Map(await Promise.all(targetStores.map(async name => [
+            name,
+            await promisifyRequest(tx.objectStore(name).getAll()),
+        ])));
 
-    await new Promise((resolve, reject) => {
-        const tx = db.transaction(transactionStores, 'readwrite');
-        let abortReason = null;
-
-        const writeImportedRecords = () => {
-            for (const name of stores) {
-                const store = tx.objectStore(name);
-                for (const record of data.stores[name]) {
-                    const portableRecord = name === 'settings'
-                        ? sanitizePortableSetting(record)
-                        : record;
-                    if (!portableRecord) continue;
-                    if (record.deleted === true) continue;
-                    let copy = structuredClone(portableRecord);
-                    if (name === 'meals') copy = normalizeMealRecordItemIds(copy);
-                    if (!merge) {
-                        store.put(copy);
-                        continue;
-                    }
-
-                    // Merge is intentionally local-first: existing records win.
-                    const key = name === 'settings' ? record.key : record.id;
-                    const request = store.get(key);
-                    request.onsuccess = () => {
-                        if (request.result === undefined) store.put(copy);
-                    };
-                }
-            }
-        };
-
-        const applyReplacement = (preservedSettings, currentStores) => {
+        if (!merge && expectedCurrentData) {
+            const currentStores = Object.fromEntries(existingByStore);
             if (!matchesPortableSnapshot(expectedCurrentData, currentStores)) {
-                abortReason = new Error('Local data changed while the safety backup was being verified. Nothing was replaced; try again.');
-                abortReason.code = 'DATA_CHANGED_DURING_REPLACE';
-                tx.abort();
-                return;
+                const error = new Error('Local data changed while the safety backup was being verified. Nothing was replaced; try again.');
+                error.code = 'DATA_CHANGED_DURING_REPLACE';
+                throw error;
             }
-            for (const name of transactionStores) tx.objectStore(name).clear();
-            writeImportedRecords();
-            if (transactionStores.includes('settings')) {
-                const settingsStore = tx.objectStore('settings');
-                for (const [key, value] of preservedSettings) {
-                    settingsStore.put({ key, value, updatedAt: now() });
-                }
-            }
-        };
-
-        try {
-            if (merge) {
-                writeImportedRecords();
-            } else {
-                // Read sensitive settings and the expected safety-snapshot
-                // state inside the same transaction that performs replacement.
-                // Writers are therefore ordered wholly before or after it.
-                const preservedSettings = new Map();
-                const currentStores = {};
-                const settingKeys = [...SENSITIVE_SETTING_KEYS, 'privacyConsent_webdav'];
-                let pending = settingKeys.length
-                    + (expectedCurrentData ? PORTABLE_DATA_STORES.length : 0);
-                const finishRead = () => {
-                    pending -= 1;
-                    if (pending === 0) applyReplacement(preservedSettings, currentStores);
-                };
-
-                for (const key of settingKeys) {
-                    const request = tx.objectStore('settings').get(key);
-                    request.onsuccess = () => {
-                        const value = request.result?.value;
-                        const shouldPreserve = key === 'privacyConsent_webdav'
-                            ? value === true
-                            : value !== undefined && value !== null && value !== '';
-                        if (shouldPreserve) preservedSettings.set(key, value);
-                        finishRead();
-                    };
-                }
-                if (expectedCurrentData) {
-                    for (const name of PORTABLE_DATA_STORES) {
-                        const request = tx.objectStore(name).getAll();
-                        request.onsuccess = () => {
-                            currentStores[name] = request.result;
-                            finishRead();
-                        };
-                    }
-                }
-            }
-        } catch (error) {
-            abortReason = error;
-            tx.abort();
         }
 
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error('Import transaction failed'));
-        tx.onabort = () => reject(abortReason || tx.error || new Error('Import transaction was aborted'));
-    });
+        const changes = [];
+        const timestamp = now();
+
+        for (const name of targetStores) {
+            const store = tx.objectStore(name);
+            const keyFor = record => (name === 'settings' ? record.key : record.id);
+            const existing = existingByStore.get(name) || [];
+            const existingByKey = new Map(existing.map(record => [keyFor(record), record]));
+            const incoming = (normalizedStores[name] || [])
+                .filter(record => record.deleted !== true)
+                // Older backup formats may contain device-only settings. They
+                // are never imported into another profile.
+                .map(record => ({ ...structuredClone(record), deleted: false }));
+            const incomingByKey = new Map(incoming.map(record => [keyFor(record), record]));
+
+            if (merge) {
+                // Merge is intentionally local-first. New stable identities are
+                // ordinary synchronized puts; a known ID (including a local
+                // tombstone) is never silently overwritten or resurrected.
+                for (const record of incoming) {
+                    const key = keyFor(record);
+                    if (existingByKey.has(key)) continue;
+                    store.put(record);
+                    const change = toSyncChange(name, record, 'put');
+                    if (change) changes.push(change);
+                }
+                continue;
+            }
+
+            for (const oldRecord of existing) {
+                const key = keyFor(oldRecord);
+                if (name === 'settings') {
+                    // Credentials and the stable LibreSync device identity are
+                    // device-local. WebDAV consent is retained only because the
+                    // active restore itself may depend on that granted access;
+                    // every other consent flag is reset rather than imported.
+                    const preserve = SENSITIVE_SETTING_KEYS.has(key)
+                        || (typeof key === 'string' && key.startsWith(LIBRESYNC_SETTING_PREFIX))
+                        || (key === 'privacyConsent_webdav' && oldRecord.value === true);
+                    if (preserve) {
+                        incomingByKey.delete(key);
+                        continue;
+                    }
+                    if (typeof key === 'string' && key.startsWith(PRIVACY_CONSENT_SETTING_PREFIX)) {
+                        incomingByKey.delete(key);
+                        store.delete(key);
+                        continue;
+                    }
+                }
+
+                const replacement = incomingByKey.get(key);
+                if (replacement) {
+                    incomingByKey.delete(key);
+                    if (!canonicalEqual(oldRecord, replacement)) {
+                        store.put(replacement);
+                        const change = toSyncChange(name, replacement, 'put');
+                        if (change) changes.push(change);
+                    }
+                    continue;
+                }
+
+                const deletion = toSyncChange(name, oldRecord, 'delete');
+                if (deletion) {
+                    if (oldRecord.deleted !== true) {
+                        store.put({ ...oldRecord, deleted: true, updatedAt: timestamp });
+                        changes.push(deletion);
+                    }
+                } else {
+                    store.delete(key);
+                }
+            }
+
+            for (const replacement of incomingByKey.values()) {
+                store.put(replacement);
+                const change = toSyncChange(name, replacement, 'put');
+                if (change) changes.push(change);
+            }
+        }
+
+        if (!merge && domainStores.includes('apiCache')) {
+            tx.objectStore('apiCache').clear();
+        }
+        if (changes.length) await recordLibreLogChanges(tx, changes);
+        await completion;
+    } catch (error) {
+        try { tx.abort(); } catch { /* transaction already failed or completed */ }
+        try { await completion; } catch { /* consume the transaction failure */ }
+        throw error;
+    }
     if (!merge) clearAddDraft();
 }
 
@@ -1022,16 +1221,26 @@ export async function importAllData(data, merge = false, {
  * Clear all data from all stores
  * @returns {Promise<void>}
  */
-async function clearAllDataWithLocksHeld() {
+async function clearAllDataWithLocksHeld({ preservedSyncStateKey } = {}) {
     const db = await openDB();
-    const stores = DATA_STORES.filter(name => db.objectStoreNames.contains(name));
-    await new Promise((resolve, reject) => {
-        const tx = db.transaction(stores, 'readwrite');
-        for (const name of stores) tx.objectStore(name).clear();
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error('Clear transaction failed'));
-        tx.onabort = () => reject(tx.error || new Error('Clear transaction was aborted'));
-    });
+    const stores = [...DATA_STORES, ...ALL_SYNC_STORE_NAMES]
+        .filter(name => db.objectStoreNames.contains(name));
+    const tx = db.transaction(stores, 'readwrite');
+    const completion = waitForTransaction(tx, undefined, 'Clear transaction');
+    try {
+        for (const name of stores) {
+            if (name === 'libresync_state' && preservedSyncStateKey) {
+                await clearStateExcept(tx, preservedSyncStateKey);
+            } else {
+                tx.objectStore(name).clear();
+            }
+        }
+        await completion;
+    } catch (error) {
+        try { tx.abort(); } catch { /* transaction already failed or completed */ }
+        try { await completion; } catch { /* consume the transaction failure */ }
+        throw error;
+    }
     clearMigrationBackups();
     clearAddDraft();
 }
@@ -1042,6 +1251,7 @@ export async function clearAllData({
     destructiveLockToken,
     writeLockToken,
     lockManager,
+    preservedSyncStateKey,
 } = {}) {
     if (!hasDataLifecycleLock(lifecycleToken)) {
         return withDataLifecycleLock(
@@ -1051,6 +1261,7 @@ export async function clearAllData({
                 destructiveLockToken,
                 writeLockToken,
                 lockManager,
+                preservedSyncStateKey,
             }),
             lockManager,
         );
@@ -1063,6 +1274,7 @@ export async function clearAllData({
                 destructiveLockToken: token,
                 writeLockToken,
                 lockManager,
+                preservedSyncStateKey,
             }),
             lockManager,
         );
@@ -1075,6 +1287,7 @@ export async function clearAllData({
                 destructiveLockToken,
                 writeLockToken,
                 lockManager,
+                preservedSyncStateKey,
             }),
             lockManager,
             { destructiveLockToken },
@@ -1088,12 +1301,57 @@ export async function clearAllData({
                 destructiveLockToken,
                 writeLockToken: token,
                 lockManager,
+                preservedSyncStateKey,
             }),
             lockManager,
             { destructiveLockToken },
         );
     }
-    return clearAllDataWithLocksHeld();
+    return clearAllDataWithLocksHeld({ preservedSyncStateKey });
+}
+
+/**
+ * Tombstone every currently live synchronized entity in one transaction.
+ * Local-only records and the connection itself are deliberately retained.
+ * The caller must obtain explicit user confirmation before invoking this.
+ * @returns {Promise<number>} number of delete changes recorded
+ */
+async function deleteAllSynchronizedDataWithWriteLockHeld() {
+    const db = await openDB();
+    const domainStores = PORTABLE_DATA_STORES
+        .filter(name => db.objectStoreNames.contains(name));
+    const tx = db.transaction(storesForLocalMutation(domainStores), 'readwrite');
+    const completion = waitForTransaction(tx, undefined, 'Synchronized data deletion');
+
+    try {
+        const recordsByStore = new Map(await Promise.all(domainStores.map(async name => [
+            name,
+            await promisifyRequest(tx.objectStore(name).getAll()),
+        ])));
+        const changes = [];
+        const timestamp = now();
+        for (const name of domainStores) {
+            const store = tx.objectStore(name);
+            for (const record of recordsByStore.get(name) || []) {
+                if (record.deleted === true) continue;
+                const change = toSyncChange(name, record, 'delete');
+                if (!change) continue;
+                store.put({ ...record, deleted: true, updatedAt: timestamp });
+                changes.push(change);
+            }
+        }
+        if (changes.length) await recordLibreLogChanges(tx, changes);
+        await completion;
+        return changes.length;
+    } catch (error) {
+        try { tx.abort(); } catch { /* transaction already failed or completed */ }
+        try { await completion; } catch { /* consume the transaction failure */ }
+        throw error;
+    }
+}
+
+export async function deleteAllSynchronizedData(options = {}) {
+    return withMaybeDataWriteLock(deleteAllSynchronizedDataWithWriteLockHeld, options);
 }
 
 export function getMigrationBackups() {

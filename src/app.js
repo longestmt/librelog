@@ -17,11 +17,12 @@ import { renderWeightPage } from './pages/weight.js';
 import { renderRecipesPage } from './pages/recipes.js';
 import { renderSettingsPage } from './pages/settings.js';
 import { renderHistoryPage } from './pages/history.js';
-import { closeModal } from './components/modal.js';
+import { closeModal, isModalOpen } from './components/modal.js';
 import {
   assertDataMutationGenerationCurrent,
   captureDataMutationGeneration,
 } from './data/operation-locks.js';
+import { initializeLibreSync } from './sync/service.js';
 
 // SVG Icons (Lucide-style)
 const ICONS = {
@@ -50,6 +51,12 @@ let currentRoute = 'diary';
 let activePageCleanup = null;
 let routeSequence = 0;
 let externalDataClearCleanup = null;
+let remoteMutationRefreshCleanup = null;
+let remoteRefreshPending = false;
+let remoteRefreshQueued = false;
+let remoteRefreshRunning = false;
+let routeRendersInProgress = 0;
+const currentPageDraftInputs = new Set();
 
 async function init() {
   try {
@@ -86,10 +93,21 @@ async function init() {
 
     await applyTheme({ mutationGeneration });
     renderShell();
+    if (!remoteMutationRefreshCleanup) {
+      remoteMutationRefreshCleanup = installRemoteMutationRefresh();
+    }
     await handleRoute();
 
     // Start auto-backup scheduler (6-hour intervals)
     initAutoBackup().catch(err => console.warn('Auto-backup init failed:', err));
+
+    // LibreSync remains dormant until explicit consent and a connection exist.
+    // Once connected, the client performs launch, reconnect, foreground, and
+    // debounced post-mutation best-effort synchronization.
+    initializeLibreSync().catch(() => {
+      // Offline/server failures are reflected in Settings; no secrets or
+      // pairing material are written to the console.
+    });
 
     // Listen for data loss events from auto-backup integrity check
     window.addEventListener('librelog:dataloss', async (e) => {
@@ -194,7 +212,107 @@ function renderShell() {
   });
 }
 
-async function handleRoute() {
+function activePageEditor() {
+  const activeElement = document.activeElement;
+  if (!(activeElement instanceof Element)) return null;
+  const editor = activeElement.closest([
+    'input:not([type="button"]):not([type="submit"]):not([type="reset"])',
+    'select',
+    'textarea',
+    '[contenteditable]:not([contenteditable="false"])',
+  ].join(','));
+  return document.getElementById('main-content')?.contains(editor) ? editor : null;
+}
+
+function pageHasConnectedDraft() {
+  for (const input of currentPageDraftInputs) {
+    if (!input.isConnected) currentPageDraftInputs.delete(input);
+  }
+  return currentPageDraftInputs.size > 0;
+}
+
+function scheduleRemoteRefresh() {
+  if (!remoteRefreshPending || remoteRefreshQueued || remoteRefreshRunning
+    || routeRendersInProgress > 0) return;
+  remoteRefreshQueued = true;
+  queueMicrotask(async () => {
+    remoteRefreshQueued = false;
+    if (!remoteRefreshPending || remoteRefreshRunning || routeRendersInProgress > 0) return;
+    // A route refresh replaces the page container. Preserve dialogs and inline
+    // drafts; a later close, save, or real navigation wakes the pending refresh.
+    if (isModalOpen() || document.querySelector('.modal-backdrop')
+      || pageHasConnectedDraft() || activePageEditor()) return;
+
+    remoteRefreshPending = false;
+    remoteRefreshRunning = true;
+    try {
+      await applyTheme();
+      await handleRoute({ remoteRefresh: true });
+    } catch (error) {
+      console.warn('Could not refresh the visible page after synchronization:', error);
+    } finally {
+      remoteRefreshRunning = false;
+      scheduleRemoteRefresh();
+    }
+  });
+}
+
+function requestRemoteRefresh(event) {
+  const sources = Array.isArray(event?.detail?.sources)
+    ? event.detail.sources
+    : [event?.detail?.source].filter(Boolean);
+  // A render can perform a legacy-value migration. Its reconciliation event
+  // reflects the page we are already rendering and must not create a loop.
+  if (remoteRefreshRunning && sources.length > 0
+    && sources.every(source => source === 'reconcile')) return;
+  remoteRefreshPending = true;
+  scheduleRemoteRefresh();
+}
+
+function installRemoteMutationRefresh() {
+  const handleInput = event => {
+    if (event.target instanceof Element
+      && document.getElementById('main-content')?.contains(event.target)) {
+      currentPageDraftInputs.add(event.target);
+    }
+  };
+  const handleFocusOut = () => setTimeout(scheduleRemoteRefresh, 0);
+  const handleLocalMutation = () => {
+    // Same-tab local commits are the save boundary for inline drafts such as
+    // the Diary note. Do not replace the page until that transaction commits.
+    currentPageDraftInputs.clear();
+    scheduleRemoteRefresh();
+  };
+  const observer = new MutationObserver(() => scheduleRemoteRefresh());
+
+  window.addEventListener('librelog:remote-mutation', requestRemoteRefresh);
+  window.addEventListener('librelog:local-mutation', handleLocalMutation);
+  document.addEventListener('input', handleInput, true);
+  document.addEventListener('focusout', handleFocusOut, true);
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  return () => {
+    window.removeEventListener('librelog:remote-mutation', requestRemoteRefresh);
+    window.removeEventListener('librelog:local-mutation', handleLocalMutation);
+    document.removeEventListener('input', handleInput, true);
+    document.removeEventListener('focusout', handleFocusOut, true);
+    observer.disconnect();
+    remoteRefreshPending = false;
+    remoteRefreshQueued = false;
+    currentPageDraftInputs.clear();
+  };
+}
+
+async function handleRoute(options = {}) {
+  const isRemoteRefresh = options?.remoteRefresh === true;
+  if (!isRemoteRefresh) {
+    // Navigation itself reads the newly committed state and consumes any
+    // deferred refresh without scheduling a second render of the new route.
+    remoteRefreshPending = false;
+    currentPageDraftInputs.clear();
+  }
+  routeRendersInProgress += 1;
+  try {
   const sequence = ++routeSequence;
   const hash = window.location.hash.slice(1) || '/diary';
   const [pathname, query] = hash.split('?');
@@ -208,7 +326,9 @@ async function handleRoute() {
   currentRoute = route;
 
   // Dialogs are page-owned. Never leave one interactive over a new route.
-  closeModal({ force: true, immediate: true, restoreFocus: false, reason: 'route-change' });
+  if (!isRemoteRefresh) {
+    closeModal({ force: true, immediate: true, restoreFocus: false, reason: 'route-change' });
+  }
 
   // Update nav active state and aria-current
   document.querySelectorAll('.nav-item').forEach(el => {
@@ -254,6 +374,10 @@ async function handleRoute() {
     console.error(`Error rendering ${route} page:`, err);
     container.innerHTML = `<div class="error-message"><p>Error loading page. Please refresh.</p></div>`;
   }
+  } finally {
+    routeRendersInProgress -= 1;
+    scheduleRemoteRefresh();
+  }
 }
 
 // Hash change listener
@@ -264,4 +388,13 @@ document.addEventListener('DOMContentLoaded', init);
 
 // Expose for testing/debugging
 window.__librelog__ = window.__librelog__ || {};
-window.__librelog__.app = { init, handleRoute, applyTheme };
+window.__librelog__.app = {
+  init,
+  handleRoute,
+  applyTheme,
+  requestRemoteRefresh,
+  teardownRemoteMutationRefresh() {
+    remoteMutationRefreshCleanup?.();
+    remoteMutationRefreshCleanup = null;
+  },
+};
